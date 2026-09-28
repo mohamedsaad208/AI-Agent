@@ -20,9 +20,12 @@ if __name__ == "__main__":
             code = launch.run_tk(ROOT)
         except Exception:
             # Deliberately omit exception details: GUI fields can include API credentials.
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                None, "The application could not start. Check that Python 3.11+ is installed, "
-                "then run Run-Agent.bat.", "AI Code Engineer", 0x10)
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None, "The application could not start. Check that Python 3.11+ is installed, "
+                    "then run Run-Agent.", "AI Code Engineer", 0x10)
+            except Exception:
+                print("The application could not start. Check that Python 3.11+ is installed.", file=sys.stderr)
             code = 1
     raise SystemExit(code)
