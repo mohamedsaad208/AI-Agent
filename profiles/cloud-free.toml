@@ -1,6 +1,8 @@
 [model]
 provider = "openrouter"
 name = "openrouter/free"
+endpoint = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
 
 [limits]
 max_turns = 8

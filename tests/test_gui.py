@@ -16,14 +16,27 @@ from ai_code_engineer import labels, memory, repair
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import (atomic_json, load_session, plan, proposal_hash)
 from ai_code_engineer.errors import Cancelled
+from ai_code_engineer import catalog
 from ai_code_engineer.gui import AgentWindow, SEARCH_PLACEHOLDER
-from ai_code_engineer.providers import OpenRouterProvider
+from ai_code_engineer.providers import OpenAICompatibleProvider
 from ai_code_engineer.workspace import Workspace
 
 OLLAMA_ENTRY = {"id": "test-local", "name": "Test Local", "cloud": False,
                 "description": "Synthetic local model for tests"}
 FREE_ENTRY = {"id": "x:free", "name": "X Free", "free": True, "cloud": True,
               "description": "Synthetic free cloud model"}
+
+
+def patched_catalog():
+    """Discovery for tests: one call, the real ``(entries, source)`` shape, no socket.
+
+    The window used to patch one function per provider; discovery is now
+    ``models_for(kind, endpoint, key)`` for every row, and the source is what the status line
+    quotes back ("live list" versus the names this tool ships with).
+    """
+    def models_for(kind, endpoint="", api_key=None):
+        return (list(FREE_ENTRY) if kind.free_only else [OLLAMA_ENTRY]), catalog.LIVE
+    return patch("ai_code_engineer.gui.models_for", side_effect=models_for)
 
 # "Fix the add function", built from code points so this file stays ASCII and cannot itself arrive
 # mangled — a mojibake string looks like Arabic in a terminal and is not.
@@ -76,7 +89,9 @@ class CancellationTests(unittest.TestCase):
     def test_gui_key_does_not_change_environment(self):
         from dataclasses import replace
         before = os.environ.get("OPENROUTER_API_KEY")
-        provider = OpenRouterProvider(replace(Settings(), model="openrouter/free"), api_key="synthetic-test-key")
+        settings = replace(Settings(), provider="openrouter", model="openrouter/free",
+                           endpoint="https://openrouter.ai/api/v1")
+        provider = OpenAICompatibleProvider(settings, api_key="synthetic-test-key")
         self.assertEqual(provider.key, "synthetic-test-key")
         self.assertEqual(os.environ.get("OPENROUTER_API_KEY"), before)
 
@@ -115,8 +130,7 @@ class DesktopTests(unittest.TestCase):
         self.repo.mkdir()
         (self.repo / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
         # The startup catalog refresh must stay offline in tests.
-        patches = (patch("ai_code_engineer.gui.ollama_models", return_value=[OLLAMA_ENTRY]),
-                   patch("ai_code_engineer.gui.openrouter_models", return_value=[FREE_ENTRY]))
+        patches = (patched_catalog(),)
         for started in patches:
             started.start()
             self.addCleanup(started.stop)

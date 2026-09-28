@@ -24,7 +24,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from ..catalog import ollama_models, openrouter_models
+from ..catalog import LIVE, models_for
 from ..chat import (context_block, context_use, create_chat, load_chat, project_of, respond,
                     title_for)
 from .. import config
@@ -35,8 +35,9 @@ from ..errors import AgentError, PolicyError
 from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, STEP_FIELDS, TONE, UNVERIFIED_STATES,
                       applied_line, applied_note, artifact_card, batch_summary_line,
                       branch_started, branch_switched,
-                      checkpoint_note, detail_section, executed_line, executing_line,
-                      friendly_error, fix_offers_off_line, is_arabic, log_dropped_line,
+                      catalog_status_line, checkpoint_note, detail_section, executed_line,
+                      executing_line, friendly_error, fix_offers_off_line, is_arabic,
+                      log_dropped_line,
                       no_branch_note,
                       no_checkpoint_note, queue_notes,
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, say, state_label,
@@ -54,7 +55,35 @@ RECOMMENDED = {
     "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
     "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
 }
-MODES = ("Ollama", "OpenRouter · Free", "OpenRouter · Paid")
+
+
+def _mode_rows() -> tuple[tuple[str, config.Kind], ...]:
+    """One row per provider the windows offer, as ``(label, kind)``.
+
+    OpenRouter is two rows on purpose: its free list and its paid list differ in what they cost,
+    which is a decision the user makes per task, not a setting. Every other row is one provider.
+    """
+    rows = []
+    for kind in config.KINDS:
+        if kind.free_only:
+            rows.append((f"{kind.label} \u00b7 Free", kind))
+            rows.append((f"{kind.label} \u00b7 Paid", kind))
+        else:
+            rows.append((kind.label, kind))
+    return tuple(rows)
+
+
+MODE_ROWS = _mode_rows()
+MODES = tuple(label for label, _ in MODE_ROWS)
+MODE_KIND = dict(MODE_ROWS)
+
+
+def free_mode(kind: config.Kind) -> str:
+    return f"{kind.label} \u00b7 Free"
+
+
+def paid_mode(kind: config.Kind) -> str:
+    return f"{kind.label} \u00b7 Paid"
 PLAN_SUFFIXES = (".md", ".txt")
 # A sidebar entry is a branch, and a branch is the only thing that owns a folder. "chat" never
 # has one unless a project was bound to it by name, so the program cannot start pointed at a
@@ -220,6 +249,14 @@ class AgentController:
         self.model_filter = ""
         self.key = ""
         self.cloud_ok = False
+        # One endpoint per provider row, because a machine can have LM Studio *and* Ollama running
+        # and switching between them must not lose where the other one lives. Empty means the row's
+        # own default; nothing here is a secret, so all of it is safe to persist.
+        self.endpoints: dict[str, str] = {}
+        self.profile = ""
+        # Which provider row each catalog came from: a live answer and the built-in fallback read
+        # differently, and the window has to say which one the user is looking at.
+        self.catalog_source: dict[str, str] = {}
         self.request_timeout = config.REQUEST_TIMEOUT_DEFAULT
         self.recipe = ""
         self.run_info = "No command has run yet."
@@ -317,6 +354,12 @@ class AgentController:
         if isinstance(saved_auto, dict):
             self._auto_pref = {str(row): bool(flag) for row, flag in saved_auto.items()}
         self.request_timeout = config.clamp_request_timeout(self._saved_ui.get("request_timeout"))
+        saved_endpoints = self._saved_ui.get("endpoints")
+        if isinstance(saved_endpoints, dict):
+            self.endpoints = {str(row): str(value) for row, value in saved_endpoints.items()
+                              if row in config.BY_KEY and isinstance(value, str)}
+        saved_profile = self._saved_ui.get("profile")
+        self.profile = saved_profile if isinstance(saved_profile, str) else ""
         saved_mode = self._saved_ui.get("mode")
         if isinstance(saved_mode, str) and saved_mode in self.catalogs:
             self.mode = self.active_mode = saved_mode
@@ -781,6 +824,9 @@ class AgentController:
             "plan": plan_info,
             "provider": {"mode": self.mode, "modes": list(MODES), "model": self.model,
                          "models": self.visible_models()},
+            # The whole connection row: a drawer that offered a provider without saying where it
+            # points, or whether it wants a key, could only be filled by trial and error.
+            "connection": self.connection_info(),
             "recipes": [runner.RECIPES[name]["label"] for name in self.recipes],
             "recipe": self.recipe, "canRun": self._can_run(), "runInfo": self.run_info,
             "memory": {"info": self._memory_info()},
@@ -829,6 +875,10 @@ class AgentController:
             "pick_project": self.browse,
             "set_composer": lambda: self.set_composer(str(payload.get("value", ""))),
             "set_auto_apply": lambda: self.set_auto_apply(bool(payload.get("value"))),
+            # Both are validated inside: an endpoint that cannot be a base is refused and reported,
+            # and a profile label that is not a bare name reads no file at all.
+            "set_endpoint": lambda: self.set_endpoint(str(payload.get("value", ""))),
+            "set_profile": lambda: self.set_profile(str(payload.get("value", ""))),
             "bind_chat": lambda: self.bind_chat(payload.get("chat", ""), payload.get("project")),
             "set_icon": lambda: self.set_icon(payload.get("project", ""), payload.get("value", "")),
             "new_chat_in": lambda: self.new_chat_in(payload.get("project", "")),
@@ -1180,8 +1230,123 @@ class AgentController:
         self.model = self.selections.get(value, "")
         self.cloud_ok = False
         self.model_filter = ""
+        self.subtitle = self._subtitle()
         if not self.catalogs.get(value):
             self.check_setup()
+
+    # ------------------------------- connection -------------------------------
+    def active_kind(self) -> config.Kind:
+        return MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+
+    def endpoint_for(self, mode: str = "") -> str:
+        """Where this provider row actually is — typed value, saved value, or its own default."""
+        kind = MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
+        return self.endpoints.get(kind.key, "") or kind.base
+
+    def set_endpoint(self, value: str) -> None:
+        """Point the active row somewhere else. Refused loudly, never half-applied.
+
+        An endpoint says where the code and the key go, so a typo must not be stored and discovered
+        mid-task: the URL is checked on the way in, and a value that cannot be a valid base leaves
+        the field exactly as it was. A change also drops that row's catalog — a list of models from
+        the old address is not a list of models at the new one.
+        """
+        kind = self.active_kind()
+        text = str(value or "").strip()
+        if not text:
+            self.endpoints.pop(kind.key, None)
+        else:
+            try:
+                self.endpoints[kind.key] = config.check_endpoint(kind, text)
+            except AgentError as exc:
+                self.status = friendly_error(exc)
+                return
+        for label, row in MODE_ROWS:
+            if row is kind:
+                self.catalogs[label] = []
+                self.catalog_source.pop(label, None)
+        self.subtitle = self._subtitle()
+        self._save_state()
+        self.check_setup()
+
+    def set_profile(self, label: str) -> None:
+        """Adopt one ``profiles/*.toml``: provider row, model, endpoint and limits.
+
+        The file names an environment variable, never a key, so choosing a profile cannot put a
+        credential on disk — and the key field is cleared rather than filled, because the value it
+        would need is not in the file.
+        """
+        self.profile = label
+        try:
+            settings = config.load_profile(label) if label else None
+        except AgentError as exc:
+            self.status = friendly_error(exc)
+            self.profile = ""
+            self._save_state()
+            return
+        if settings is not None:
+            self.apply_connection(settings.provider, settings.endpoint, settings.model)
+        self._save_state()
+
+    def available_profiles(self) -> list[str]:
+        return config.profile_names()
+
+    def apply_connection(self, provider: str, endpoint: str, model: str = "") -> None:
+        """Move the window onto another provider row without losing the model choice by accident."""
+        mode = config.mode_for(provider, model)
+        if not mode:
+            self.status = friendly_error(AgentError(f"Unknown provider: {provider}"))
+            return
+        self.set_mode(mode)
+        if endpoint:
+            self.set_endpoint(endpoint)
+        if model:
+            self.selections[self.mode] = model
+            self.model = model
+            self._pending_model = ""
+            self.model_changed()
+        self.check_setup()
+
+    def connection_info(self) -> dict:
+        kind = self.active_kind()
+        endpoint = self.endpoint_for()
+        needs_consent = config.needs_consent(kind, endpoint)
+        return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
+                "default_endpoint": kind.base, "cloud": kind.cloud, "shape": kind.shape,
+                "needs_key": kind.needs_key, "key_env": kind.key_env or "",
+                "consent": needs_consent, "paid": self.mode.endswith(" \u00b7 Paid"),
+                "profile": self.profile, "profiles": self.available_profiles(),
+                "source": self.catalog_source.get(self.mode, ""),
+                "key_present": bool(self.key.strip() or os.environ.get(kind.key_env or ""))}
+
+    def cloud_choice(self) -> tuple[bool, bool]:
+        """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths.
+
+        Two things can make a task leave the device: the provider row itself, and a model entry the
+        catalog marked cloud (an Ollama "cloud" tag answers over the internet from a local URL).
+        """
+        kind = self.active_kind()
+        entry = self.selected_entry()
+        paid = kind.free_only and self.mode == paid_mode(kind)
+        cloud = config.needs_consent(kind, self.endpoint_for()) or bool(entry and entry.get("cloud"))
+        return cloud, paid
+
+    def task_settings(self, cloud: bool) -> Settings | None:
+        """The Settings for a task on the current row, or None with the reason on the status line.
+
+        An endpoint is checked when it is typed, but a row can still be unusable — Custom with
+        nothing in the field — and refusing here is what keeps a half-built Settings away from
+        ``make_provider``, which would otherwise fail inside a worker thread.
+        """
+        kind = self.active_kind()
+        try:
+            return config.settings_for(kind, self.endpoint_for(), model=self.model,
+                                       api_key_env=kind.key_env,
+                                       max_turns=8 if cloud else 12,
+                                       timeout_seconds=self.timeout_seconds())
+        except AgentError as exc:
+            self.status = friendly_error(exc)
+            return None
 
     def set_model(self, value: str) -> None:
         self.model = value
@@ -1254,19 +1419,25 @@ class AgentController:
         if shown != loaded:
             return (f"{shown} of {loaded} models match \"{self.model_filter.strip()}\". "
                     "Clear the filter to see the rest.")
-        return f"{loaded} models available. Select one from the list."
+        return f"{loaded} models available at {self.endpoint_for()}. Select one from the list."
 
     def check_setup(self) -> None:
+        """Ask the selected provider what it has. Read-only: no code leaves, no token is generated."""
         if self.busy:
             return
         selected_mode, api_key = self.mode, (self.key.strip() or None)
+        kind = self.active_kind()
+        endpoint = self.endpoint_for(selected_mode)
 
         def done(result):
-            if selected_mode == "Ollama":
-                self.catalogs["Ollama"] = result
+            entries, source = result
+            self.catalog_source[selected_mode] = source
+            if kind.free_only:
+                free, paid = config.free_mode(kind), config.paid_mode(kind)
+                self.catalogs[free] = [entry for entry in entries if entry.get("free")]
+                self.catalogs[paid] = [entry for entry in entries if not entry.get("free")]
             else:
-                self.catalogs["OpenRouter · Free"] = [entry for entry in result if entry["free"]]
-                self.catalogs["OpenRouter · Paid"] = [entry for entry in result if not entry["free"]]
+                self.catalogs[selected_mode] = entries
             pending, self._pending_model = self._pending_model, ""
             catalog = self.catalogs.get(self.mode, [])
             if pending and not self.model and any(entry["id"] == pending for entry in catalog):
@@ -1274,12 +1445,12 @@ class AgentController:
             elif not self.model and any(entry["id"] == DEFAULT_MODEL for entry in catalog):
                 self.model = DEFAULT_MODEL
             self.model_changed()
-            count = len(catalog)
-            self.status = (f"{count} models loaded. Using {self.model or 'the model you choose'}."
-                           if count else "No models found for this provider. Check the service or choose another.")
-            self._note("catalog", f"Refreshed {selected_mode}: {count} models.")
+            self.status = catalog_status_line(arabic=self.arabic, count=len(catalog),
+                                              model=self.model, label=selected_mode,
+                                              live=source == LIVE)
+            self._note("catalog", f"{selected_mode}: {len(catalog)} models ({source}).")
 
-        operation = ollama_models if selected_mode == "Ollama" else lambda: openrouter_models(api_key)
+        operation = lambda: models_for(kind, endpoint, api_key)
         self.run_job(operation, done, "Refreshing available models…")
 
     # ------------------------------- memory -------------------------------
@@ -1418,9 +1589,7 @@ class AgentController:
         repo, task = self.repo.strip(), (text or "").strip()
         plan_file = self.plan_file.strip() or None
         entry = self.selected_entry()
-        openrouter = self.mode.startswith("OpenRouter")
-        cloud = openrouter or bool(entry and entry.get("cloud"))
-        paid = self.mode == "OpenRouter · Paid"
+        cloud, paid = self.cloud_choice()
         if repo and not Path(repo).is_dir():
             self.status = status_text("need_folder_exists", arabic=self.arabic)
             return
@@ -1441,9 +1610,9 @@ class AgentController:
         if cloud and not self.cloud_ok:
             self.status = status_text("consent_message", arabic=self.arabic)
             return
-        settings = replace(Settings(), provider="openrouter" if openrouter else "ollama",
-                           model=self.model, max_turns=8 if cloud else 12,
-                           timeout_seconds=self.timeout_seconds())
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return
         key = self.key.strip() or None
         self._draft = ""
         # A bound project answers in prose by default: bound means it may *read* that project,
@@ -2222,16 +2391,15 @@ class AgentController:
             self.status = (f"Stopped after {repair.MAX_FIX_ROUNDS} fix rounds and the command still fails. "
                            "Try a narrower task, another model, or inspect the output in Checks.")
             return
-        entry = self.selected_entry()
-        openrouter = self.mode.startswith("OpenRouter")
-        cloud = openrouter or bool(entry and entry.get("cloud"))
+        cloud, paid = self.cloud_choice()
         if cloud and not self.cloud_ok:
             self._auto_fix = False
             self.status = status_text("consent_project", arabic=self.arabic)
             return
-        settings = replace(Settings(), provider="openrouter" if openrouter else "ollama",
-                           model=self.model, max_turns=8 if cloud else 12,
-                           timeout_seconds=self.timeout_seconds())
+        settings = self.task_settings(cloud)
+        if settings is None:
+            self._auto_fix = False
+            return
         self._fix_round += 1
         repo, chat_id = self.session["root"], self.chat_id
         reference, step_id = self.session.get("plan_reference"), self.session.get("plan_step")
@@ -2244,8 +2412,7 @@ class AgentController:
         def work():
             provider = make_provider(settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
-                                     api_key=self.key.strip() or None,
-                                     allow_paid=self.mode == "OpenRouter · Paid")
+                                     api_key=self.key.strip() or None, allow_paid=paid)
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
                         progress=lambda line: self._progress(line),
                         step=self._step, cancelled=self.cancel_event.is_set,
@@ -2739,6 +2906,7 @@ class AgentController:
                               "key": self.branch.get("key", "")},
               "composer": dict(self._composer_pref),
               "auto_apply": dict(self._auto_pref),
+              "endpoints": dict(self.endpoints), "profile": self.profile,
               "request_timeout": self.timeout_seconds(), "plan_chained": bool(self.chained),
               "style": self._saved_ui.get("style", "claude"), "theme": self._saved_ui.get("theme", "light"),
               "collapsed": bool(self._saved_ui.get("collapsed", False))}

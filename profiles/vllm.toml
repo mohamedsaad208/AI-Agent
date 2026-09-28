@@ -1,0 +1,12 @@
+# vLLM: an OpenAI-compatible server, usually on this device or a machine on the local network.
+# Keep the endpoint on this device unless you have decided where your code is going.
+[model]
+provider = "vllm"
+name = "Qwen/Qwen2.5-Coder-3B-Instruct"
+endpoint = "http://localhost:8000/v1"
+
+[limits]
+max_turns = 12
+timeout_seconds = 300
+context_chars = 16000
+output_tokens = 4096

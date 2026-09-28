@@ -176,6 +176,7 @@ function render(data) {
   renderThemePick(); renderNav(); renderHeader(); renderThread(); renderComposer();
   renderQueue();
   renderRail(); renderLog();
+  syncSettings();
   // A proposal that arrived on this snapshot was already asked to show itself.
   takePreviewOffer();
   setBusy(data.busy, data.cancellable);
@@ -1187,6 +1188,26 @@ function railHidden() { return getComputedStyle($('rail')).display === 'none'; }
    what the preview's tab buttons repaint into — a sheet that kept showing the last file after a tab
    click would be the pane's old bug wearing a scrim. */
 let SHEET = null;
+let SETTINGS = null;
+
+/* A profile or a provider change moves the connection row underneath an open tab: the endpoint, the
+   key variable and whether approval is needed all belong to the server. Only the Connection tab is
+   repainted, because the others hold text the user is typing and a snapshot must not eat it. */
+function connectionSignature() {
+  const c = DATA.connection || {};
+  return [c.kind, c.endpoint, c.profile, DATA.provider.mode, DATA.provider.model].join('|');
+}
+
+function syncSettings() {
+  if (!SETTINGS || SETTINGS.tab !== 'connection') return;
+  if (SETTINGS.signature === connectionSignature()) return;
+  const typed = document.querySelector('#key');
+  const keep = typed ? typed.value : '';          // the server never echoes a key back
+  SETTINGS.show(SETTINGS.tab);
+  const again = document.querySelector('#key');
+  if (again) again.value = keep;
+  SETTINGS.signature = connectionSignature();
+}
 
 function refreshPreview() {
   if (!SHEET) { renderRail(); return; }
@@ -1662,7 +1683,7 @@ function openSettings(tab) {
   const body = el('div', 'content');
   body.style.maxHeight = '60vh';
   s.append(tabs, body);
-  const close = modal(s);
+  const close = modal(s, () => { SETTINGS = null; });
   const sections = {
     project: () => `
       <div class="field"><label>Project folder</label><input readonly value="${esc(st.project || '')}"></div>
@@ -1678,29 +1699,58 @@ function openSettings(tab) {
       <div class="field"><label>Project notes — sent with every task in this folder</label>
         <textarea id="memory" ${st.project ? '' : 'disabled placeholder="Choose a project folder first."'}>${esc(st.memory || '')}</textarea>
         <div class="hint">${esc(st.memory_info || '')}</div></div>`,
-    cloud: () => `
-      <div class="field"><label>OpenRouter API key (never written to disk)</label>
-        <input type="password" id="key" placeholder="sk-or-…"></div>
-      <label class="switch"><input type="checkbox" id="consent" ${st.consent ? 'checked' : ''}> Allow this public / synthetic code to be sent to the cloud service</label>`,
+    connection: () => {
+      const c = DATA.connection || {};
+      const rows = (list, selected) => list.map((v) =>
+        `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(v)}</option>`).join('');
+      return `
+      <div class="field"><label>Profile — a file in profiles/, read at pick time</label>
+        <select id="profile"><option value="">${esc('None (choose the row below)')}</option>${
+          rows(c.profiles || [], c.profile || '')}</select>
+        <div class="hint">A profile sets provider, model and endpoint. It carries the name of the
+          key variable, never a key.</div></div>
+      <div class="field"><label>Provider</label>
+        <select id="mode">${rows(DATA.provider.modes || [], DATA.provider.mode)}</select></div>
+      <div class="field"><label>Endpoint — where this provider's requests go</label>
+        <input id="endpoint" value="${esc(c.endpoint || '')}" placeholder="${esc(c.default_endpoint || 'https://example/v1')}">
+        <div class="hint">${esc(connectionHint(c))}</div></div>
+      <div class="field"><label>${esc(c.key_env || 'API key')} — never written to disk</label>
+        <input type="password" id="key" placeholder="${esc(c.key_present ? 'found in the environment; paste to override for this session' : 'paste for this session only')}">
+        <div class="hint">${esc(c.needs_key ? 'This provider requires a key.' : 'This provider needs no key.')}</div></div>
+      ${c.consent ? `<label class="switch"><input type="checkbox" id="consent" ${st.consent ? 'checked' : ''}>
+        Allow this public / synthetic code to be sent to that address</label>` : ''}`;
+    },
   };
+  function connectionHint(c) {
+    if (c.shape === 'ollama') return 'Ollama on this device. A model tagged "cloud" is still refused without approval.';
+    if (c.consent) return 'Outside this device, so it needs your approval on every task and the address must be https.';
+    return 'On this device. Nothing leaves it.';
+  }
   function show(name) {
     for (const b of tabs.children) b.classList.toggle('on', b.dataset.tab === name);
     body.innerHTML = sections[name]();
+    if (SETTINGS) SETTINGS.tab = name;
     body.querySelector('#chained')?.addEventListener('change', (e) => send('set_chained', { value: e.target.checked }));
     body.querySelector('#autoapply')?.addEventListener('change', (e) => send('set_auto_apply', { value: e.target.checked }));
     body.querySelector('#timeout')?.addEventListener('change', (e) => send('set_timeout', { value: +e.target.value }));
     body.querySelector('#filter')?.addEventListener('input', (e) => send('set_filter', { value: e.target.value }));
     body.querySelector('#memory')?.addEventListener('change', (e) => send('save_memory', { text: e.target.value }));
+    body.querySelector('#profile')?.addEventListener('change', (e) => send('set_profile', { value: e.target.value }));
+    body.querySelector('#mode')?.addEventListener('change', (e) => send('set_mode', { value: e.target.value }));
+    // change, not input: the endpoint is checked on the server and a rejected value must not be
+    // sent on every keystroke, because a valid one re-fetches that provider's model list.
+    body.querySelector('#endpoint')?.addEventListener('change', (e) => send('set_endpoint', { value: e.target.value }));
     body.querySelector('#key')?.addEventListener('input', (e) => send('set_key', { value: e.target.value }));
     body.querySelector('#consent')?.addEventListener('change', (e) => send('set_consent', { value: e.target.checked }));
   }
-  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['cloud', 'Cloud']]) {
+  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['connection', 'Connection']]) {
     const b = el('button', '', label); b.dataset.tab = name; b.onclick = () => show(name); tabs.appendChild(b);
   }
   const foot = el('footer');
   const refresh = el('button', 'line-btn', 'Refresh models'); refresh.onclick = () => send('refresh_models');
   const done = el('button', 'solid', 'Done'); done.onclick = close;
   foot.append(refresh, done); s.appendChild(foot);
+  SETTINGS = { show: show, tab: tab || 'project', signature: connectionSignature() };
   show(tab || 'project');
 }
 

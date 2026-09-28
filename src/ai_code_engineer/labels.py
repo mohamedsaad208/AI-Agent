@@ -579,6 +579,43 @@ def queue_notes(arabic: bool, elsewhere: int, asked: bool) -> dict:
                 ar=f"{elsewhere} في محادثة أخرى — افتحها لترى ما ينتظر")}
 
 
+def key_needed_line(*, arabic: bool, env_name: str = "") -> str:
+    """Which variable has to hold the key. Naming it is the difference between a fix and a search."""
+    if env_name:
+        return say(arabic, en=f"Enter your {env_name} first — in the key field, or in that "
+                              "environment variable. It is never saved to a file.",
+                   ar=f"اكتب {env_name} أولاً — في خانة المفتاح أو في متغير البيئة ده. "
+                      "المفتاح ما بيتحفظش في ملف خالص.")
+    return say(arabic, en="This provider needs an API key first.", ar="البروفايدر ده محتاج مفتاح API الأول.")
+
+
+def catalog_status_line(*, arabic: bool, count: int, model: str, label: str,
+                        live: bool = True) -> str:
+    """What a refresh found, and *where* it came from.
+
+    A built-in fallback list and a live catalog look identical in a dropdown but mean different
+    things: one is what the service says it has today, the other is a name this tool shipped with.
+    Saying which is the difference between a stale id being a surprise and being a known risk.
+    """
+    if not count:
+        return say(arabic,
+                   en=f"No models found for {label}. Check the service or the endpoint, "
+                      "or choose another provider.",
+                   ar=f"مفيش موديلات اتلقات لـ {label}. اتأكد من الخدمة أو من العنوان، "
+                      f"أو اختار بروفايدر تاني.")
+    head = say(arabic, en=f"{count} models loaded from {label}. ",
+               ar=f"{count} موديل من {label}. ")
+    using = (say(arabic, en=f"Using {model}.", ar=f"هيستخدم {model}.") if model else
+             say(arabic, en="Choose one from the list.", ar="اختار واحد من القائمة."))
+    if live:
+        return head + using
+    return head + using + " " + say(
+        arabic,
+        en="These are names this tool ships with — the live list could not be reached, so one may "
+           "no longer exist on that service.",
+        ar="دي أسماء موجودة في Tool نفسها — قائمة السيرفر الحي ما وصلتش، فممكن واحد منها ما بقاش موجود.")
+
+
 def friendly_error(exc: Exception) -> str:
     # Redacted once, here, because almost every branch returns a slice of ``value``: the fallthrough
     # hands back the exception text verbatim, and ``engine`` interpolates the model's own refusal
@@ -618,6 +655,9 @@ def friendly_error(exc: Exception) -> str:
         # rather than a wrong one. Both fixes are the user's to make, so name them.
         return ("The model reached its output limit before finishing, so the answer is cut off. "
                 "Ask for one file or one step at a time, or raise the output limit in Settings.")
+    if " in your environment" in value:
+        # Named by the provider that refused, so a Groq key is not reported as an OpenRouter one.
+        return "Enter your " + value.split(" in your environment", 1)[0].split("Set ", 1)[-1].strip() + " first."
     if "API_KEY" in value:
         return "Enter your OpenRouter API key first."
     if "HTTP 401" in value or "HTTP 403" in value:

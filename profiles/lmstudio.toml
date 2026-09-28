@@ -1,0 +1,12 @@
+# LM Studio: a local server with an OpenAI-compatible API. Set name to a model you have downloaded;
+# the picker lists what the service actually has.
+[model]
+provider = "lmstudio"
+name = "qwen2.5-coder-3b-instruct"
+endpoint = "http://localhost:1234/v1"
+
+[limits]
+max_turns = 12
+timeout_seconds = 300
+context_chars = 16000
+output_tokens = 4096

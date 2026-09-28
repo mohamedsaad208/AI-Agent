@@ -17,7 +17,7 @@ from ai_code_engineer.engine import (apply_proposal, atomic_json, chat_sessions,
                                      propose_block, proposal_hash, review, rollback, shrink_warning)
 from ai_code_engineer.errors import AgentError, PolicyError, ProviderError
 from ai_code_engineer.redaction import redact
-from ai_code_engineer.providers import OllamaProvider, OpenRouterProvider, make_provider
+from ai_code_engineer.providers import OllamaProvider, OpenAICompatibleProvider, make_provider
 from ai_code_engineer.verification import verify
 from ai_code_engineer.workspace import Workspace, digest, ensure_project_dir
 
@@ -334,7 +334,8 @@ class AgentTests(unittest.TestCase):
             plan(self.ws, "change", provider, replace(Settings(), max_turns=1), self.base / "runs", progress=lambda _: None)
 
     def test_cloud_denied_before_request(self):
-        settings = replace(Settings(), provider="openrouter", model="openrouter/free")
+        settings = replace(Settings(), provider="openrouter", model="openrouter/free",
+                           endpoint="https://openrouter.ai/api/v1")
         with patch("ai_code_engineer.providers.request_json") as request:
             with self.assertRaises(PolicyError):
                 make_provider(settings, allow_cloud=False, data_class="public")
@@ -359,12 +360,15 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(request.call_args.args[1]["format"], "json")
 
     def test_openrouter_contract_and_truncation(self):
-        settings = replace(Settings(), provider="openrouter", model="openrouter/free")
+        settings = replace(Settings(), provider="openrouter", model="openrouter/free",
+                           endpoint="https://openrouter.ai/api/v1")
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "fake-test-key"}):
-            provider = OpenRouterProvider(settings)
+            provider = OpenAICompatibleProvider(settings)
             with patch("ai_code_engineer.providers.request_json", return_value={"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}], "model": "actual:free"}) as request:
                 self.assertEqual(provider.generate([]), "{}")
                 self.assertEqual(provider.model, "actual:free")
+                self.assertEqual(request.call_args.args[0],
+                                 "https://openrouter.ai/api/v1/chat/completions")
                 self.assertFalse(request.call_args.args[1]["provider"]["allow_fallbacks"])
             with patch("ai_code_engineer.providers.request_json", return_value={"choices": [{"finish_reason": "length", "message": {"content": "{}"}}]}):
                 with self.assertRaises(ProviderError):
@@ -411,7 +415,7 @@ class AgentTests(unittest.TestCase):
 
     def test_paid_openrouter_model_denied(self):
         with self.assertRaises(PolicyError):
-            OpenRouterProvider(replace(Settings(), provider="openrouter", model="paid-model"))
+            OpenAICompatibleProvider(replace(Settings(), provider="openrouter", model="paid-model"))
 
     def test_repeated_read_stops_without_writes(self):
         provider = ScriptedProvider([{"action": "read_file", "path": "app.py"}] * 3)

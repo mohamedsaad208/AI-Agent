@@ -1,18 +1,22 @@
-"""Read-only model discovery. Catalog requests do not submit source code or generate tokens."""
+"""Read-only model discovery. Catalog requests do not submit source code or generate tokens.
+
+Discovery and generation must read the *same* endpoint. They used to disagree — the Ollama list was
+a literal loopback URL while generation used ``settings.endpoint`` — so a relocated service listed
+zero models and the window called that "no models found" instead of "wrong address".
+"""
 from decimal import Decimal, InvalidOperation
 import os
 
+from .config import Kind, OLLAMA, OPENROUTER, check_endpoint
 from .errors import ProviderError
 from .providers import request_json
 
-# Ollama's default listen address. A caller with a configured endpoint passes it: discovery used to
-# read this literal while generation read ``settings.endpoint``, so a relocated Ollama listed zero
-# models and the window called that "no models found" rather than "wrong address".
-OLLAMA_LOCAL = "http://127.0.0.1:11434"
+LIVE = "live"
+BUILT_IN = "built-in"
 
 
 def ollama_models(endpoint: str = "") -> list[dict]:
-    base = (str(endpoint or "").strip() or OLLAMA_LOCAL).rstrip("/")
+    base = check_endpoint(OLLAMA, endpoint)
     data = request_json(base + "/api/tags", timeout=10)
     entries = data.get("models")
     if not isinstance(entries, list):
@@ -42,8 +46,9 @@ def price(value) -> Decimal | None:
         return None
 
 
-def openrouter_models(api_key: str | None = None) -> list[dict]:
-    data = request_json("https://openrouter.ai/api/v1/models", key=api_key or os.environ.get("OPENROUTER_API_KEY"),
+def openrouter_models(api_key: str | None = None, endpoint: str = "") -> list[dict]:
+    base = check_endpoint(OPENROUTER, endpoint)
+    data = request_json(base + "/models", key=api_key or os.environ.get("OPENROUTER_API_KEY"),
                         timeout=20, max_bytes=16_000_000)
     entries = data.get("data")
     if not isinstance(entries, list):
@@ -79,3 +84,60 @@ def openrouter_models(api_key: str | None = None) -> list[dict]:
                        "description": pricing_text + context_text +
                                       ("  |  JSON output listed" if json_support else "  |  JSON support not listed")}
     return sorted(found.values(), key=lambda item: item["id"].casefold())
+
+
+def openai_models(base: str, api_key: str | None = None, *, cloud: bool = True) -> list[dict]:
+    """``GET {base}/models`` — the OpenAI-shaped list every compatible server answers.
+
+    The payload is a list of identifiers and nothing else that is useful here: pricing is not in
+    it, so the description says what the request can prove (where it runs) and nothing more.
+    """
+    data = request_json(base + "/models", key=api_key, timeout=20, max_bytes=8_000_000)
+    entries = data.get("data")
+    if not isinstance(entries, list):
+        entries = data.get("models")
+    if not isinstance(entries, list):
+        raise ProviderError("This provider returned an invalid model list.")
+    found = {}
+    for item in entries:
+        name = item.get("id") or item.get("name") if isinstance(item, dict) else item
+        if not isinstance(name, str) or not name.strip():
+            continue
+        found[name] = {"id": name, "name": name, "cloud": cloud,
+                       "free": False,
+                       "description": "Listed by this provider's /models endpoint. Pricing is not "
+                                      "reported there — check the service."}
+    return sorted(found.values(), key=lambda item: item["id"].casefold())
+
+
+def built_in(kind: Kind) -> list[dict]:
+    """The names shipped with the row, used when the live request fails.
+
+    They are a starting point, not a claim that the service still lists them: the sentence that
+    presents them says so, because a stale id costs one refused request while a false promise of
+    "available" costs a task.
+    """
+    return [{"id": name, "name": name, "cloud": kind.cloud, "free": False,
+             "description": "Built-in name for this provider — not confirmed by a live request."}
+            for name in kind.verified]
+
+
+def models_for(kind: Kind, endpoint: str = "",
+               api_key: str | None = None) -> tuple[list[dict], str]:
+    """Discover what a provider row has, and say *where* the answer came from.
+
+    Returns ``(entries, source)`` with ``source`` one of ``LIVE`` or ``BUILT_IN``. Only rows that
+    carry verified names fall back; a local server with nothing on it correctly reports zero models
+    rather than a list of guesses.
+    """
+    base = check_endpoint(kind, endpoint or kind.base)
+    try:
+        if kind.shape == "ollama":
+            return ollama_models(base), LIVE
+        if kind.key == OPENROUTER.key:
+            return openrouter_models(api_key), LIVE
+        return openai_models(base, api_key, cloud=kind.cloud), LIVE
+    except ProviderError:
+        if kind.verified:
+            return built_in(kind), BUILT_IN
+        raise

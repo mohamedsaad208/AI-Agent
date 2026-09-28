@@ -1,0 +1,13 @@
+# Groq: fast hosted inference over an OpenAI-compatible API. The key is read from the environment;
+# this file names the variable and never holds a value, so a profile can sit in a repository safely.
+[model]
+provider = "groq"
+name = "llama-3.3-70b-versatile"
+endpoint = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[limits]
+max_turns = 8
+timeout_seconds = 120
+context_chars = 16000
+output_tokens = 4096

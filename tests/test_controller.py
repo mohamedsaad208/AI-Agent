@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer import git_integration, memory, repair
+from ai_code_engineer import catalog, git_integration, memory, repair
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController
@@ -28,6 +28,19 @@ FREE_ENTRY = {"id": "x:free", "name": "X Free", "free": True, "cloud": True,
 CALCULATOR_BAD = "def add(a, b):\n    return a - b\n"
 CALCULATOR_GOOD = "def add(a, b):\n    return a + b\n"
 PLAN = "# Build it\n\n## 1. Foundation\nCreate the package.\n\n## 2. Register\nReject duplicate emails.\n"
+
+
+def patched_catalog():
+    """The controller's one discovery call, answered without a network.
+
+    Discovery sat behind two functions per provider until the provider list grew; it is now
+    ``models_for(kind, endpoint, key)`` returning ``(entries, source)``, and the window reads the
+    source to say whether a list came from the service or from built-in names. Tests that used to
+    patch one function per provider patch this one.
+    """
+    def models_for(kind, endpoint="", api_key=None):
+        return (list(FREE_ENTRY) if kind.free_only else [OLLAMA_ENTRY]), catalog.LIVE
+    return patch("ai_code_engineer.webapp.controller.models_for", side_effect=models_for)
 
 
 class ProposalModel:
@@ -133,8 +146,7 @@ class ControllerTests(unittest.TestCase):
         self.repo = self.app_dir / "repo"
         (self.repo / "tests").mkdir(parents=True)
         (self.repo / "calculator.py").write_text(CALCULATOR_BAD)
-        started = (patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY]),
-                   patch("ai_code_engineer.webapp.controller.openrouter_models", return_value=[FREE_ENTRY]))
+        started = (patched_catalog(),)
         for patcher in started:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -888,8 +900,7 @@ class BranchTests(unittest.TestCase):
         self.repo = self.app_dir / "repo"
         (self.repo / "tests").mkdir(parents=True)
         (self.repo / "calculator.py").write_text(CALCULATOR_BAD)
-        started = (patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY]),
-                   patch("ai_code_engineer.webapp.controller.openrouter_models", return_value=[FREE_ENTRY]))
+        started = (patched_catalog(),)
         for patcher in started:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1544,8 +1555,7 @@ class CheckpointTests(unittest.TestCase):
                  "calculator.py")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "commit",
                  "-q", "--no-verify", "-m", "first")
-        for patcher in (patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY]),
-                        patch("ai_code_engineer.webapp.controller.openrouter_models", return_value=[FREE_ENTRY]),
+        for patcher in (patched_catalog(),
                         patch("ai_code_engineer.webapp.controller.make_provider",
                               return_value=ProposalModel())):
             patcher.start()
@@ -1634,10 +1644,7 @@ class TaskBranchTests(unittest.TestCase):
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "commit",
                  "-q", "--no-verify", "-m", "first")
         self.base = self.head()
-        for patcher in (patch("ai_code_engineer.webapp.controller.ollama_models",
-                              return_value=[OLLAMA_ENTRY]),
-                        patch("ai_code_engineer.webapp.controller.openrouter_models",
-                              return_value=[FREE_ENTRY])):
+        for patcher in (patched_catalog(),):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -1760,10 +1767,7 @@ class GitRestoreTests(unittest.TestCase):
                  "calculator.py", "notes.md")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "commit",
                  "-q", "--no-verify", "-m", "first")
-        for patcher in (patch("ai_code_engineer.webapp.controller.ollama_models",
-                              return_value=[OLLAMA_ENTRY]),
-                        patch("ai_code_engineer.webapp.controller.openrouter_models",
-                              return_value=[FREE_ENTRY]),
+        for patcher in (patched_catalog(),
                         patch("ai_code_engineer.webapp.controller.make_provider",
                               return_value=ProposalModel())):
             patcher.start()
@@ -1935,8 +1939,7 @@ class BlockApplyTests(unittest.TestCase):
         (self.repo / "src" / "main.py").write_text("def add(a, b):\n    return a - b\n",
                                                    encoding="utf-8", newline="\n")
         (self.repo / ".env").write_text("TOKEN=1\n", encoding="utf-8")
-        for patcher in (patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY]),
-                        patch("ai_code_engineer.webapp.controller.openrouter_models", return_value=[FREE_ENTRY])):
+        for patcher in (patched_catalog(),):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.events = []
@@ -2105,7 +2108,7 @@ class QueueTests(unittest.TestCase):
         (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
         self.model = GatingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                   patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY]),
+                   patched_catalog(),
                    patch("ai_code_engineer.runner.run", return_value=run_result(proof=PROOF))]
         for patcher in started:
             patcher.start()
@@ -2404,7 +2407,7 @@ class TheActivityFeed(unittest.TestCase):
         (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
         self.model = SteppingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                   patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY])]
+                   patched_catalog()]
         for patcher in started:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -2552,7 +2555,7 @@ class TheStepRows(unittest.TestCase):
         (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
         self.model = SteppingModel()
         for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patch("ai_code_engineer.webapp.controller.ollama_models", return_value=[OLLAMA_ENTRY])):
+                        patched_catalog()):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.controller = Scripted(self.app_dir)

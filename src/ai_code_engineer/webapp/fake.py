@@ -13,9 +13,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import git_integration, labels
+from .. import config, git_integration, labels
 from ..errors import PolicyError
-from .controller import PROJECT_ICONS as ICONS
+from .controller import MODES, PROJECT_ICONS as ICONS
 
 BEFORE = """package com.demo.users;
 
@@ -138,9 +138,16 @@ class FakeController:
         # The model picker is a list you search, so the preview needs a catalog and a filter that
         # behaves like the real view — the settings used to hand back one constant.
         self.mode = "Ollama"
-        self.modes = ["Ollama", "OpenRouter · Free", "OpenRouter · Paid"]
-        self.catalogs = {"Ollama": OLLAMA_MODELS, "OpenRouter · Free": FREE_MODELS,
-                         "OpenRouter · Paid": PAID_MODELS}
+        # The same table the real window builds, so the preview is reviewing the provider list and
+        # not a shorter copy of it.
+        self.modes = list(MODES)
+        self.catalogs = {label: (OLLAMA_MODELS if kind.shape == "ollama" else
+                                 FREE_MODELS if label == config.free_mode(kind) else
+                                 PAID_MODELS if label == config.paid_mode(kind) else SERVED_MODELS)
+                         for label, kind in config.mode_rows()}
+        self.endpoints = {kind.key: kind.base for kind in config.KINDS if kind.base}
+        self.profile = ""
+        self.catalog_source = {label: "live" for label in MODES}
         self.model = "qwen2.5-coder:1.5b"
         self.selections = {self.mode: self.model}
         self.model_filter = ""
@@ -253,6 +260,7 @@ class FakeController:
                                {"id": 5, "title": "Refresh-token rotation", "status": "pending", "current": self.step == 5}]},
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
                          "models": self.visible_models()},
+            "connection": self.connection_info(),
             "recipes": ["Maven test", "Maven compile", "pytest"], "recipe": self.recipe,
             "canRun": self.state in {"APPLIED_UNVERIFIED", "CHECKS_PASSED", "VERIFICATION_FAILED", "VERIFICATION_BLOCKED"},
             "runInfo": "No command has run yet." if not self.runs else
@@ -351,6 +359,37 @@ class FakeController:
             return (f'{shown} of {loaded} models match "{self.model_filter.strip()}". '
                     "Clear the filter to see the rest.")
         return f"{loaded} models available. Select one from the list."
+
+    def connection_info(self) -> dict:
+        """The same block the real controller sends, so the Connection tab is reviewable here.
+
+        The scripted window never contacts a provider: an endpoint change re-reads the row's own
+        rules and nothing else, which is what makes it safe to click in a preview.
+        """
+        kind = config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+        endpoint = self.endpoints.get(kind.key, "") or kind.base
+        return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
+                "default_endpoint": kind.base, "cloud": kind.cloud, "shape": kind.shape,
+                "needs_key": kind.needs_key, "key_env": kind.key_env,
+                "consent": config.needs_consent(kind, endpoint),
+                "paid": self.mode == config.paid_mode(kind),
+                "profile": self.profile, "profiles": config.profile_names(),
+                "source": self.catalog_source.get(self.mode, ""),
+                "key_present": bool(self.key.strip())}
+
+    def set_profile(self, label: str) -> None:
+        """Move the preview onto a profile's row — the same three fields the real window sets."""
+        self.profile = label
+        if not label:
+            return
+        try:
+            settings = config.load_profile(label)
+        except Exception:                                  # noqa: BLE001 - a preview reports, never raises
+            return
+        self.mode = config.mode_for(settings.provider, settings.model) or self.mode
+        if settings.endpoint:
+            self.endpoints[config.MODE_KIND[self.mode].key] = settings.endpoint
+        self.model = settings.model
 
     def project_info(self, key: str) -> dict:
         """One drawer payload per scripted project, with the same keys the real one sends.
@@ -482,6 +521,19 @@ class FakeController:
                 self.selections[self.mode] = self.model
                 self.mode, self.model_filter, self.consent = value, "", False
                 self.model = self.selections.get(value, "")
+        elif type == "set_endpoint":
+            # Checked by the same rule the real window uses, so a rejected URL is refused here too
+            # and the tab can be reviewed against a refusal rather than only against a success.
+            kind = config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+            text = str(payload.get("value", "")).strip() or kind.base
+            try:
+                self.endpoints[kind.key] = config.check_endpoint(kind, text)
+            except PolicyError as exc:
+                emit({"kind": "toast", "text": str(exc)})
+            else:
+                emit({"kind": "toast", "text": "%s now points at %s" % (kind.label, self.endpoints[kind.key])})
+        elif type == "set_profile":
+            self.set_profile(str(payload.get("value", "")))
         elif type == "refresh_models":
             emit({"kind": "toast",
                   "text": "%d models listed for %s in this preview — the real window asks the "
@@ -679,6 +731,16 @@ PAID_MODELS = [
     {"id": "anthropic/claude-3.5-sonnet", "name": "Claude 3.5 Sonnet",
      "description": "200k context · $3/M input"},
     {"id": "openai/gpt-4o", "name": "GPT-4o", "description": "128k context · $2.50/M input"},
+]
+# What an OpenAI-shaped server lists: identifiers and nothing else, which is exactly what a real
+# `/models` response carries. Pricing is not in that payload, so the preview does not invent any.
+SERVED_MODELS = [
+    {"id": "qwen2.5-coder-3b-instruct", "name": "qwen2.5-coder-3b-instruct",
+     "description": "Listed by this provider's /models endpoint. Pricing is not reported there — "
+                    "check the service."},
+    {"id": "deepseek-coder", "name": "deepseek-coder",
+     "description": "Listed by this provider's /models endpoint. Pricing is not reported there — "
+                    "check the service."},
 ]
 MODELS = OLLAMA_MODELS
 

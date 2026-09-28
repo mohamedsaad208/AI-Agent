@@ -6,10 +6,10 @@ import math
 import os
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from .config import Settings, validate
+from .config import (Kind, OLLAMA, OPENROUTER, Settings, check_endpoint, kind_for, needs_consent,
+                     validate)
 from .errors import PolicyError, ProviderError
 from .redaction import redact
 
@@ -93,11 +93,9 @@ class OllamaProvider:
         self.model = settings.model
         self.supports_thinking = False
         self.allow_cloud = allow_cloud
-        url = urlparse(settings.endpoint)
-        if (url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost", "::1"}
-                or url.username or url.password or url.path not in {"", "/"} or url.query or url.fragment):
-            raise PolicyError("Local mode accepts a loopback HTTP Ollama endpoint only.")
-        self.endpoint = settings.endpoint.rstrip("/")
+        # One rule for every provider, in ``config``: this device only, no credentials in the URL.
+        # It used to refuse a URL *path* as well, which is how a relocated Ollama became unusable.
+        self.endpoint = check_endpoint(OLLAMA, settings.endpoint)
 
     def preflight(self) -> None:
         info = request_json(self.endpoint + "/api/show", {"model": self.model}, timeout=10)
@@ -133,26 +131,45 @@ class OllamaProvider:
         return value
 
 
-class OpenRouterProvider:
-    def __init__(self, settings: Settings, api_key: str | None = None, *, allow_paid: bool = False):
-        if settings.model != "openrouter/free" and not settings.model.endswith(":free") and not allow_paid:
-            raise PolicyError("Select the Paid cloud option explicitly to use a paid OpenRouter model.")
+class OpenAICompatibleProvider:
+    """Every provider that answers ``POST {base}/chat/completions`` with the OpenAI shape.
+
+    That is OpenAI, Groq, DeepSeek, OpenRouter, LM Studio, vLLM and any custom base a user types:
+    one body, one response, a different URL and a different key. Anthropic and Gemini are *not* in
+    this class — different auth header, different body, different response — and are not offered.
+    The three things that really are OpenRouter-only (the upstream routing block, the echoed
+    upstream model, the free/paid rule) hang off ``Kind`` flags rather than a subclass.
+    """
+
+    def __init__(self, settings: Settings, api_key: str | None = None, *,
+                 allow_paid: bool = False, kind: Kind | None = None):
+        self.kind = kind or kind_for(settings.provider) or OPENROUTER
         self.settings = settings
         self.model = settings.model
-        self.key = api_key or os.environ.get("OPENROUTER_API_KEY")
-        if not self.key:
-            raise ProviderError("Set OPENROUTER_API_KEY in your environment (never in a file).")
+        if self.kind.free_only and not allow_paid and settings.model != "openrouter/free" \
+                and not str(settings.model).endswith(":free"):
+            raise PolicyError("Select the Paid cloud option explicitly to use a paid OpenRouter model.")
+        self.endpoint = check_endpoint(self.kind, settings.endpoint)
+        env_name = settings.api_key_env or self.kind.key_env
+        self.key = api_key or (os.environ.get(env_name) if env_name else "")
+        # A custom endpoint may or may not want a key — that is the user's server to decide — so only
+        # the rows that are known to require one refuse without it.
+        if self.kind.needs_key and not self.key:
+            raise ProviderError(f"Set {env_name or 'an API key'} in your environment (never in a file).")
 
     def generate(self, messages: list[dict], json_mode: bool = True) -> str:
         body = {
             "model": self.settings.model, "messages": messages, "stream": False,
             "temperature": 0, "max_tokens": self.settings.output_tokens,
-            "provider": {"allow_fallbacks": False, "require_parameters": True},
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        result = request_json("https://openrouter.ai/api/v1/chat/completions", body,
-                              key=self.key, timeout=self.settings.timeout_seconds)
+        if self.kind.routing:
+            # Refuse OpenRouter's own failovers: a silent hop to another upstream means the model
+            # that answered is not the one that was reviewed.
+            body["provider"] = {"allow_fallbacks": False, "require_parameters": True}
+        result = request_json(self.endpoint + "/chat/completions", body,
+                              key=self.key or None, timeout=self.settings.timeout_seconds)
         try:
             choice = result["choices"][0]
             # Proposals must be complete; chat tolerates a missing finish_reason.
@@ -160,21 +177,25 @@ class OpenRouterProvider:
             if not finished:
                 raise ProviderError("Model did not finish normally; output discarded.")
             value = choice["message"]["content"]
-            self.model = result.get("model", self.model)
+            if self.kind.routing:
+                self.model = result.get("model", self.model)
             if not isinstance(value, str) or not value:
                 raise KeyError("content")
             return value
         except (KeyError, IndexError, TypeError, AttributeError):
-            raise ProviderError("Invalid OpenRouter response.") from None
+            raise ProviderError(f"Invalid {self.kind.label} response.") from None
 
 
 def make_provider(settings: Settings, *, allow_cloud: bool, data_class: str,
                   api_key: str | None = None, allow_paid: bool = False) -> ModelProvider:
     validate(settings)
-    if settings.provider == "openrouter":
-        if not allow_cloud or data_class not in {"public", "synthetic"}:
-            raise PolicyError("Cloud requires --allow-cloud and --data-class public or synthetic.")
-        return OpenRouterProvider(settings, api_key=api_key, allow_paid=allow_paid)
-    provider = OllamaProvider(settings, allow_cloud=allow_cloud and data_class in {"public", "synthetic"})
-    provider.preflight()
-    return provider
+    kind = kind_for(settings.provider) or OLLAMA
+    if kind.shape == "ollama":
+        # A cloud-backed Ollama model is discovered in preflight, not assumed from the endpoint.
+        provider = OllamaProvider(settings, allow_cloud=allow_cloud and data_class in {"public", "synthetic"})
+        provider.preflight()
+        return provider
+    if needs_consent(kind, settings.endpoint) and (
+            not allow_cloud or data_class not in {"public", "synthetic"}):
+        raise PolicyError("Cloud requires --allow-cloud and --data-class public or synthetic.")
+    return OpenAICompatibleProvider(settings, api_key=api_key, allow_paid=allow_paid, kind=kind)

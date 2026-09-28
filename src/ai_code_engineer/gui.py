@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
 
-from .catalog import ollama_models, openrouter_models
+from .catalog import LIVE, models_for
 from .chat import create_chat, load_chat, respond, title_for
 from . import config
 from .config import Settings
@@ -22,7 +22,7 @@ from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
-                     friendly_error, is_arabic, state_label, status_text)
+                     catalog_status_line, friendly_error, is_arabic, state_label, status_text)
 from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
@@ -194,11 +194,20 @@ class AgentWindow:
         self.mode = tk.StringVar(value="Ollama")
         self.model = tk.StringVar()
         self.model_filter = tk.StringVar()
+        # Both windows keep one endpoint per provider row: a machine can run Ollama and LM Studio at
+        # once, and switching between them must not lose where the other one lives.
+        self.endpoint = tk.StringVar()
+        self.profile_var = tk.StringVar(value="")
         self.search = tk.StringVar()
         self.model_info = tk.StringVar(value="Loading the model list…")
-        self.catalogs = {"Ollama": [], "OpenRouter · Free": [], "OpenRouter · Paid": []}
+        self.catalogs = {mode: [] for mode in config.MODES}
         self.selections = {}
         self.active_mode = "Ollama"
+        # One endpoint per provider row, held in memory and in the registry — never a key, so
+        # nothing in here is worth leaking.
+        self.endpoints: dict[str, str] = {}
+        self.profile = ""
+        self.catalog_source: dict[str, str] = {}
         self.key = tk.StringVar()
         try:
             saved_timeout = int(self._saved_ui.get("request_timeout") or config.REQUEST_TIMEOUT_DEFAULT)
@@ -227,9 +236,18 @@ class AgentWindow:
         self.repo.trace_add("write", self.project_changed)
         self.search.trace_add("write", lambda *_: self.refresh_recent())
         saved_mode = self._saved_ui.get("mode")
+        saved_endpoints = self._saved_ui.get("endpoints")
+        if isinstance(saved_endpoints, dict):
+            self.endpoints = {row: str(value) for row, value in saved_endpoints.items()
+                              if row in config.BY_KEY and isinstance(value, str)}
+        saved_profile = self._saved_ui.get("profile")
+        self.profile = saved_profile if isinstance(saved_profile, str) else ""
+        self.profile_var.set(self.profile)
+        self.endpoint.set(self.endpoint_for())
         if isinstance(saved_mode, str) and saved_mode in self.catalogs:
             self.mode.set(saved_mode)
             self.active_mode = saved_mode
+            self.endpoint.set(self.endpoint_for())
             # Restore needs the cloud/key UI packed for a restored cloud mode;
             # otherwise the approval prompt appears with no visible checkbox.
             self.model_changed()
@@ -769,10 +787,33 @@ class AgentWindow:
         Tooltip(timeout_box, "Small local models need minutes for a large proposal; raise this if requests time out.")
         self.job_controls.append((timeout_box, "normal"))
         self.request_timeout.trace_add("write", lambda *_: self._save_state())
+        # Connection: where the selected provider row actually is. An endpoint used to be reachable
+        # only from a TOML file and the command line, so a relocated Ollama or an LM Studio server on
+        # another port could not be pointed at from the window at all.
+        self.conn_frame = ttk.Frame(parent)
+        self.conn_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(self.conn_frame, text="Profile (a file in profiles/)", anchor="w").pack(fill="x")
+        self.profile_box = ttk.Combobox(self.conn_frame, textvariable=self.profile_var,
+                                        values=[""] + config.profile_names(), state="readonly")
+        self.profile_box.pack(fill="x")
+        self.profile_box.bind("<<ComboboxSelected>>",
+                              lambda _e: self.set_profile(self.profile_var.get()))
+        Tooltip(self.profile_box, "A profile sets provider, model and endpoint. It names the key's "
+                                  "environment variable and never holds a key.")
+        ttk.Label(self.conn_frame, text="Endpoint (where requests go)", anchor="w").pack(fill="x", pady=(8, 3))
+        endpoint_entry = ttk.Entry(self.conn_frame, textvariable=self.endpoint)
+        endpoint_entry.pack(fill="x")
+        for event in ("<Return>", "<FocusOut>"):
+            endpoint_entry.bind(event, lambda _e: self.set_endpoint(self.endpoint.get()))
+        Tooltip(endpoint_entry, "A local row must stay on this device; a remote address needs https "
+                                "and the approval below.")
         self.cloud_frame = ttk.Frame(parent)
         self.key_frame = ttk.Frame(self.cloud_frame)
         self.key_frame.pack(fill="x")
-        ttk.Label(self.key_frame, text="OpenRouter API key (not saved)", anchor="w").pack(fill="x", pady=(8, 3))
+        # The label names the variable the row actually reads, because a Groq key is not an
+        # OpenRouter key and one box had better say which it is.
+        self.key_label = ttk.Label(self.key_frame, text="API key (not saved)", anchor="w")
+        self.key_label.pack(fill="x", pady=(8, 3))
         key_entry = ttk.Entry(self.key_frame, textvariable=self.key, show="•")
         key_entry.pack(fill="x")
         check = ttk.Checkbutton(self.cloud_frame, variable=self.cloud_ok,
@@ -956,6 +997,7 @@ class AgentWindow:
     def _save_state(self):
         ui = {"mode": self.mode.get(), "last_project": self.repo.get().strip(),
               "last_chat": self.chat_id, "request_timeout": self.request_timeout_seconds(),
+              "endpoints": dict(self.endpoints), "profile": self.profile,
               "plan_chained": bool(self.chained.get())}
         model = self.model.get() or self._pending_model
         if model:
@@ -1226,6 +1268,9 @@ class AgentWindow:
         self.selections[self.active_mode] = self.model.get()
         self.active_mode = self.mode.get()
         self.model.set(self.selections.get(self.active_mode, ""))
+        # The entry follows the row: LM Studio's address is not Ollama's, and showing the previous
+        # row's endpoint under the new name is how a key ends up somewhere it was never meant to go.
+        self.endpoint.set(self.endpoint_for())
         self.cloud_ok.set(False)
         self.model_filter.set("")
         self.filter_models()
@@ -1251,39 +1296,46 @@ class AgentWindow:
         entry = self.selected_model()
         self.selections[self.mode.get()] = self.model.get()
         info = (entry["name"] + "\n" + entry["description"]) if entry else \
-            f"{len(self.model_box.cget('values'))} models available. Select one from the list."
+            f"{len(self.model_box.cget('values'))} models available at {self.endpoint_for()}. " \
+            "Select one from the list."
         if entry and entry["id"] in RECOMMENDED:
             info += "\n★ " + RECOMMENDED[entry["id"]]
         self.model_info.set(info)
-        openrouter = self.mode.get().startswith("OpenRouter")
-        cloud = openrouter or bool(entry and entry.get("cloud"))
-        if cloud:
+        cloud, paid = self.cloud_choice()
+        kind = self.active_kind()
+        # The key field belongs to any row that needs one, not to OpenRouter alone: LM Studio has no
+        # key box at all and Groq has two, and both are the same control.
+        if cloud or kind.needs_key:
             self.cloud_frame.pack(fill="x", before=self.footer_actions)
-            if openrouter:
+            if kind.needs_key:
                 self.key_frame.pack(fill="x", before=self.cloud_consent)
+                self.key_label.configure(text="%s key (not saved)" % (kind.key_env or "API"))
             else:
                 self.key_frame.pack_forget()
         else:
             self.cloud_frame.pack_forget()
             self.cloud_ok.set(False)
-        if self.mode.get() == "OpenRouter · Paid":
-            self.hint.configure(text="Paid requests use your OpenRouter balance. Prices are catalog estimates; set a spending limit on your API key.")
-        else:
-            self.hint.configure(text="You will review a proposal first. Project files are not changed automatically.")
+        self.hint.configure(text=("Paid requests use your %s balance. Prices are catalog estimates; "
+                                  "set a spending limit on your API key." % kind.label) if paid else
+                            "You will review a proposal first. Project files are not changed automatically.")
         self._save_state()
 
     def check_setup(self):
         if self.busy:
             return
         selected_mode = self.mode.get()
+        kind = self.active_kind()
         api_key = self.key.get().strip() or None
+        endpoint = self.endpoint_for(selected_mode)
 
         def done(result):
-            if selected_mode == "Ollama":
-                self.catalogs["Ollama"] = result
+            entries, source = result
+            self.catalog_source[selected_mode] = source
+            if kind.free_only:
+                self.catalogs[config.free_mode(kind)] = [row for row in entries if row.get("free")]
+                self.catalogs[config.paid_mode(kind)] = [row for row in entries if not row.get("free")]
             else:
-                self.catalogs["OpenRouter · Free"] = [entry for entry in result if entry["free"]]
-                self.catalogs["OpenRouter · Paid"] = [entry for entry in result if not entry["free"]]
+                self.catalogs[selected_mode] = entries
             self.filter_models()
             pending = self._pending_model
             self._pending_model = ""
@@ -1293,10 +1345,12 @@ class AgentWindow:
                 self.model.set(DEFAULT_MODEL)
             self.model_changed()
             count = len(self.catalogs[self.mode.get()])
-            self.status.set(f"{count} models loaded. Using {self.model.get() or 'the model you choose'}." if count else
-                            "No models found for this provider. Check the service or choose another provider.")
-            self.append_log(f"Refreshed {selected_mode}: {count} models. No generation request was sent.")
-        operation = ollama_models if selected_mode == "Ollama" else lambda: openrouter_models(api_key)
+            self.status.set(catalog_status_line(arabic=self.arabic, count=count,
+                                                model=self.model.get(), label=selected_mode,
+                                                live=source == LIVE))
+            self.append_log("Refreshed %s: %d models (%s). No generation request was sent."
+                            % (selected_mode, count, source))
+        operation = lambda: models_for(kind, endpoint, api_key)
         self.run_job(operation, done, "Refreshing available models…")
 
     def unverified_prior_task(self, chat_id: str, repo: str) -> dict | None:
@@ -1317,10 +1371,8 @@ class AgentWindow:
         task = self.task.get("1.0", "end").strip()
         plan_file = self.plan_file.get().strip() or None
         model = self.model.get().strip()
-        openrouter = self.mode.get().startswith("OpenRouter")
         entry = self.selected_model()
-        cloud = openrouter or bool(entry and entry.get("cloud"))
-        paid = self.mode.get() == "OpenRouter · Paid"
+        cloud, paid = self.cloud_choice()
         if repo and not Path(repo).is_dir():
             self.status.set(status_text("need_folder_exists", arabic=self.arabic))
             return
@@ -1336,8 +1388,9 @@ class AgentWindow:
         if cloud and not self.cloud_ok.get():
             self.status.set(status_text("consent_message", arabic=self.arabic))
             return
-        settings = replace(Settings(), provider="openrouter" if openrouter else "ollama", model=model,
-                           max_turns=8 if cloud else 12)
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return
         key = self.key.get().strip() or None
         if not repo:
             self.start_chat(task, settings, cloud, paid, key)
@@ -1772,6 +1825,81 @@ class AgentWindow:
             value = None                    # the widget is gone; the default is the honest answer
         return config.clamp_request_timeout(value)
 
+    def active_kind(self):
+        return config.MODE_KIND.get(self.mode.get(), config.DEFAULT_KIND)
+
+    def endpoint_for(self, mode: str = "") -> str:
+        kind = config.MODE_KIND.get(mode or self.mode.get(), config.DEFAULT_KIND)
+        return self.endpoints.get(kind.key, "") or kind.base
+
+    def cloud_choice(self):
+        """``(cloud, paid)`` for the row on screen: the provider, the endpoint and the model entry
+        can each make a task leave the device, and only the last one is a property of the row."""
+        kind = self.active_kind()
+        entry = self.selected_model()
+        paid = kind.free_only and self.mode.get() == config.paid_mode(kind)
+        cloud = config.needs_consent(kind, self.endpoint_for()) or bool(entry and entry.get("cloud"))
+        return cloud, paid
+
+    def task_settings(self, cloud: bool):
+        """Settings for the selected row, or None with the reason on the status line.
+
+        An endpoint is checked when it is typed, but a row can still be unusable — Custom with an
+        empty field — and refusing here keeps a half-built Settings out of the worker thread.
+        """
+        kind = self.active_kind()
+        try:
+            return config.settings_for(kind, self.endpoint_for(), model=self.model.get().strip(),
+                                       api_key_env=kind.key_env,
+                                       max_turns=8 if cloud else 12,
+                                       timeout_seconds=self.request_timeout_seconds())
+        except AgentError as exc:
+            self.status.set(friendly_error(exc))
+            return None
+
+    def set_endpoint(self, value: str) -> None:
+        kind = self.active_kind()
+        text = str(value or "").strip()
+        if not text:
+            self.endpoints.pop(kind.key, None)
+        else:
+            try:
+                self.endpoints[kind.key] = config.check_endpoint(kind, text)
+            except AgentError as exc:
+                self.status.set(friendly_error(exc))
+                return
+        # A list of models from the old address is not a list of models at the new one.
+        for label, row in config.mode_rows():
+            if row is kind:
+                self.catalogs[label] = []
+                self.catalog_source.pop(label, None)
+        self.endpoint.set(self.endpoint_for())
+        self._save_state()
+        self.check_setup()
+
+    def set_profile(self, label: str) -> None:
+        self.profile = label
+        try:
+            settings = config.load_profile(label) if label else None
+        except AgentError as exc:
+            self.status.set(friendly_error(exc))
+            self.profile = ""
+            self._save_state()
+            return
+        if settings is not None:
+            mode = config.mode_for(settings.provider, settings.model)
+            if mode in self.catalogs:
+                self.selections[self.mode.get()] = self.model.get()
+                self.mode.set(mode)
+                self.active_mode = mode
+            if settings.endpoint:
+                self.set_endpoint(settings.endpoint)
+            if settings.model:
+                self.model.set(settings.model)
+            self._pending_model = ""
+            self.filter_models()
+        self._save_state()
+
     def provider_args(self):
         """Validate the composer selection; returns settings for one more request."""
         model = self.model.get().strip()
@@ -1779,15 +1907,14 @@ class AgentWindow:
         if entry is None:
             self.status.set("Select a model from the list first, then try again.")
             return None
-        openrouter = self.mode.get().startswith("OpenRouter")
-        cloud = openrouter or bool(entry.get("cloud"))
+        cloud, paid = self.cloud_choice()
         if cloud and not self.cloud_ok.get():
             self.status.set(status_text("consent_project", arabic=self.arabic))
             return None
-        settings = replace(Settings(), provider="openrouter" if openrouter else "ollama",
-                           model=model, max_turns=8 if cloud else 12,
-                           timeout_seconds=self.request_timeout_seconds())
-        return settings, cloud, self.mode.get() == "OpenRouter · Paid", (self.key.get().strip() or None)
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return None
+        return settings, cloud, paid, (self.key.get().strip() or None)
 
     def run_tests(self, auto_fix: bool = False):
         """Run one allowlisted command in the approved folder and record the result."""

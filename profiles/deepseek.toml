@@ -1,0 +1,13 @@
+# DeepSeek: hosted, OpenAI-compatible. The key is read from the environment; this file names the
+# variable and never holds a value.
+[model]
+provider = "deepseek"
+name = "deepseek-chat"
+endpoint = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[limits]
+max_turns = 8
+timeout_seconds = 180
+context_chars = 24000
+output_tokens = 4096
