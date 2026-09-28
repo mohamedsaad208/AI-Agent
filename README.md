@@ -1,55 +1,51 @@
-# 🤖 AI Code Engineer (Autonomous Software Engineering Agent)
+<div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python Version](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-green.svg)]()
-[![Developed with AI](https://img.shields.io/badge/Developed%20with-AI%20%26%20Human%20Pairing-8A2BE2.svg)]()
-[![Tests](https://img.shields.io/badge/Tests-620%2B%20Passing-brightgreen.svg)]()
+<img src="assets/banner.svg" alt="AI Code Engineer Banner" width="100%"/>
 
-> 💡 **Developed with AI:** This project was architected and developed using advanced Human-AI pair programming, demonstrating modern agentic coding workflows, zero-trust security isolation, and self-healing software loops.
->
-> 🚀 **Autonomous, privacy-first AI Software Engineer Agent** running locally or in the cloud. Designed to inspect repositories, parse code structures via AST, propose cryptographic diffs, execute sandboxed verification, and fix errors autonomously.
+# AI Code Engineer
+### Give your coding workflow an autonomous, privacy-first software engineer.
 
----
+AI Code Engineer is an open-source autonomous agent framework for real-world software engineering: AST repository indexing, cryptographic diff proposals, zero-trust workspace security, automated JUnit test loops, and multi-provider LLM support (Ollama local, OpenRouter, OpenAI, Groq, DeepSeek).
 
-## 🌟 Key Features
+[![License](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3B82F6?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-10B981?style=for-the-badge&logo=linux&logoColor=white)]()
+[![Developed with AI](https://img.shields.io/badge/Built%20With-AI%20%26%20Human%20Pairing-8B5CF6?style=for-the-badge&logo=openai&logoColor=white)]()
+[![Tests](https://img.shields.io/badge/Tests-620%2B%20Passing-06B6D4?style=for-the-badge&logo=pytest&logoColor=white)]()
 
-- 🔒 **Zero-Trust Security & Workspace Isolation:**
-  - Strict path traversal barriers, symlink blocking, and secret redaction (AWS, GitHub tokens, Bearer keys, .env).
-  - Explicit cryptographic review (`SHA-256` proposal hashes) before any file write.
-  - Safe rollback capability without destructive git resets.
+[Quick Start](#-quick-start) •
+[Why AI Code Engineer](#-why-ai-code-engineer) •
+[Platform Guide](#-platform-guide) •
+[Try These First](#-try-these-first) •
+[Architecture](#-architecture) •
+[Contributing](#-contributing)
 
-- 🧠 **Multi-Provider LLM Engine:**
-  - **Local (Offline & Private):** Full integration with **Ollama** (e.g., `qwen2.5-coder`, `deepseek-coder`, `llama3`).
-  - **Cloud:** **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, and generic OpenAI-compatible APIs.
-
-- 🗺️ **Repository AST Indexing & Context Optimization:**
-  - In-memory symbol parser (Python AST, Java/Kotlin, JS/TS, Go, Rust) provides the LLM with method signatures, class hierarchies, and dependencies without burning context tokens on unnecessary file reads.
-
-- 🧪 **Automated Test & Self-Correction Loop:**
-  - Automatic detection of project toolchains (`pytest`, `unittest`, `Maven`, `Gradle`, `npm/node`, `cargo`, `go test`).
-  - Parses JUnit XML reports for evidence-backed test verification.
-  - Self-healing loop that feeds test failures back to the LLM for autonomous fixes (up to 3 rounds).
-
-- 🖥️ **Modern Desktop WebApp & Interactive CLI:**
-  - Integrated local WebApp with real-time streaming, diff previews, task queuing, and interactive chat.
-  - Interactive CLI text menu for headless or remote server workflows.
+</div>
 
 ---
 
-## 🚀 Quick Start
+# 🚀 Why AI Code Engineer
 
-### Prerequisites
-- **Python 3.11** or newer.
-- *(Optional for Local LLM)*: [Ollama](https://ollama.com/) running locally (`ollama serve`).
+| Feature | Why it matters |
+| :--- | :--- |
+| 🔒 **Zero-Trust Security** | Path-traversal guards, symlink blocking, and automatic secret redaction (AWS, GitHub tokens, Bearer keys, `.env`) prevent leakage to logs or LLMs. |
+| 🛡️ **Cryptographic Diffs** | Nothing reaches your disk without explicit approval. All changes generate `SHA-256` proposal hashes and support one-click rollbacks. |
+| ⚡ **100% Offline & Local** | Full first-class support for **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Code stays on your hardware. |
+| ☁️ **Multi-Provider Cloud** | Seamlessly switch between **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, or custom OpenAI-compatible endpoints. |
+| 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
+| 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
+| 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
 
-### 1. Clone the Repository
+---
+
+# ⚡ Quick Start
+
+## 1. Clone & Verify
 ```bash
 git clone https://github.com/mohamedsaad208/AI-Agent.git
 cd AI-Agent
 ```
 
-### 2. Run Diagnostics & Verification
 ```bash
 # Run self-diagnostics
 python agent.py doctor
@@ -63,82 +59,43 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 💻 How to Run (Platform Guide)
+# 💻 Platform Guide
 
-### 🪟 Windows
-* **Desktop WebApp (GUI):**
-  - Simply double-click `Run-Agent.bat`
-  - *Or via terminal:*
-    ```powershell
-    python desktop.pyw
-    ```
-* **Interactive CLI:**
-  - Double-click `Run-Agent-CLI.bat`
-  - *Or via terminal:*
-    ```powershell
-    python launcher.py
-    ```
+| Platform | GUI WebApp Launcher | Interactive CLI Launcher | Direct Terminal Command |
+| :--- | :--- | :--- | :--- |
+| **🪟 Windows** | Double-click `Run-Agent.bat` | Double-click `Run-Agent-CLI.bat` | `python desktop.pyw` |
+| **🐧 Linux** | `./run-agent.sh` | `./run-agent-cli.sh` | `python3 desktop.pyw` |
+| **🍎 macOS** | `./run-agent.sh` | `./run-agent-cli.sh` | `python3 desktop.pyw` |
 
----
+<details>
+<summary><strong>🐧 Linux & 🍎 macOS First-Time Setup</strong></summary>
 
-### 🐧 Linux (Ubuntu, Debian, Fedora, Arch)
-1. **Give execution permissions (first time only):**
-   ```bash
-   chmod +x run-agent.sh run-agent-cli.sh
-   ```
-2. **Launch Desktop WebApp:**
-   ```bash
-   ./run-agent.sh
-   ```
-3. **Launch Interactive CLI Menu:**
-   ```bash
-   ./run-agent-cli.sh
-   ```
-
----
-
-### 🍎 macOS
-1. **Give execution permissions (first time only):**
-   ```bash
-   chmod +x run-agent.sh run-agent-cli.sh
-   ```
-2. **Launch Desktop App:**
-   ```bash
-   ./run-agent.sh
-   # Or directly:
-   python3 desktop.pyw
-   ```
-3. **Launch Interactive CLI Menu:**
-   ```bash
-   ./run-agent-cli.sh
-   ```
-
----
-
-### ⚡ Direct Python Execution (All Platforms)
+Make the shell launchers executable:
 ```bash
-# Start WebApp server directly
-python -m ai_code_engineer.webapp
-
-# Start headless CLI directly
-python agent.py --help
+chmod +x run-agent.sh run-agent-cli.sh
 ```
 
----
+Launch the GUI:
+```bash
+./run-agent.sh
+```
 
-## 💡 Usage Examples
+Launch the interactive CLI:
+```bash
+./run-agent-cli.sh
+```
+</details>
 
-### Running with a Local Model (Ollama)
+<details>
+<summary><strong>⚙️ Advanced Headless CLI Usage</strong></summary>
+
 ```powershell
 # Index repository symbols
 python agent.py map --repo examples/demo_repo
 
-# Plan and propose code changes
+# Plan and propose code changes with local Ollama
 python agent.py plan "Fix add in calculator.py so it adds two numbers" --repo examples/demo_repo --config profiles/local.toml
-```
 
-### Review, Apply & Verify
-```powershell
 # Review proposed diff
 python agent.py review "<session_id>"
 
@@ -151,63 +108,82 @@ python agent.py verify "<session_id>"
 # Rollback if needed
 python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ```
+</details>
 
 ---
 
-## 🏗️ Architecture Overview
+# 🎯 Try These First
+
+- **Fix a Bug with Automated Verification:**  
+  *"Read the failing tests in `tests/test_auth.py` and inspect `src/auth.py`. Fix the token expiration validation without breaking backwards compatibility, then run tests."*
+
+- **Implement a Multi-Phase Plan:**  
+  Attach a `plan.md` file using the **+ Plan** button in the WebApp:  
+  *"Implement Phase 1 from the attached plan only. Create missing DTO classes and verify syntax."*
+
+- **Refactor with AST Context:**  
+  *"Inspect the repository structure and refactor `UserService` to extract email notifications into an independent `NotificationService` interface."*
+
+- **Autonomous Self-Healing Loop:**  
+  Click **Run & Fix** on the Checks card to allow the agent to run the test suite, read compiler errors, and rewrite code until all tests turn green.
+
+---
+
+# 🏗️ Architecture
 
 ```
-       +-------------------------------------------------------+
-       |             Desktop UI / WebApp / CLI                 |
-       +-------------------------------------------------------+
-                                  |
-                                  v
-+---------------------------------------------------------------------+
-|                      Agent Orchestration Engine                      |
-|  - Task Planner & Queue Manager     - Step-by-Step Ledger           |
-|  - AST Symbol Indexer & Repo Map    - Memory & Standing Notes       |
-+---------------------------------------------------------------------+
-            |                                         |
-            v                                         v
-+-----------------------+                 +-----------------------+
-|   Model Providers     |                 |  Workspace & Security |
-|  - Ollama (Local)     |                 |  - Path Traversal Guard
-|  - OpenRouter (Cloud) |                 |  - Secret Redactor    |
-|  - OpenAI / Generic   |                 |  - Hash-locked Diff   |
-+-----------------------+                 +-----------------------+
-                                                      |
-                                                      v
-                                          +-----------------------+
-                                          | Verification & Checks |
-                                          |  - JUnit XML Parser   |
-                                          |  - Self-Healing Loop  |
-                                          +-----------------------+
+                     +---------------------------------------+
+                     |       Desktop WebApp / Native UI      |
+                     +---------------------------------------+
+                                         |
+                                         v
++---------------------------------------------------------------------------------+
+|                           Agent Orchestration Engine                            |
+|  - Task Planner & Queue Manager            - Step-by-Step Ledger (Planbook)     |
+|  - AST Symbol Indexer & Repo Map           - Persistent Project Memory          |
++---------------------------------------------------------------------------------+
+             |                                                  |
+             v                                                  v
++--------------------------+                      +-------------------------------+
+|      Model Providers     |                      |      Workspace & Security     |
+|  - Ollama (Local)        |                      |  - Path Traversal Guard       |
+|  - OpenRouter (Cloud)    |                      |  - Zero-Trust Secret Redactor |
+|  - OpenAI / Groq / Custom|                      |  - SHA-256 Hash-Locked Diffs  |
++--------------------------+                      +-------------------------------+
+                                                                |
+                                                                v
+                                                  +-------------------------------+
+                                                  |     Verification & Checks     |
+                                                  |  - Toolchain Detectors        |
+                                                  |  - JUnit XML Evidence Parser  |
+                                                  |  - Autonomous Repair Loop     |
+                                                  +-------------------------------+
 ```
 
 ---
 
-## 🤝 Contributing
+# 🤝 Contributing
 
-We welcome contributions from the community! Because this repository enforces strict code quality and branch protection, please follow these steps:
+We welcome contributions from the global open-source community!
 
 1. **Fork** the repository.
-2. **Create a feature branch:**
+2. **Create your feature branch:**
    ```bash
-   git checkout -b feature/your-feature-name
+   git checkout -b feature/amazing-feature
    ```
-3. **Write clean code & ensure all tests pass:**
+3. **Ensure all tests pass:**
    ```bash
    python -m unittest discover -s tests -v
    ```
 4. **Commit your changes:**
    ```bash
-   git commit -m "feat: describe your feature clearly"
+   git commit -m "feat: add amazing new feature"
    ```
 5. **Push to your fork and submit a Pull Request (PR).**
 
-> ⚠️ **Branch Protection Note:** Direct pushes to `main` are restricted. All changes must be submitted via Pull Requests and pass automated checks before merging.
+> ⚠️ **Branch Protection Note:** Direct pushes to `main` are restricted. All contributions must go through Pull Requests and pass automated verification.
 
 ---
 
-## 📄 License
-This project is open-source under the [MIT License](LICENSE).
+# 📄 License
+This project is open-source software licensed under the [MIT License](LICENSE).
