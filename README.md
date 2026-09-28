@@ -20,6 +20,10 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 [Architecture](#-architecture) •
 [Contributing](#-contributing)
 
+<br/>
+
+<img src="assets/demo.gif" alt="AI Code Engineer Live Demo" width="100%"/>
+
 </div>
 
 ---
