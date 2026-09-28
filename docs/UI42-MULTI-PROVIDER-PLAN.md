@@ -150,3 +150,61 @@ at the bottom are open.
    `http://` host to a cloud key is the one path that could leak it.
 5. **Where a profile is chosen**: the Settings drawer (recommended — provider, model, endpoint and key already
    live in that area) or the sidebar next to the project, where the tool's other per-folder choices are?
+
+---
+
+## As built — decisions answered
+
+**"نفذ على التوصيات الخمس"** (2026-09-28): all five recommendations stand. No Anthropic or Gemini
+adapter; the "Keep going?" gate stays and Phase 4 adds one batch-scoped answer to it; streaming
+covers chat answers *and* proposals into the live step row, with Stop-mid-generation deferred;
+`generic` is free on loopback and behind the consent switch everywhere else; the profile picker is
+in the Settings drawer.
+
+## As built — Phase 1, the connection spine
+
+**832 → 881 tests green.** `tests/test_connection.py` is new: 49 tests over the provider table, the
+endpoint policy, one request shape per row, discovery following the configured endpoint, the
+built-in fallback and its sentence, the profiles, and the web window's connection surface.
+
+- **`config.py` owns the table**, not `providers.py` as planned: `validate` needs it and
+  `providers` imports `config`, so the other direction is a cycle. `Kind` carries
+  `key/label/base/shape/cloud/needs_key/key_env/routing/free_only/verified`; `mode_rows()` is the
+  list both windows show, so the two `MODES` copies are gone with it.
+- **`check_endpoint` replaces the loopback rule** at `providers.py:96-99`. A URL path is allowed —
+  that is what `/v1` is, and refusing it made every OpenAI-compatible base unusable. Still refused:
+  any scheme but http/https, credentials in the URL, a query or a fragment, a remote host for a
+  local row, and cleartext to a remote address.
+- **One class for seven rows.** `OpenAICompatibleProvider` replaced `OpenRouterProvider`; the three
+  things that really are OpenRouter-only became flags (the upstream routing block, the echoed
+  upstream model, the free/paid rule). `OllamaProvider` keeps `/api/chat`, `format:"json"`, the
+  `num_ctx` sizing and `think:false` — those are not OpenAI-shaped and dropping them would regress
+  the CPU-only loop this tool exists for.
+- **Discovery and generation read one endpoint.** `ollama_models(endpoint)`,
+  `openrouter_models(api_key, endpoint)`, a new `openai_models(base, key)` that accepts both
+  `/models` payload shapes, and `models_for(kind, endpoint, key) -> (entries, source)`. Only rows
+  with genuinely-known names fall back, and `labels.catalog_status_line` says which list the user
+  is looking at — a shipped name and a server's live list are different promises.
+- **The windows.** The drawer's fourth tab is **Connection** (profile, provider, endpoint, key, and
+  the consent switch only for a row that can leave the device). Tk got the same controls in its
+  Settings page. New actions `set_endpoint` and `set_profile`; `snapshot()["connection"]` is the row.
+- **Profiles**: `groq`, `openai`, `deepseek`, `lmstudio`, `vllm` added, and `cloud-free.toml`
+  corrected — it pointed an OpenRouter provider at the Ollama loopback endpoint, which the old code
+  silently ignored and the new code would have honoured. Each names `api_key_env` and holds no value.
+
+Three deviations worth keeping in mind, all measured rather than guessed:
+
+1. **A cloud row aimed at loopback is allowed.** The plan implied refusing it; the leak that has to
+   be refused is *cleartext to a remote address*, and a local proxy on the user's own machine is
+   theirs to run. `make_provider`'s consent switch still gates every cloud row, so nothing reaches
+   that path without approval.
+2. **A refused endpoint leaves the typed text in the field** and toasts why. The server keeps its
+   own value. Snapping the field back would hide the typo the user has to fix.
+3. **An open drawer repaints only the Connection tab, and only when the row actually changed**
+   (a signature of kind/endpoint/profile/mode/model). Repainting on every snapshot would clear the
+   model filter and the key field mid-typing — and the key is never echoed by the server, so it is
+   carried across a repaint by hand.
+
+`check_endpoint`'s refusals stay English, like every other sentence at the provider layer: a
+PolicyError raised in `config` has no language to ask about, and `friendly_error` has no Arabic
+parameter to answer with. Recorded rather than half-fixed.

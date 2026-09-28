@@ -1,6 +1,33 @@
-# Implementation status — 2026-09-28
+# Implementation status — 2026-09-29
+
+## UI 4.2 Phase 1 — the connection spine: eight providers, one endpoint, no literals
+
+Asked for "Multi-Provider Integration": generic OpenAI-compatible providers, TOML profiles,
+`/v1/models` discovery, SSE streaming, reasoning separation, an autonomous verify-then-fix loop and an
+in-app provider UI. `docs/UI42-MULTI-PROVIDER-PLAN.md` measured it first and found about half of it
+already shipping, a third reachable only from the command line, and two of its premises wrong
+(Anthropic/Gemini are not OpenAI-compatible; the self-correct loop exists and is gated by decision).
+**832 → 881 offline tests**, `node --check` clean, verified in the scripted window.
+
+| what changed | where |
+| --- | --- |
+| the provider list is a table, not a two-value whitelist | `config.Kind` + `KINDS` (ollama, lmstudio, vllm, openai, groq, deepseek, openrouter, generic) and `mode_rows()`, which both windows read instead of their own copies |
+| one class speaks for seven rows | `providers.OpenAICompatibleProvider` replaces `OpenRouterProvider`; what really is OpenRouter-only became flags — the upstream routing block, the echoed upstream model, the free/paid rule |
+| the endpoint rule allows the shape it used to refuse | `config.check_endpoint` — a URL path is what `/v1` is. Still refused: credentials, query, fragment, a remote host for a local row, cleartext to a remote address |
+| discovery and generation read the same address | `catalog.ollama_models(endpoint)`, `openrouter_models(api_key, endpoint)`, new `openai_models()` for `/models`, and `models_for(kind, endpoint, key) → (entries, source)` |
+| a fallback list says what it is | `labels.catalog_status_line` names the provider and the source, because a shipped name and a live list are different promises. Only rows with verified names fall back |
+| the windows can reach all of it | a **Connection** tab in the Settings drawer (profile, provider, endpoint, key, consent when the row can leave the device), the same three controls in Tk's Settings page, `set_endpoint` / `set_profile` actions, `snapshot()["connection"]` |
+| profiles are no longer CLI-only | `groq/openai/deepseek/lmstudio/vllm` added; `cloud-free.toml` corrected (it pointed an OpenRouter provider at the Ollama loopback URL); each names `api_key_env` and holds no key |
+| two redaction holes closed | `friendly_error` redacts once at its boundary, covering the `value[:600]` fallthrough and the model's own refusal reason; the controller's `[Detail: …]` line is redacted before it is stored |
+
+Measured during the browser pass, and kept because they are not visible in the diff: a refused
+endpoint leaves the mistyped text in the field and toasts the reason; an open drawer repaints *only*
+the Connection tab and only when the row changed, since the key field is never echoed back by the
+server; and a cloud row aimed at loopback is allowed — the leak worth refusing is cleartext to
+somewhere else, and `make_provider`'s consent switch still gates it.
 
 ## UI 4.1 — step rows that say what they did, and open to show what they found
+
 
 Asked with a screenshot of another tool's transcript: "عايز اعمل زي دي جوه التول يكتب كدا ايه شغال وبيعمل
 ايه ولو في تفاصيل هيكون جميل افتحها ابص عليها او اعملها كولابس". `docs/UI41-STEP-ROWS-PLAN.md` measured the
