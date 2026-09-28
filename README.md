@@ -3,9 +3,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-green.svg)]()
+[![Developed with AI](https://img.shields.io/badge/Developed%20with-AI%20%26%20Human%20Pairing-8A2BE2.svg)]()
 [![Tests](https://img.shields.io/badge/Tests-620%2B%20Passing-brightgreen.svg)]()
 
-> **Autonomous, privacy-first AI Software Engineer Agent** running locally or in the cloud. Designed to inspect repositories, parse code structures via AST, propose cryptographic diffs, execute sandboxed verification, and fix errors autonomously.
+> 💡 **Developed with AI:** This project was architected and developed using advanced Human-AI pair programming, demonstrating modern agentic coding workflows, zero-trust security isolation, and self-healing software loops.
+>
+> 🚀 **Autonomous, privacy-first AI Software Engineer Agent** running locally or in the cloud. Designed to inspect repositories, parse code structures via AST, propose cryptographic diffs, execute sandboxed verification, and fix errors autonomously.
 
 ---
 
