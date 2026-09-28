@@ -49,22 +49,79 @@ git clone https://github.com/mohamedsaad208/AI-Agent.git
 cd AI-Agent
 ```
 
-### 2. Run Diagnostics & Demo
-```powershell
+### 2. Run Diagnostics & Verification
+```bash
 # Run self-diagnostics
 python agent.py doctor
 
 # Run deterministic sandbox demo (No LLM required)
 python agent.py demo
 
-# Run the comprehensive test suite
+# Run comprehensive test suite
 python -m unittest discover -s tests -v
 ```
 
-### 3. Launch the Desktop UI
-Double-click `Run-Agent.bat` or run:
-```powershell
+---
+
+## 💻 How to Run (Platform Guide)
+
+### 🪟 Windows
+* **Desktop WebApp (GUI):**
+  - Simply double-click `Run-Agent.bat`
+  - *Or via terminal:*
+    ```powershell
+    python desktop.pyw
+    ```
+* **Interactive CLI:**
+  - Double-click `Run-Agent-CLI.bat`
+  - *Or via terminal:*
+    ```powershell
+    python launcher.py
+    ```
+
+---
+
+### 🐧 Linux (Ubuntu, Debian, Fedora, Arch)
+1. **Give execution permissions (first time only):**
+   ```bash
+   chmod +x run-agent.sh run-agent-cli.sh
+   ```
+2. **Launch Desktop WebApp:**
+   ```bash
+   ./run-agent.sh
+   ```
+3. **Launch Interactive CLI Menu:**
+   ```bash
+   ./run-agent-cli.sh
+   ```
+
+---
+
+### 🍎 macOS
+1. **Give execution permissions (first time only):**
+   ```bash
+   chmod +x run-agent.sh run-agent-cli.sh
+   ```
+2. **Launch Desktop App:**
+   ```bash
+   ./run-agent.sh
+   # Or directly:
+   python3 desktop.pyw
+   ```
+3. **Launch Interactive CLI Menu:**
+   ```bash
+   ./run-agent-cli.sh
+   ```
+
+---
+
+### ⚡ Direct Python Execution (All Platforms)
+```bash
+# Start WebApp server directly
 python -m ai_code_engineer.webapp
+
+# Start headless CLI directly
+python agent.py --help
 ```
 
 ---
