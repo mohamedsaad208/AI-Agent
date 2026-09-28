@@ -1,0 +1,45 @@
+# State the app writes next to itself: webapp/launch.py sets app_dir to this folder
+# (Path(__file__).resolve().parents[3]) and webapp/controller.py hangs every store off it.
+
+# Granted project folders plus the ui block (style, theme, model, auto-apply) - controller.py
+# writes both into one registry file via atomic_json(self.app_dir / ".agent-projects.json").
+.agent-projects.json
+
+# Session JSON, chat history and streamed logs - controller.py self.runs / self.chats.
+.agent-runs/
+.agent-chats/
+
+# Plan-step ledgers and project notes - controller.py self.plans / self.memory_dir. Deliberately
+# outside the approved folder so the model cannot rewrite what gates or instructs it.
+.agent-plans/
+.agent-memory/
+
+# WebView2 user-data folder handed to open_window() by webapp/launch.py.
+.agent-webview/
+
+# Screenshots taken while verifying the UI by hand; referenced by docs as .screens/uiNN-*.png.
+.screens/
+
+# Generated previews only. The `.py`/`.html` tools beside them (contrast.py, msgs.py) are what
+# the docs cite as the source of a measured claim, so they stay tracked.
+.design-preview/*.png
+
+# The model profiles under profiles/ are tracked on purpose: the README runs examples through
+# them, and no API key lives in one (the app keeps the key in memory only).
+
+# Interpreter and packaging artifacts: build/ and src/ai_code_engineer.egg-info appear when
+# python -m build runs, dist/ is where wheels land, .venv/ is the interpreter Run-Agent.bat prefers.
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Credential files the app itself refuses to touch (workspace.py BLOCKED_PARTS).
+.env
+
+# Build outputs
+target/
+.design-preview$1.png
+

@@ -1,0 +1,10 @@
+[model]
+provider = "ollama"
+name = "qwen3:4b"
+endpoint = "http://127.0.0.1:11434"
+
+[limits]
+max_turns = 12
+timeout_seconds = 120
+context_chars = 24000
+output_tokens = 4096

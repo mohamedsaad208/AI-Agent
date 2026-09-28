@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en" data-style="claude" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>AI Code Engineer</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="app.css">
+<script>
+/* Set the style before the first paint: doing it after bootstrap arrives would animate
+   every token at once, which reads as a colour flash on launch. */
+(function () {
+  const q = new URLSearchParams(location.search);
+  const saved = JSON.parse(localStorage.getItem('ui.prefs') || '{}');
+  const root = document.documentElement;
+  root.dataset.style = q.get('style') || saved.style || 'claude';
+  const mode = q.get('theme') || saved.theme || 'light';
+  root.dataset.theme = mode === 'auto'
+    ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : mode;
+  // The collapsed state is the window's own choice too: applying it after bootstrap arrives
+  // would show the sidebar for a frame and then snap it away.
+  if (saved.collapsed) root.classList.add('side-collapsed');
+  root.classList.add('booting');
+})();
+</script>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="side">
+    <div class="brand">
+      <div class="mark">A</div><b>AI Code Engineer</b>
+      <div class="spacer"></div>
+      <button class="icon-btn" id="collapse" title="Collapse sidebar (Ctrl+B)" aria-label="Collapse sidebar">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M10 5v14"/></svg>
+      </button>
+    </div>
+
+    <button class="newbtn" id="new-chat" title="New chat (Ctrl+Shift+K). Ctrl+K opens the command palette.">
+      <span class="l">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>
+        New chat
+      </span><span class="kbd">Ctrl ⇧ K</span>
+    </button>
+
+    <label class="search" for="search">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      <input id="search" placeholder="Search tasks and chats" autocomplete="off" spellcheck="false">
+    </label>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="foot">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 4v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V7l7-4z"/></svg>
+      You always review first
+      <div class="themepick" id="themepick"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <button class="icon-btn" id="sidebar-expand" title="Expand sidebar (Ctrl+B)" aria-label="Expand sidebar">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M10 5v14"/><path d="M6.6 12h2.2M6.6 9.4h2.2M6.6 14.6h2.2"/></svg>
+      </button>
+      <div style="min-width:0">
+        <h1 id="title">New chat</h1>
+        <div class="sub" id="subtitle">Standalone chat — no folder attached, nothing to change</div>
+      </div>
+      <div class="seg" id="seg" role="tablist" aria-label="Switch view">
+        <button data-view="details" role="tab" aria-selected="false" aria-controls="view-details">Activity</button>
+        <button data-view="task" role="tab" aria-selected="true" aria-controls="view-task" class="on">Chat</button>
+      </div>
+      <button class="ghost" id="attach-top" title="Attach a project plan">＋ Plan</button>
+    </header>
+    <div class="busybar hidden" id="busybar"></div>
+
+    <!-- chat -->
+    <section class="view on" id="view-task" role="tabpanel" aria-label="Chat">
+      <div class="scroll" id="scroller"><div class="thread" id="thread"></div></div>
+      <div class="dock">
+        <div class="queue" id="queue" aria-live="polite"></div>
+        <div class="composer" id="composer">
+          <textarea id="prompt" dir="auto" rows="2" placeholder="Ask anything — or choose a project and describe the change"></textarea>
+          <div class="cbar" id="cbar"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- activity -->
+    <section class="view" id="view-details" role="tabpanel" aria-label="Activity">
+      <div class="logwrap"><div class="log" id="log"></div></div>
+    </section>
+  </main>
+
+  <aside class="rail" id="rail"></aside>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<div id="modal-root"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

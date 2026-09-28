@@ -1,0 +1,9 @@
+[model]
+provider = "openrouter"
+name = "openrouter/free"
+
+[limits]
+max_turns = 8
+timeout_seconds = 120
+context_chars = 16000
+output_tokens = 4096

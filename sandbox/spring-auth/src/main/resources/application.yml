@@ -1,0 +1,10 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: auth
+
+jwt:
+  secret: change-me-change-me-change-me-32
+  lifetime-minutes: 60
