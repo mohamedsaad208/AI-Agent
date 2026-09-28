@@ -5,9 +5,15 @@ import os
 from .errors import ProviderError
 from .providers import request_json
 
+# Ollama's default listen address. A caller with a configured endpoint passes it: discovery used to
+# read this literal while generation read ``settings.endpoint``, so a relocated Ollama listed zero
+# models and the window called that "no models found" rather than "wrong address".
+OLLAMA_LOCAL = "http://127.0.0.1:11434"
 
-def ollama_models() -> list[dict]:
-    data = request_json("http://127.0.0.1:11434/api/tags", timeout=10)
+
+def ollama_models(endpoint: str = "") -> list[dict]:
+    base = (str(endpoint or "").strip() or OLLAMA_LOCAL).rstrip("/")
+    data = request_json(base + "/api/tags", timeout=10)
     entries = data.get("models")
     if not isinstance(entries, list):
         raise ProviderError("Ollama returned an invalid model list.")

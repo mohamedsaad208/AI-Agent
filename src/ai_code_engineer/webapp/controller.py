@@ -457,7 +457,10 @@ class AgentController:
             self._emit({"kind": "busy", "value": False, "cancellable": False})
             if failure is not None:
                 self.status = failure
-                log_msg = f"{failure} [Detail: {raw_error[:300]}]" if (raw_error and raw_error != failure) else failure
+                # The detail is the exception verbatim, which is the one field that can carry a
+                # provider's own text — including a bearer token it echoed back. Cap after redacting.
+                log_msg = (f"{failure} [Detail: {redact(raw_error)[:300]}]"
+                           if (raw_error and raw_error != failure) else failure)
                 self._note("error", log_msg)
                 self._add("tool", "Tool", failure)
             else:
@@ -465,7 +468,7 @@ class AgentController:
                     on_done(result)
                 except (AgentError, OSError, ValueError) as exc:
                     self.status = friendly_error(exc)
-                    self._note("error", f"{self.status} [Detail: {str(exc)[:300]}]")
+                    self._note("error", f"{self.status} [Detail: {redact(str(exc))[:300]}]")
             # The strip keeps the last sentence it was told. If nothing but the running line and
             # this job's own progress said anything, they are dropped — "Connecting to the model…"
             # sitting there after the answer arrived is the phantom this window keeps having to kill.
