@@ -22,7 +22,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 
 <br/>
 
-<img src="assets/demo.gif" alt="AI Code Engineer Live Demo" width="100%"/>
+<img src="assets/demo-complex.gif" alt="AI Code Engineer Multi-File Refactor & Self-Healing Loop" width="100%"/>
 
 </div>
 
@@ -113,6 +113,20 @@ python agent.py verify "<session_id>"
 python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ```
 </details>
+
+---
+
+# 🖥️ Interactive Desktop WebApp
+
+<div align="center">
+<img src="assets/demo-webapp.gif" alt="AI Code Engineer Desktop WebApp Interface" width="100%"/>
+</div>
+
+The application features a sleek, local WebApp interface served on `127.0.0.1` with:
+- 📂 **Multi-Project Workspace:** Manage isolated branches, project memory notes, and saved tasks.
+- ⚡ **Review-First Diff Inspector:** Side-by-side **Diff / Now / Was** inspector with one-click rollbacks.
+- 🤖 **Universal Model Selector:** Switch on the fly between local models (Ollama/DeepSeek) and cloud APIs (Groq, OpenAI, OpenRouter).
+- 🧪 **Evidence-Based Checks:** Native test suite runner with JUnit XML proofs and self-healing fix rounds.
 
 ---
 
