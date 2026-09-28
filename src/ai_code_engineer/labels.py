@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 from .errors import AgentError, Cancelled
+from .redaction import redact
 
 # The whole Arabic block, not just its letters: a task written with digits, paths or punctuation
 # still counts, and the diacritics are inside the range too. Written as escapes so the intent is
@@ -579,7 +580,11 @@ def queue_notes(arabic: bool, elsewhere: int, asked: bool) -> dict:
 
 
 def friendly_error(exc: Exception) -> str:
-    value = str(exc)
+    # Redacted once, here, because almost every branch returns a slice of ``value``: the fallthrough
+    # hands back the exception text verbatim, and ``engine`` interpolates the model's own refusal
+    # reason into an AgentError. Whatever a provider, a command or a model put in that text is then
+    # this window's status line, chat row and Activity log.
+    value = redact(str(exc))
     if "request timeout" in value:
         return ("The model needed more than the request timeout. Raise it in Project & model settings, "
                 "or ask for a smaller change.")
