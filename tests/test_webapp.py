@@ -19,6 +19,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ai_code_engineer import intent
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp import server as server_module
 from ai_code_engineer.webapp.controller import AgentController, initials_for
@@ -598,6 +599,76 @@ class ControllerSurfaceTests(unittest.TestCase):
             real = set(controller.snapshot())
             self.assertEqual(sorted(scripted - real), [],
                              "the preview sends a field the real controller never does")
+
+
+class ThePreviewKnowsTheThreePositions(unittest.TestCase):
+    """`--fake` is the window the design is reviewed in, so a mode has to be reviewable there.
+
+    A preview that only ever takes the yes path lets a refusal ship as a colour change: the badge, the
+    row it adds, the switch it disarms and the question a command asks all have to be reachable here.
+    """
+
+    def preview(self, mode="read"):
+        controller = FakeController()
+        events: list = []
+        if mode:
+            controller.action("set_composer", {"value": mode}, events.append)
+        return controller, events
+
+    def test_a_name_nobody_sent_lands_on_the_promise_that_writes_nothing(self):
+        controller, events = self.preview(mode="")
+        controller.action("set_composer", {"value": "READ-ONLY "}, events.append)
+        self.assertEqual(controller.composer, "chat")
+
+    def test_an_imperative_is_answered_with_an_explanation_and_no_proposal(self):
+        controller, events = self.preview()
+        controller.action("send", {"text": "fix the duplicate email guard"}, events.append)
+        said = "\n".join(str(event["message"].get("text", ""))
+                         for event in events if event.get("kind") == "message")
+        self.assertIn(intent.no_proposal(), said)
+        # The preview always opens with a scripted proposal on screen, so what is being checked here is
+        # that this Send did not start the proposal job at all.
+        self.assertFalse(controller.busy, "the scripted proposal job was started anyway")
+        self.assertNotIn("propose", [row["kind"] for row in controller.log])
+
+    def test_apply_rollback_and_a_block_are_refused_before_they_are_offered(self):
+        controller, events = self.preview()
+        review = controller.snapshot()["review"]
+        self.assertFalse(review["canApply"], "the button is not drawn either")
+        self.assertFalse(review["canRollback"])
+        controller.action("apply", {}, events.append)
+        self.assertIn(intent.no_write("Apply"), controller.status_line)
+        controller.action("rollback", {}, events.append)
+        self.assertIn(intent.no_write("Roll back"), controller.status_line)
+        self.assertEqual(controller.state, "WAITING_APPROVAL", "a refusal changed the task's state")
+        controller.action("apply_block", {"path": "a.py", "content": "x"}, events.append)
+        self.assertIn(intent.no_proposal(), controller.status_line)
+
+    def test_the_write_switch_cannot_be_armed_and_rearming_the_mode_does_not_either(self):
+        controller, events = self.preview()
+        controller.action("set_auto_apply", {"value": True}, events.append)
+        self.assertIn(intent.no_auto_apply(), controller.status_line)
+        self.assertFalse(controller.auto_apply)
+        controller.action("set_composer", {"value": "change"}, events.append)
+        self.assertFalse(controller.auto_apply, "switching back armed what the refusal prevented")
+
+    def test_a_command_the_preview_may_not_run_asks_before_it_does(self):
+        controller, events = self.preview()
+        asked = threading.Thread(target=lambda: controller.action("run", {"fix": False}, events.append))
+        asked.start()
+        deadline = time.time() + 5
+        question = next((event for event in events if event.get("kind") == "confirm"), None)
+        while question is None and time.time() < deadline:
+            time.sleep(0.01)
+            question = next((event for event in events if event.get("kind") == "confirm"), None)
+        self.assertIsNotNone(question, "the preview ran without asking")
+        self.assertIn("mvn -B test", question["message"])
+        self.assertEqual(question["confirm"], "Run it")
+        runs = controller.runs
+        controller.set_reply(question["id"], {"ok": False})
+        asked.join(5)
+        self.assertEqual(controller.runs, runs, "the answer was no")
+        self.assertIn(intent.run_declined(), controller.status_line)
 
 
 class TheWriteCardAndTheChips(unittest.TestCase):

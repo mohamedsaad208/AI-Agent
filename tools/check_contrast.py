@@ -43,6 +43,7 @@ PAIRS = [
     ("accent-text", "bg", "link / active pill on page"),
     ("accent-text", "panel", "link / active pill on card"),
     ("ok-ink", "ok-bg", "pass pill"),
+    ("info-ink", "info-bg", "read-only mode pill"),
     ("warn-ink", "warn-bg", "warn pill"),
     ("bad-ink", "bad-bg", "fail pill"),
     ("add-ink", "add", "diff added line"),

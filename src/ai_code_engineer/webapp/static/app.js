@@ -174,7 +174,7 @@ function render(data) {
   // Style and theme are the window's own choice, applied before first paint by the boot
   // script; a state push from the server must not snap them back.
   renderThemePick(); renderNav(); renderHeader(); renderThread(); renderComposer();
-  renderQueue();
+  renderQueue(); renderSetup();
   renderRail(); renderLog();
   syncSettings();
   // A proposal that arrived on this snapshot was already asked to show itself.
@@ -920,32 +920,53 @@ function autoPill() {
   return b;
 }
 
+/* The three positions on the one axis that decides what Send may become. The server owns the rule and
+   the words of every refusal; this table is only what choosing each one means, so the badge cannot
+   advertise a position the controller would then turn down. */
+const MODES = [
+  ['chat', 'Chat', 'Answer in prose. Reads the project as context, writes nothing.'],
+  ['read', 'Read-only', 'Read it, search it and map it, and explain what is wrong. Builds no proposal and '
+    + 'writes nothing, and your project\u2019s own command runs only when you approve that one.'],
+  ['change', 'Change', 'Propose a diff you review before any file is written.'],
+];
+const modeRow = (value) => MODES.find((row) => row[0] === value) || MODES[0];
+
+function modeMenu() {
+  const branch = DATA.branch || {};
+  const s = sheet('What should Send do?', branch.projectName || 'This conversation');
+  const list = el('div', 'content');
+  for (const [value, name, desc] of MODES) {
+    const b = el('button', 'cmd' + (DATA.composer === value ? ' on' : ''),
+      `<span>${esc(name)}</span><span class="g">${DATA.composer === value ? 'current' : ''}</span>`);
+    b.onclick = () => { close(); if (DATA.composer !== value) send('set_composer', { value }); };
+    list.append(b, el('p', 'cmd-help', esc(desc)));
+  }
+  s.appendChild(list);
+  const close = modal(s);
+}
+
 function modeBadge() {
   const branch = DATA.branch || {};
-  const change = DATA.composer === 'change';
+  const change = DATA.composer === 'change', reading = DATA.composer === 'read';
   const name = branch.projectName ? ' · ' + esc(branch.projectName) : '';
-  const b = el('button', 'pill mode ' + (change ? 'change' : 'chat'));
-  b.innerHTML = (change ? 'Change' : 'Chat') + name + ICON.chev;
+  const b = el('button', 'pill mode ' + (reading ? 'read' : change ? 'change' : 'chat'));
+  b.innerHTML = modeRow(DATA.composer)[1] + name + ICON.chev;
   if (branch.bound) {
     // A bound chat is not a mode choice: the folder's remembered mode and switch stay with the
     // project branch, and asking for Change here is refused. So no chevron and no click.
-    b.innerHTML = (change ? 'Change' : 'Chat') + name;
+    b.innerHTML = modeRow(DATA.composer)[1] + name;
     b.title = 'A chat moved into ' + (branch.projectName || 'a project') + ' answers in prose and reads '
       + 'that folder as context. A message that asks for files is still planned as a proposal you '
-      'approve, but the mode and Auto-Apply belong to the project — open it in the sidebar to change them.';
+      + 'approve, but the mode and Auto-Apply belong to the project — open it in the sidebar to change them.';
     b.onclick = () => toast('That belongs to the project. Open ' + (branch.projectName || 'it') + ' in the sidebar.');
     const ta0 = $('prompt');
     if (ta0) ta0.placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
     return b;
   }
-  b.title = change
-    ? 'Send proposes a diff you review before any file is written. Click to answer in prose instead.'
-    : branch.key
-      ? 'Send answers in prose, reading this project as context. Click to request reviewed changes.'
-      : 'Send answers in prose. Open a project in the sidebar to work on its files.';
+  b.title = modeRow(DATA.composer)[2] + ' Click to choose what the next Send will do.';
   b.onclick = () => {
-    if (!DATA.project) { toast('Choose a project first — then Chat or Change both mean something'); return; }
-    send('set_composer', { value: change ? 'chat' : 'change' });
+    if (!DATA.project) { toast('Choose a project first — then Chat, Read-only and Change each mean something'); return; }
+    modeMenu();
   };
   const ta = $('prompt');
   /* The one field where the user decides what Send will do, so it has to describe the folder's
@@ -956,8 +977,10 @@ function modeBadge() {
     ? (autoOn
       ? 'Describe the change you want. This folder writes itself, then runs your command.'
       : 'Describe the change you want. Nothing is written until you click Apply.')
-    : branch.key ? 'Ask about ' + branch.projectName + ' — it answers in prose and writes nothing.'
-      : 'Ask anything. Choose a project to work on its files.';
+    : reading
+      ? 'Ask what is wrong here, where it is, and what a fix would touch. Nothing is written.'
+      : branch.key ? 'Ask about ' + branch.projectName + ' — it answers in prose and writes nothing.'
+        : 'Ask anything. Choose a project to work on its files.';
   return b;
 }
 
@@ -983,6 +1006,54 @@ function submit() {
 function autosize() {
   const ta = $('prompt'); ta.style.height = 'auto';
   ta.style.height = Math.min(240, Math.max(50, ta.scrollHeight)) + 'px';
+}
+
+/* The first-run card, over the composer. Each row says its status in a word as well as a colour:
+   "green" is not an answer for someone who cannot see it, and this is the first screen a new operator
+   reads. Nothing here probes the machine — the rows come from the server, and only a click re-runs
+   them. */
+const SETUP_MARK = { ok: 'OK', warn: 'WATCH', bad: 'BLOCKED', info: 'NOTE' };
+
+function renderSetup() {
+  const box = $('setup');
+  if (!box) return;
+  box.innerHTML = '';
+  const card = DATA.setup || {};
+  const rows = card.rows || [];
+  if (!card.show || !rows.length) return;
+  const counts = card.counts || {};
+  const btn = (label, title, run) => {
+    const b = el('button', 'line-btn');
+    b.textContent = label; b.title = title; b.onclick = run;
+    return b;
+  };
+  const head = el('div', 'setup-head');
+  const title = el('b'); title.textContent = 'Set up this machine';
+  const tally = el('span', 'setup-tally');
+  tally.textContent = `${counts.ok || 0} ok · ${counts.warn || 0} to watch · ${counts.bad || 0} blocking`;
+  head.append(title, tally,
+    btn('Run the checks', 'Ask this machine what it can reach: the provider, its model list, and the '
+        + 'command the folder answers to.', () => send('setup_check')),
+    btn('Run the offline proof', 'A proposal applied, checked and rolled back in a temporary folder. '
+        + 'No model is asked, and none of your files are touched.', () => send('setup_demo')),
+    btn("Don't show this again", 'The card stops appearing at launch. Everything it says stays in '
+        + 'Settings.', () => send('setup_hide')));
+  box.appendChild(head);
+  for (const row of rows) {
+    const line = el('div', 'setup-row');
+    const badge = el('span', 'setup-badge ' + (SETUP_MARK[row.status] ? row.status : 'info'));
+    badge.textContent = SETUP_MARK[row.status] || 'NOTE';
+    const body = el('div', 'setup-body');
+    const text = el('div', 'setup-text'); text.textContent = row.text || '';
+    body.appendChild(text);
+    if (row.advice) {
+      const advice = el('div', 'setup-advice');
+      advice.textContent = row.advice;
+      body.appendChild(advice);
+    }
+    line.append(badge, body);
+    box.appendChild(line);
+  }
 }
 
 /* Messages sent during a running task, one line each. The strip is where the promise lives: a
@@ -1757,8 +1828,13 @@ function openSettings(tab) {
   }
   const foot = el('footer');
   const refresh = el('button', 'line-btn', 'Refresh models'); refresh.onclick = () => send('refresh_models');
+  /* "Don't show this again" hides the card, and the note on that button promises the answers stay
+     here — so the way back has to be a button, not a memory of where the card was. */
+  const checks = el('button', 'line-btn', 'Setup checks');
+  checks.title = 'Ask this machine what it can reach, and show the first-run card again.';
+  checks.onclick = () => send('setup_check');
   const done = el('button', 'solid', 'Done'); done.onclick = close;
-  foot.append(refresh, done); s.appendChild(foot);
+  foot.append(refresh, checks, done); s.appendChild(foot);
   SETTINGS = { show: show, tab: tab || 'project', signature: connectionSignature() };
   show(tab || 'project');
 }
@@ -1773,7 +1849,9 @@ function palette() {
   const commands = [
     ['New chat (standalone, no project)', () => send('new_chat')],
     ['Chat mode — answer in prose', () => send('set_composer', { value: 'chat' })],
+    ['Read-only mode — explain, write nothing', () => send('set_composer', { value: 'read' })],
     ['Change mode — propose a reviewed diff', () => send('set_composer', { value: 'change' })],
+    ['Setup checks — what this machine can reach', () => send('setup_check')],
     ['Move this chat into a project…', () => chatMenu({ id: DATA.current, title: DATA.header.title },
       (DATA.branch || {}).key || '')],
     ['Open a project folder', () => send('pick_project')],

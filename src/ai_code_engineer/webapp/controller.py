@@ -49,7 +49,7 @@ from ..labels import note as shared_note     # `note` is a local variable in thr
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
-from .. import git_integration, host, planbook, repair, runner, symbols
+from .. import git_integration, host, intent, planbook, repair, runner, setup, symbols
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 
@@ -92,7 +92,7 @@ PLAN_SUFFIXES = (".md", ".txt")
 # has one unless a project was bound to it by name, so the program cannot start pointed at a
 # directory the user did not choose in this session.
 BRANCH_CHAT, BRANCH_PROJECT = "chat", "project"
-CHAT_COMPOSER, CHANGE_COMPOSER = "chat", "change"
+CHAT_COMPOSER, CHANGE_COMPOSER, READ_COMPOSER = "chat", "change", "read"
 CHAT_ID = re.compile(r"[a-f0-9]{32}")
 # A closed palette, not free text: the value is painted into the sidebar, so anything a
 # crafted registry could inject there would read to the user as their own label. Escapes
@@ -311,6 +311,11 @@ class AgentController:
         self.targets: list[dict] = []
         self.target = ""
         self._targets_root = ""
+        # The first-run card. Rows are computed once and stored, never per snapshot: building them asks
+        # the provider, and a snapshot goes out on every streamed log line.
+        self._setup_rows: list[dict] = []
+        self._setup_demo: dict | None = None
+        self._setup_open = False
         self.review_file = 0
         self.diff_tab = "diff"
         self._fix_round = 0
@@ -413,6 +418,8 @@ class AgentController:
                    if isinstance(saved_chat, str) and CHAT_ID.fullmatch(saved_chat) else None)
         if kind == BRANCH_PROJECT and self.projects.get(str(key)):
             self._select_branch(BRANCH_PROJECT, str(key))
+            if self.composer == CHANGE_COMPOSER:
+                self.auto_apply = bool(self._auto_pref.get(str(key), False))
         elif resumed is not None and resumed.exists():
             try:
                 self.open_chat(resumed)
@@ -420,6 +427,11 @@ class AgentController:
                 self._select_branch(BRANCH_CHAT)
         else:
             self._select_branch(BRANCH_CHAT)
+        # A machine that has never granted a folder gets the card, once. "Never" is the operative word:
+        # the dismiss writes `setup_seen`, and a first-run helper that came back every launch would be
+        # the thing the operator learns to click through without reading.
+        self._setup_open = (setup.first_run(self.app_dir)
+                            and not bool(self._saved_ui.get("setup_seen")))
 
     # ------------------------------- prompts -------------------------------
     def _ask(self, kind: str, payload: dict) -> dict:
@@ -921,6 +933,8 @@ class AgentController:
                          "memory": self._project_notes(), "memory_info": self._memory_info(),
                          "consent": self.cloud_ok},
             "artifact": self._artifact(), "review": self._review(), "banner": self._banner(),
+            # The first-run card: rows computed once and stored, never probed per snapshot.
+            "setup": self.setup_view(),
             "queue": self._queue_view(),
             # The questions a worker is blocked on, with their ids: a page that connects after the
             # event was sent can still answer one, which is the whole of D33.
@@ -956,6 +970,10 @@ class AgentController:
             # an empty one closes the row. Nothing here reads or writes the project.
             "step_detail": lambda: self.open_step(str(payload.get("id", ""))),
             "new_chat": self.new_chat, "new_project": self.new_project, "example": self.example,
+            # The first-run card: two buttons that do work, two that only change what is on screen.
+            "setup_check": self.run_setup_check, "setup_demo": self.run_setup_demo,
+            "setup_show": lambda: self.set_setup_open(True),
+            "setup_hide": lambda: self.set_setup_open(False),
             "open": lambda: self.open_item(payload.get("kind", "session"), payload.get("id", "")),
             "pick_project": self.browse,
             "set_composer": lambda: self.set_composer(str(payload.get("value", ""))),
@@ -1055,8 +1073,8 @@ class AgentController:
         # chat must never be able to write anything at all.
         if composer == CHANGE_COMPOSER and not self.branch["bound"] and self.branch["key"]:
             self._composer_pref[self.branch["key"]] = CHANGE_COMPOSER
-        self.auto_apply = bool(self._auto_pref.get(str(self.branch.get("key") or ""), False)) \
-            if not self.branch["bound"] else False
+        self.auto_apply = (bool(self._auto_pref.get(str(self.branch.get("key") or ""), False))
+                           if self.composer == CHANGE_COMPOSER and not self.branch["bound"] else False)
         if chat_id:
             self.chat_id = chat_id
         else:
@@ -1070,11 +1088,24 @@ class AgentController:
         if not self._draining:
             self._drain_queue()
 
+    def reading_only(self) -> bool:
+        """The one question every write gate and every run gate asks.
+
+        Deliberately not "a bound chat": a chat moved into a project reads its folder as context and
+        still plans a proposal when a message asks for one, and that behaviour is pinned by tests and
+        by the tooltip on its own badge. Read-only is the position that refuses even the proposal.
+        """
+        return intent.read_only(self.composer)
+
     def _branch_mode(self, key: str) -> str:
-        """A chat with no folder can only answer in prose; a project keeps the mode it was left in."""
+        """A chat with no folder can only answer in prose; a project keeps the mode it was left in.
+
+        Read through `intent.normalise`, because a pref written by an older version of this file — or
+        a value that is neither of the words — has to land on the promise that writes nothing.
+        """
         if not key:
             return CHAT_COMPOSER
-        return self._composer_pref.get(key, CHAT_COMPOSER)
+        return intent.normalise(self._composer_pref.get(key, CHAT_COMPOSER))
 
     def _grant_folder(self, key: str, resolved: str) -> None:
         """Register a folder and open it — the one way a project branch is entered by granting.
@@ -1088,9 +1119,10 @@ class AgentController:
                             composer=None if key in self._composer_pref else CHANGE_COMPOSER)
 
     def set_composer(self, value: str) -> None:
-        wanted = CHANGE_COMPOSER if value == CHANGE_COMPOSER else CHAT_COMPOSER
-        if wanted == CHANGE_COMPOSER and not self.repo:
-            self.status = "Choose a project in the sidebar before asking for reviewed changes."
+        """What the next Send is allowed to become: prose, a read-only analysis, or a reviewed diff."""
+        wanted = intent.normalise(value)
+        if wanted != CHAT_COMPOSER and not self.repo:
+            self.status = intent.needs_folder(wanted, arabic=self.arabic)
             return
         if wanted == CHANGE_COMPOSER and self.branch.get("bound"):
             # The folder this chat reads is not a folder it may write. Leaving the chat is the way.
@@ -1100,11 +1132,14 @@ class AgentController:
         self.composer = wanted
         if self.branch.get("key") and not self.branch.get("bound"):
             self._composer_pref[self.branch["key"]] = wanted
+        # The switch is a property of Change mode. Reading masks it for this conversation and leaves
+        # the folder's stored preference alone, so switching back is not a silent re-arm of anything.
+        self.auto_apply = (bool(self._auto_pref.get(str(self.branch.get("key") or ""), False))
+                           if wanted == CHANGE_COMPOSER and not self.branch.get("bound") else False)
         self.subtitle = self._subtitle()
         self._save_state()
-        self.status = ("Change mode: Send proposes a diff you review before any file is written."
-                       if wanted == CHANGE_COMPOSER else
-                       "Chat mode: Send answers in prose and cannot write files.")
+        self.status = intent.switched(wanted, arabic=self.arabic,
+                                      project=Path(self.repo).name if self.repo else "")
 
     def set_auto_apply(self, value) -> None:
         """Turn on the switch that removes the click between reviewing a diff and writing it.
@@ -1115,6 +1150,14 @@ class AgentController:
         The review itself is untouched: the proposal is still built, hashed and shown, and
         two cases still stop for an answer — see `apply`.
         """
+        if self.reading_only():
+            if not bool(value):
+                return                      # switching a switch that is already off asks nothing of anyone
+            # A conversation that promises to write nothing cannot be handed the switch that writes
+            # without a click. The folder's stored preference is left alone; only this conversation
+            # refuses, which is the promise a mode is allowed to keep.
+            self.status = intent.no_auto_apply(arabic=self.arabic)
+            return
         if not self.repo:
             self.status = "Choose a project before turning Auto-Apply on."
             return
@@ -1542,6 +1585,76 @@ class AgentController:
         operation = lambda: models_for(kind, endpoint, api_key)
         self.run_job(operation, done, "Refreshing available models…")
 
+    # ------------------------------ first run ------------------------------
+    def setup_view(self) -> dict:
+        """The card, from rows that were computed once. Asking the provider is never a side effect.
+
+        A snapshot goes out on every streamed log line, and building the audit asks a service over the
+        network and walks a folder — so the rows are stored, and only the operator's click refreshes
+        them.
+        """
+        if self._setup_open and not self._setup_rows:
+            self._setup_rows = setup.audit(repo=self.repo.strip(), provider=self.active_kind().key,
+                                           endpoint=self.endpoint_for(self.mode),
+                                           api_key=self.key.strip() or None, model=self.model,
+                                           arabic=self.arabic, demo=self._setup_demo, probe=False)
+        counts = setup.counts(self._setup_rows)
+        return {"show": self._setup_open, "rows": self._setup_rows, "counts": counts,
+                "demo": self._setup_demo, "busy": self.busy}
+
+    def run_setup_check(self) -> None:
+        """Ask what this machine can reach. The one click that sends a request for the audit."""
+        if self.busy:
+            return
+        kind, endpoint = self.active_kind(), self.endpoint_for(self.mode)
+        repo, model, arabic = self.repo.strip(), self.model, self.arabic
+        api_key = self.key.strip() or None
+        previous = self._setup_demo
+
+        def work():
+            return setup.audit(repo=repo, provider=kind.key, endpoint=endpoint, api_key=api_key,
+                               model=model, arabic=arabic, demo=previous)
+
+        def done(rows):
+            self._setup_rows = rows
+            self._setup_open = True
+            counts = setup.counts(rows)
+            self.say(say(arabic, en="Checks done: {} ok, {} to watch, {} blocking.".format(
+                            counts["ok"], counts["warn"], counts["bad"]),
+                        ar="الفحوص خلصت: {} تمام، {} تحت الملاحظة، {} مانع.".format(
+                            counts["ok"], counts["warn"], counts["bad"])))
+
+        self.run_job(work, done, "Checking this machine…")
+
+    def run_setup_demo(self) -> None:
+        """The offline proof: a temporary folder, a proposal, an apply, a rollback. Never this project."""
+        if self.busy:
+            return
+        arabic = self.arabic
+
+        def done(result):
+            self._setup_demo = result
+            passed = result.get("proposal_apply_rollback") == "passed"
+            if self._setup_rows:
+                self._setup_rows = [setup.demo_row(result, arabic=arabic) if item["id"] == "demo" else item
+                                    for item in self._setup_rows]
+            self._setup_open = True
+            self.say(say(arabic,
+                         en="The proof held: a proposal was applied, checked and rolled back in a "
+                            "temporary folder." if passed else
+                            "The proof did not complete: " + str(result.get("note", ""))[:120],
+                         ar="الدليل نجح: مقترح اتطبّق واتفحص واتراجع في مجلد مؤقت." if passed else
+                            "الدليل ما كملش: " + str(result.get("note", ""))[:120]))
+
+        self.run_job(setup.run_demo, done, "Running the offline proof…")
+
+    def set_setup_open(self, value: bool) -> None:
+        """The card's own two buttons: show it again, or say this machine has already read it."""
+        self._setup_open = bool(value)
+        if not value:
+            self._saved_ui["setup_seen"] = True
+            self._save_state()
+
     # ------------------------------- memory -------------------------------
     def _project_notes(self) -> str:
         if not self.repo:
@@ -1708,6 +1821,13 @@ class AgentController:
             return
         key = self.key.strip() or None
         self._draft = ""
+        # The position is decided before the message is read. `asks_for_a_change` exists to promote a
+        # chat that turned out to name files, and promoting is exactly what Read-only refuses — so an
+        # imperative here gets the analysis it is allowed, and the row above the answer says why no
+        # diff follows it.
+        if self.reading_only():
+            self.start_chat(task, settings, cloud, paid, key, intent.no_proposal(arabic=self.arabic))
+            return
         # A bound project answers in prose by default: bound means it may *read* that project,
         # never that a greeting became a change request. A message that opens with "add" or
         # "صلح" is a different thing, and it is planned as a change — for this message only,
@@ -1956,8 +2076,14 @@ class AgentController:
         self.pending = text
         self._emit({"kind": "log_chunk", "ts": _clock(), "text": text})
 
-    def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None) -> None:
-        """Prose answer. With a bound project it may read that folder's map; never write to it."""
+    def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None,
+                   note: str = "") -> None:
+        """Prose answer. With a bound project it may read that folder's map; never write to it.
+
+        `note` is a line the *mode* puts above its own answer. Read-only uses it for the refusal, which
+        has to be part of the transcript — a status line is replaced by the next click, and "this
+        conversation builds no proposal" is something the operator reads back afterwards.
+        """
         if self.chat is None or self.chat.get("id") != self.chat_id:
             self.chat = create_chat(self.model or Settings().model, self.chat_id,
                                     project=self._chat_project())
@@ -1965,6 +2091,8 @@ class AgentController:
         self.session = self.session_path = None
         self.title = chat.get("title") or task.replace("\n", " ")[:45]
         self._add("user", "You", task)
+        if note:
+            self.line("tool", "Tool", note)
         repo = self.repo
 
         def work():
@@ -1976,7 +2104,8 @@ class AgentController:
         def done(reply):
             self._add("assistant", "AI Code Engineer", reply)
             self.title = title_for(chat)
-            self.status = ("Answered. Switch to Change mode when you want reviewed changes to these files."
+            self.status = (intent.answered(arabic=self.arabic) if self.reading_only() else
+                           "Answered. Switch to Change mode when you want reviewed changes to these files."
                            if repo else
                            "Answered. Choose a project when you want reviewed changes to real files.")
 
@@ -2038,6 +2167,11 @@ class AgentController:
         if self.busy or not self.repo:
             self.status = "Choose a project before applying a block to a file."
             return
+        if self.reading_only():
+            # The answer above may show a block in full, and this is the click that would turn it into
+            # a proposal — so it is refused by name, not by the block being hidden.
+            self.say(intent.no_proposal(arabic=self.arabic))
+            return
         name = str(payload.get("path", ""))[:240]
         content = str(payload.get("content", ""))
         task = ("Write " + name + " from a code block in the chat answer")[:MAX_TASK_CHARS]
@@ -2065,6 +2199,11 @@ class AgentController:
 
     def apply(self) -> None:
         if self.busy or not self.session or self.session.get("state") != "WAITING_APPROVAL":
+            return
+        if self.reading_only():
+            # A proposal built before the badge moved is still on the screen, and the mode is a
+            # position about this folder — not about whether a diff happens to be rendered right now.
+            self.say(intent.no_write("Apply", arabic=self.arabic))
             return
         changes = self.session.get("changes", [])
         again = ""
@@ -2190,7 +2329,13 @@ class AgentController:
         self.run_job(lambda: verify(path), done, "Checking syntax in changed files…")
 
     def undo(self) -> None:
-        if self.busy or not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
+        if self.busy:
+            return
+        if self.reading_only():
+            # Rolling back is a write with a friendly name: it puts different bytes on the same paths.
+            self.say(intent.no_write("Roll back", arabic=self.arabic))
+            return
+        if not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
             return
         if not self.confirm("Roll back changes",
                             "Restore this task's files to their previous contents?\nLater edits will block "
@@ -2397,14 +2542,27 @@ class AgentController:
         if recipe is None:
             self.status = status_text("no_recipe", arabic=self.arabic)
             return
-        self._auto_fix = bool(auto_fix)
-        if auto_fix:
-            self._fix_round = 0
         # The folder comes from the task when there is one and from the window when the last task
         # blocked or rolled back. A run is recorded on the session only when that session can hold
         # it -- `repair.record_run` refuses any state outside its own set, and writing into one of
         # those would rewrite a finished task's verdict.
         repo = self.session["root"] if self.session else self.repo.strip()
+        command = runner.display_command(recipe)
+        if self.reading_only():
+            # Reading a folder is not running inside it, and this is the only action in the mode that
+            # can execute anything: a build runs whatever its own scripts do. So it asks once per
+            # command, and names the command the answer is about.
+            if not self.ask("Run this command?", intent.run_ask(
+                    command, arabic=self.arabic, project=Path(repo).name), ok_label="Run it"):
+                self.say(intent.run_declined(arabic=self.arabic))
+                return
+            # What it never runs is a fix round, because the output of a round is a proposal. That is
+            # said where the loop would have started — `_offer_fix`, on a real failure — rather than as
+            # a warning about something that may not happen.
+            auto_fix = False
+        self._auto_fix = bool(auto_fix)
+        if auto_fix:
+            self._fix_round = 0
         # The module list was scanned from the window's folder. A task pointed somewhere else gets
         # its own root and no module, rather than a path resolved against the wrong tree.
         target = self.target if str(Path(repo).resolve()) == self._targets_root else "."
@@ -2414,10 +2572,6 @@ class AgentController:
         where = Path(repo).name if target in ("", ".") else PurePosixPath(target).name
         # Say the command before running it, not only after it fails: a project's own build
         # executes code the repository defines, and this is the last line worth reading first.
-        # The interpreter is named, not pathed, because the absolute path is noise here and the
-        # argv the child actually gets is recorded in the log.
-        command = " ".join("python" if part == sys.executable else str(part)
-                           for part in runner.RECIPES[recipe]["command"])
         self._run_step = self._step(executing_line(arabic=self.arabic, command=command),
                                     action="executing", fields={"command": command})
 
@@ -2514,6 +2668,12 @@ class AgentController:
         Nothing is written here either: the round produces a proposal, and Apply stays a
         separate, deliberate click.
         """
+        if self.reading_only():
+            # Reached from `report_run` after a command the user agreed to run. The round this offers
+            # ends in a proposal, so the offer is not made — the failure stands in the transcript on
+            # its own, which is what this mode was asked for.
+            self.line("tool", "Tool", intent.no_fix_round(arabic=self.arabic))
+            return False
         if not self.model:
             return False
         if not self.session or self.session.get("state") not in MUTABLE_STATES:
@@ -3018,9 +3178,10 @@ class AgentController:
                        + (" · attached plan " + session["plan_reference"]["path"] if session.get("plan_reference") else "")
                        + (" · proposal " + str(session.get("proposal_hash", ""))[:4] + "…"
                           + str(session.get("proposal_hash", ""))[-4:] if session.get("proposal_hash") else "")),
-            "canApply": state == "WAITING_APPROVAL" and not self.busy,
+            "canApply": state == "WAITING_APPROVAL" and not self.busy and not self.reading_only(),
             "canMutate": state in MUTABLE_STATES and not self.busy,
-            "canRollback": (state in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}) and not self.busy,
+            "canRollback": (state in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"})
+                           and not self.busy and not self.reading_only(),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
             "view": {
@@ -3059,8 +3220,7 @@ class AgentController:
         """The header line: what the next Send would actually do, and with what."""
         if not self.repo:
             return "Standalone chat — no folder attached, nothing to change"
-        parts = [Path(self.repo).name,
-                 "chat · reads as context" if self.composer == CHAT_COMPOSER else "change · reviewed diff"]
+        parts = [Path(self.repo).name, intent.subtitle(self.composer)]
         plan_info = self._plan_info()
         if plan_info:
             parts.append(f"step {plan_info['step']} of {plan_info['total']}"

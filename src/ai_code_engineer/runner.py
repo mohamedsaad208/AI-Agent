@@ -130,6 +130,18 @@ RECIPES: dict[str, dict] = {
 }
 
 
+def display_command(recipe: str) -> str:
+    """The recipe as one line a person can read before agreeing to run it.
+
+    The interpreter is named, not pathed: an absolute `python.exe` under a user profile is noise in a
+    confirmation, and the argv the child really gets is recorded in the log. Both windows ask the same
+    question about the same command, so both get it from here rather than spelling out the
+    substitution again.
+    """
+    return " ".join("python" if part == sys.executable else str(part)
+                    for part in RECIPES[recipe]["command"])
+
+
 def timeout_for(recipe: str) -> int:
     """JVM builds need minutes even warm; script suites usually do not.
 

@@ -17,7 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import git_integration, memory, repair
+from ai_code_engineer import git_integration, intent, memory, repair, runner
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController
@@ -1989,6 +1989,165 @@ class RememberedFolderModeTests(unittest.TestCase):
     def test_a_plain_chat_branch_still_defaults_to_prose(self):
         window = self.window()
         self.assertEqual(window.composer, "chat", "no folder, nothing to propose against")
+
+
+class ReadOnlyModeTests(unittest.TestCase):
+    """Phase-3 item 4: a position that reads the folder and refuses to write it.
+
+    Each gate is a sentence the operator only hears by asking for the thing it stops, so every test
+    here enters through the method the UI calls — `apply`, `run_tests`, `start_plan` — rather than by
+    asserting on a predicate.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._made = []
+        self.addCleanup(self._drain)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name)
+        self.repo = sandbox_repo(self.app_dir)
+        patcher = patched_catalog()
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.model = ProposalModel()
+        starter = patch("ai_code_engineer.webapp.controller.make_provider",
+                        side_effect=lambda *a, **k: self.model)
+        starter.start()
+        self.addCleanup(starter.stop)
+        self.controller = self.build()
+
+    def build(self, answers=None):
+        controller = Scripted(self.app_dir, answers)
+        controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        controller.model = "test-local"
+        controller.set_repo(str(self.repo))
+        self._made.append(controller)
+        return controller
+
+    def _drain(self):
+        for controller in self._made:
+            controller.cancel_event.set()
+            controller.join(timeout=10)
+
+    def read(self, controller=None):
+        controller = controller or self.controller
+        controller.set_composer("read")
+        self.assertEqual(controller.composer, "read")
+        return controller
+
+    def rows(self, controller=None):
+        return " \n".join(m["text"] for m in (controller or self.controller).snapshot()["messages"])
+
+    # ------------------------------- choosing it -------------------------------
+    def test_reading_a_folder_has_to_be_a_folder_first(self):
+        window = self.build()
+        window.set_repo("")
+        window.set_composer("read")
+        self.assertEqual(window.composer, "chat", "an empty window cannot be in Read-only")
+        self.assertIn("Choose a project", window.snapshot()["status"])
+
+    def test_the_header_says_which_promise_is_in_force(self):
+        self.read()
+        self.assertIn("read-only · writes nothing", self.controller.snapshot()["header"]["subtitle"])
+
+    # ------------------------------- the proposal -------------------------------
+    def test_an_imperative_gets_an_explanation_and_no_proposal(self):
+        self.model = ChatModel()        # this message is answered in prose, so the provider must be one
+        self.read()
+        self.controller.start_plan("Fix add in calculator.py")
+        self.controller.join()
+        state = self.controller.snapshot()
+        self.assertNotEqual(state["review"]["state"], "Changes ready for review")
+        self.assertIn(intent.no_proposal(), self.rows())
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD,
+                         "the whole point is that nothing is written")
+        self.assertEqual(state["status"], intent.answered(),
+                         "and the answer closes on its own promise, not on advice to switch modes")
+
+    def test_the_folder_is_read_while_answering(self):
+        """The spec's four verbs: read it, search it, map it, explain it."""
+        self.model = ChatModel()
+        self.read()
+        self.controller.start_plan("why is add() wrong here")
+        self.controller.join()
+        messages = self.model.calls[-1][0]
+        text = json.dumps(messages)
+        self.assertIn("calculator.py", text, "the repository map reached the model with the question")
+
+    # ------------------------------- the writes -------------------------------
+    def test_a_proposal_left_on_screen_cannot_be_applied_or_rolled_back(self):
+        self.controller.set_composer("change")
+        self.controller.start_plan("Fix add in calculator.py")
+        self.controller.join()
+        self.assertEqual(self.controller.snapshot()["review"]["state"], "Changes ready for review")
+        self.read()
+        state = self.controller.snapshot()
+        self.assertFalse(state["review"]["canApply"], "the button is not offered either")
+        self.assertFalse(state["review"]["canRollback"])
+        self.controller.apply()
+        self.controller.join()
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+        self.assertIn(intent.no_write("Apply"), self.controller.snapshot()["status"])
+        self.controller.undo()
+        self.assertIn(intent.no_write("Roll back"), self.controller.snapshot()["status"])
+
+    def test_a_code_block_cannot_be_turned_into_a_proposal(self):
+        self.read()
+        self.controller.offer_block({"path": "calculator.py", "content": CALCULATOR_GOOD})
+        self.controller.join()
+        self.assertIn(intent.no_proposal(), self.controller.snapshot()["status"])
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    def test_the_switch_that_writes_without_a_click_cannot_be_armed(self):
+        self.read()
+        self.controller.set_auto_apply(True)
+        self.assertIn(intent.no_auto_apply(), self.controller.snapshot()["status"])
+        self.assertFalse(self.controller.auto_apply)
+        # Turning it back to Change must not silently arm what the refusal prevented.
+        self.controller.set_composer("change")
+        self.assertFalse(self.controller.auto_apply)
+
+    # ------------------------------- the command -------------------------------
+    def test_nothing_runs_until_the_operator_answers_for_that_command(self):
+        self.read()
+        self.controller.answers["confirm"] = False        # the answer to *this* command is no
+        with patch("ai_code_engineer.runner.run", return_value=run_result()) as ran:
+            self.controller.run_tests(False)
+            self.controller.join()
+        self.assertEqual(ran.call_count, 0)
+        asked = self.controller.asked[-1]
+        self.assertEqual(asked["title"], "Run this command?")
+        self.assertEqual(asked["message"],
+                         intent.run_ask(runner.display_command(self.controller.selected_recipe()),
+                                        project=self.repo.name),
+                         "the question names the exact command it is asking about")
+        self.assertIn(intent.run_declined(), self.controller.snapshot()["status"])
+
+    def test_a_command_the_operator_approved_runs_and_writes_nothing(self):
+        window = Scripted(self.app_dir, {"confirm": True})
+        window.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        window.model = "test-local"
+        window.set_repo(str(self.repo))
+        window.set_composer("read")
+        self._made.append(window)
+        failure = run_result(status="failed", failures=["AssertionError: 1 != 2"])
+        with patch("ai_code_engineer.runner.run", return_value=failure) as ran:
+            window.run_tests(True)          # "Run & fix" — the fix half is refused, the run is not
+            window.join()
+        self.assertEqual(ran.call_count, 1)
+        self.assertIn(intent.no_fix_round(), self.rows(window))
+        self.assertFalse(window._auto_fix)
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    # ------------------------------- remembering it -------------------------------
+    def test_a_folder_left_in_read_only_comes_back_in_read_only(self):
+        self.read()
+        self.controller.set_auto_apply(False)
+        self.controller.close()
+        second = self.build()
+        second.set_repo(str(self.repo))
+        self.assertEqual(second.composer, "read")
+        self.assertFalse(second.auto_apply, "and the write switch is still off with it")
 
 
 class BlockApplyTests(unittest.TestCase):

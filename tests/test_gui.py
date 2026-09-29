@@ -13,14 +13,14 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import labels, memory, repair
+from ai_code_engineer import intent, labels, memory, repair, runner
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import (atomic_json, load_session, plan, proposal_hash)
 from ai_code_engineer.errors import Cancelled
 from ai_code_engineer.gui import AgentWindow, SEARCH_PLACEHOLDER
 from ai_code_engineer.providers import OpenAICompatibleProvider
 from ai_code_engineer.workspace import Workspace
-from doubles import (ChatModel, FREE_ENTRY, OLLAMA_ENTRY,
+from doubles import (ChatModel, FREE_ENTRY, OLLAMA_ENTRY, run_result,
                      patched_catalog as shared_patched_catalog)
 from helpers import sandbox_repo
 
@@ -871,6 +871,99 @@ Validate the token.
             root.update_idletasks()
             self.assertEqual(reopened.chat_id, chat_id)
             self.assertEqual(sum(1 for author, _ in reopened.messages if author == "You"), 1)
+        finally:
+            if reopened is not None:
+                reopened.cancel_timers()
+            root.destroy()
+
+    # --------------------------- Read-only mode ---------------------------
+    def read_only_send(self, text="Fix calculator.py"):
+        """Send with a folder named and the Read-only switch on. Returns the answering model."""
+        self.ui.repo.set(str(self.repo))
+        self.ui.read_only.set(True)
+        self.ui.task.insert("1.0", text)
+        self.ui.mode.set("Ollama")
+        self.ui.mode_changed()
+        self.ui.model.set("test-local")
+        model = ChatModel()
+        with patch("ai_code_engineer.gui.make_provider", return_value=model):
+            self.ui.start_plan()
+            self.wait_for_job()
+        return model
+
+    def texts(self):
+        return "\n".join(text for _, text in self.ui.messages)
+
+    def test_read_only_answers_an_imperative_and_proposes_nothing(self):
+        """Tk has no Chat/Change badge, so this switch is the only ladder rung it can hold — and the
+        rung above it (a reviewed diff) is what the switch refuses."""
+        self.read_only_send()
+        self.assertIsNone(self.ui.session, "no proposal, so no task to review")
+        self.assertIn(intent.no_proposal(), self.texts())
+        self.assertIn("a - b", (self.repo / "calculator.py").read_text())
+
+    def test_read_only_reads_the_folder_it_is_asked_about(self):
+        model = self.read_only_send("why does add() return the wrong number")
+        self.assertIn("calculator.py", json.dumps(model.calls[-1][0]),
+                      "the repository map reached the model with the question")
+        self.assertEqual(self.ui.status.get(), intent.answered())
+
+    def test_the_write_buttons_grey_out_and_the_methods_refuse_anyway(self):
+        self.draft()
+        self.assertEqual(str(self.ui.apply_button["state"]), "normal")
+        self.ui.read_only.set(True)
+        self.assertEqual(str(self.ui.apply_button["state"]), "disabled")
+        self.assertEqual(str(self.ui.rollback_button["state"]), "disabled")
+        self.assertEqual(str(self.ui.fix_button["state"]), "disabled")
+        with patch("ai_code_engineer.gui.messagebox.askyesno", return_value=True):
+            self.ui.apply()
+        self.assertIn(intent.no_write("Apply"), self.ui.status.get())
+        self.assertIn("a - b", (self.repo / "calculator.py").read_text())
+        self.ui.undo()
+        self.assertIn(intent.no_write("Roll back"), self.ui.status.get())
+
+    def test_the_command_runs_only_after_the_operator_answers_for_that_command(self):
+        self.applied_draft()
+        self.make_runnable()
+        self.ui.read_only.set(True)
+        asked = []
+
+        def answer(title, message, **_kwargs):
+            asked.append((title, message))
+            return False
+        with patch("ai_code_engineer.gui.messagebox.askyesno", side_effect=answer), \
+                patch("ai_code_engineer.gui.runner.run",
+                      return_value=self.run_result("passed")) as ran:
+            self.ui.run_tests(False)
+            self.wait_for_job()
+        self.assertEqual(ran.call_count, 0, "a refused answer must not run anything")
+        self.assertEqual(asked[-1][0], "Run this command?")
+        self.assertIn(runner.display_command(self.ui.selected_recipe()), asked[-1][1],
+                      "the question names the command it is asking about")
+        self.assertIn(intent.run_declined(), self.ui.status.get())
+
+    def test_a_round_is_never_bought_by_a_run_that_was_only_approved_to_run(self):
+        """Tk reaches the same decision from a different place, so the refusal has to be here too."""
+        self.ui.read_only.set(True)
+        self.ui.session = {"state": "APPLIED_UNVERIFIED", "root": str(self.repo)}
+        with patch("ai_code_engineer.gui.plan") as planned:
+            self.ui.ask_for_fix(run_result(status="failed", failures=["AssertionError"]))
+        self.assertEqual(planned.call_count, 0)
+        self.assertIn(intent.no_fix_round(), self.texts())
+        self.assertFalse(self.ui._auto_fix)
+
+    def test_the_switch_survives_a_restart_and_arrives_with_the_buttons_greyed(self):
+        self.ui.read_only.set(True)
+        self.ui.cancel_timers()
+        self.root.destroy()
+        root = tk.Tk()
+        root.withdraw()
+        reopened = None
+        try:
+            reopened = AgentWindow(root, self.app_dir)
+            root.update_idletasks()
+            self.assertTrue(reopened.read_only.get(), "a promise made at the window is forgotten by it")
+            self.assertEqual(str(reopened.apply_button["state"]), "disabled")
         finally:
             if reopened is not None:
                 reopened.cancel_timers()

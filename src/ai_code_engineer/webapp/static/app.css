@@ -306,6 +306,30 @@ html.side-collapsed #sidebar-expand { display: grid }
 .composer textarea::placeholder { color: var(--faint) }
 .composer.busy { border-left: 2px solid var(--accent) }
 
+/* ------------------------------ the first-run card ------------------------------
+   The four badge pairs are the tone families the pills already ship, all of them measured in
+   tools/check_contrast.py. The word inside the badge is the point rather than the decoration: a row
+   that said only "green" is unreadable for exactly the person who cannot see green. */
+.setup:empty { display: none }
+.setup {
+  margin: 0 0 8px; padding: 10px 12px; background: var(--field); border: 1px solid var(--line);
+  border-radius: var(--r-l); box-shadow: var(--card-shadow); max-height: 42vh; overflow-y: auto;
+}
+.setup-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px }
+.setup-head b { font-size: 13px }
+.setup-tally { font-size: 12px; color: var(--faint); margin-right: auto }
+.setup-row { display: flex; align-items: flex-start; gap: 9px; padding: 6px 0; border-top: 1px solid var(--line-soft) }
+.setup-badge {
+  flex: none; font-size: 10.5px; font-weight: 700; letter-spacing: .04em; padding: 2px 7px;
+  border-radius: 999px; border: 1px solid transparent;
+}
+.setup-badge.ok { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-line) }
+.setup-badge.warn { background: var(--warn-bg); color: var(--warn-ink); border-color: var(--warn-line) }
+.setup-badge.bad { background: var(--bad-bg); color: var(--bad-ink); border-color: var(--bad-line) }
+.setup-badge.info { background: var(--info-bg); color: var(--info-ink); border-color: var(--info-line) }
+.setup-text { font-size: 13px; color: var(--ink-2) }
+.setup-advice { font-size: 12px; color: var(--faint); margin-top: 2px }
+
 /* ------------------------------ the queue strip ------------------------------
    A queued message runs by itself when the task ends, so the strip is the record of what is
    about to happen. Colours stay on pairs check_contrast.py already grades: ink-2 and faint on
@@ -346,10 +370,11 @@ button.pill:hover { background: var(--hover); border-color: var(--line-2) }
 .pill.soft { border-color: transparent; background: var(--chip) }
 .pill.on { border-color: var(--accent); color: var(--accent-text) }
 .pill .x { opacity: .5; font-size: 13px; line-height: 1 }
-/* The two composer modes reuse the two proven tinted/neutral pill pairs the rest of the
-   window already ships: chip ink for prose, the OK pill pair for "this can change files". */
+/* The three composer modes reuse pairs the contrast audit already grades: chip ink for prose, the
+   info blue for a folder it will only read, the OK green for "this can change files". */
 .pill.mode { font-weight: 600 }
 .pill.mode.chat { border-color: transparent; background: var(--chip); color: var(--ink-2) }
+.pill.mode.read { border-color: var(--info-line); background: var(--info-bg); color: var(--info-ink) }
 .pill.mode.change { border-color: var(--ok-line); background: var(--ok-bg); color: var(--ok-ink) }
 .pill.path { max-width: 300px; overflow: hidden; text-overflow: ellipsis; color: var(--faint) }
 /* The git chip reuses the two pairs the contrast audit already grades: a clean tree is
@@ -602,6 +627,10 @@ button.drive:hover { border-color: var(--line-2); background: var(--hover) }
 }
 .cmd .g { margin-left: auto; font-size: 11px; color: var(--faint) }
 .cmd.on { background: var(--sel); color: var(--ink) }
+/* The mode sheet spells each promise out under its row instead of hiding it in a title attribute:
+   which of the three positions refuses to write is the whole decision, and it has to be readable
+   before the click. `faint` on the sheet's own surface is the pair the card labels already use. */
+.cmd-help { padding: 0 12px 10px; font-size: 12px; line-height: 1.45; color: var(--faint) }
 
 /* ------------------------- file chips and the rail preview (UI 3.1) -------------------------
    A chip is the smallest control that says "this file changed, and you can look". The three pairs

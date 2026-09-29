@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, labels, repair
+from .. import config, git_integration, intent, labels, repair
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -239,6 +239,11 @@ class FakeController:
         self._emit = None
 
     # ----------------------------- contract -----------------------------
+    @property
+    def reading_only(self) -> bool:
+        """The same question the real controller asks every write and every run gate."""
+        return intent.read_only(self.composer)
+
     def snapshot(self) -> dict:
         return {
             "prefs": self.prefs, "busy": self.busy, "cancellable": self.cancellable, "pending": self.pending,
@@ -318,6 +323,7 @@ class FakeController:
         }
 
     def _review(self) -> dict:
+        reading = self.reading_only
         files = []
         for change in FILES:
             lines = _diff(change["before"] or "", change["after"], change["path"])
@@ -331,12 +337,12 @@ class FakeController:
             "state": STATES.get(self.state, self.state), "tone": TONE.get(self.state, ""),
             "title": "Implement step 2: register the user and reject duplicate emails",
             "detail": f"{len(FILES)} files · attached plan plan.md · proposal 8f2a…c41b",
-            "canApply": self.state == "WAITING_APPROVAL",
+            "canApply": self.state == "WAITING_APPROVAL" and not reading,
             "canMutate": self.state in labels.MUTABLE_STATES,
             # Roll back answers to a wider set than the other two, because an interrupted apply is
             # exactly when the escape has to be on screen. Without this field the preview window —
             # the one the design is reviewed in — shows a button that can never light up.
-            "canRollback": self.state in labels.MUTABLE_STATES | labels.INTERRUPTED_STATES,
+            "canRollback": (self.state in labels.MUTABLE_STATES | labels.INTERRUPTED_STATES) and not reading,
             "files": files, "selected": self._file, "tab": self.tab,
             "view": {"diff": _diff(chosen["before"] or "", chosen["after"], name),
                      "before": (chosen["before"] or "").splitlines(),
@@ -440,10 +446,14 @@ class FakeController:
         if type == "send":
             return self._send(payload.get("text", ""), emit)
         if type == "apply":
+            if self.reading_only:
+                return self._refuse(intent.no_write("Apply"))
             return self._confirm_then("apply", emit)
         if type == "run":
             return self._run(payload.get("fix"), emit)
         if type == "rollback":
+            if self.reading_only:
+                return self._refuse(intent.no_write("Roll back"))
             self.state = "ROLLED_BACK"
             self._note(emit, "rolled_back", "Task changes rolled back.")
             self.git_restore_offer = {"commit": "9f3c21a", "paths": len(FILES)}
@@ -519,9 +529,17 @@ class FakeController:
         elif type == "set_auto_apply":
             # The pill next to Send and the composer placeholder both key off this, so a preview
             # that ignored the click could not be used to review either of them.
-            self.auto_apply = bool(payload.get("value"))
+            if self.reading_only and not bool(payload.get("value")):
+                pass                  # turning a switch that is already off asks nothing of anyone
+            elif self.reading_only:
+                self._refuse(intent.no_auto_apply())
+            else:
+                self.auto_apply = bool(payload.get("value"))
         elif type == "set_composer":
-            self.composer = "change" if payload.get("value") == "change" else "chat"
+            self.composer = intent.normalise(payload.get("value"))
+            # The switch belongs to Change mode, exactly as it does in the real window: a folder
+            # moved to Read-only mid-session has to stop showing "writes itself" on the next pill.
+            self.auto_apply = self.auto_apply and self.composer == "change"
         elif type == "set_timeout":
             self.timeout = int(payload.get("value") or 300)
         elif type == "set_recipe":
@@ -571,6 +589,8 @@ class FakeController:
         elif type == "apply_block":
             # The block button writes nothing here either: it opens a proposal, which is the state
             # the review cards are drawn for.
+            if self.reading_only:
+                return self._refuse(intent.no_proposal())
             self.state = "WAITING_APPROVAL"
             emit({"kind": "toast", "text": "Proposing %s — review the diff, then Apply"
                   % str(payload.get("path", "that file"))})
@@ -589,6 +609,8 @@ class FakeController:
             return None
         self.messages.append({"role": "user", "author": "You", "time": _clock(), "text": text})
         emit({"kind": "message", "message": self.messages[-1]})
+        if self.reading_only:
+            return self._analyse(emit)
         self.busy = self.cancellable = True
         self.pending = "connecting to the model…"
         emit({"kind": "busy", "value": True, "cancellable": True})
@@ -631,6 +653,26 @@ class FakeController:
 
         threading.Thread(target=work, name="ui-fake-job", daemon=True).start()
 
+    def _refuse(self, text: str) -> None:
+        """A gate the preview cannot show is a gate nobody reviewed — so refusals land on screen."""
+        self.status_line = text
+        self._emit({"kind": "toast", "text": text})
+
+    def _analyse(self, emit) -> None:
+        """Read-only's scripted answer: the folder was read, the refusal is its own row, and no
+        proposal state is entered. Everything the mode promises has to be visible here."""
+        self._note(emit, "read", "Read 6 files · 18.4k characters")
+        self.messages.append({"role": "tool", "author": "Tool", "time": _clock(),
+                              "text": intent.no_proposal()})
+        emit({"kind": "message", "message": self.messages[-1]})
+        reply = {"role": "assistant", "author": "AI Code Engineer", "time": _clock(),
+                 "text": "The duplicate-email guard lives in `UserService.create()`, and it compares "
+                         "strings in two places that disagree about the field name. That is the whole "
+                         "of what I found; the fix would touch `UserService.java` and its test."}
+        self.messages.append(reply)
+        emit({"kind": "message", "message": reply})
+        emit({"kind": "state", "data": self.snapshot()})
+
     def _confirm_then(self, type: str, emit) -> None:
         answer = self._ask("confirm", {"title": "Apply changes",
                                        "message": "Write 3 file(s) to D:\\AI\\AI-Agent\\examples\\demo2?\n"
@@ -660,6 +702,16 @@ class FakeController:
                 self.recipe = chosen["recipes"][0]
 
     def _run(self, fix, emit) -> None:
+        if self.reading_only:
+            # The one action in this mode that runs anything, so it asks per command. The refusal has
+            # to be reviewable here too: a preview that only shows the yes path hides the whole rule.
+            answer = self._ask("confirm", {"title": "Run this command?",
+                                           "message": intent.run_ask("mvn -B test", project="demo2"),
+                                           "confirm": "Run it"}, emit)
+            if not answer.get("ok"):
+                return self._refuse(intent.run_declined())
+            # A round's output is a proposal, and this mode builds none: the scripted chip never moves.
+            fix = False
         self.busy = True
         # The scripted command always passes, so a loop has to be driven by hand: "Run & fix" spends
         # the budget the same way the real window does — reset, then one round per further run — so

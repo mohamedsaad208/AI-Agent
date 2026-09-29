@@ -115,6 +115,27 @@ class MoreThanOneProjectTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class TheCommandAPersonApproves(unittest.TestCase):
+    """Read-only mode asks about a command by name, so the name has to be one a person can read.
+
+    Both windows used to spell out the substitution where they showed it; this is the single copy the
+    question and the transcript line both come from.
+    """
+
+    def test_the_interpreter_is_named_rather_than_pathed(self):
+        text = runner.display_command("python-unittest")
+        self.assertTrue(text.startswith("python "), text)
+        self.assertNotIn(sys.executable, text, "a user-profile path is noise in a confirmation")
+        self.assertIn("unittest", text)
+
+    def test_a_tool_that_is_not_python_keeps_its_own_name(self):
+        self.assertEqual(runner.display_command("npm-test"), "npm test")
+
+    def test_the_recipes_all_have_one(self):
+        for name in runner.RECIPES:
+            self.assertTrue(runner.display_command(name).strip(), name)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

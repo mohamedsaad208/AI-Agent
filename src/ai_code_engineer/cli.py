@@ -7,14 +7,13 @@ import os
 from pathlib import Path
 import shutil
 import sys
-import tempfile
 
-from .config import Settings, load_settings, validate
-from .catalog import ollama_models
+from .config import load_settings, validate
 from .engine import apply_proposal, load_session, plan, review, rollback
 from .errors import AgentError
 from .providers import make_provider
 from .report import export_file, find_session
+from . import config, setup
 from .verification import RECIPES, verify
 from .workspace import Workspace
 
@@ -22,13 +21,27 @@ from .workspace import Workspace
 def safe_print(value: str) -> None:
     # Strip terminal control characters in untrusted model/repository content.
     value = "".join(c if c in "\n\t" or ord(c) >= 32 and not 127 <= ord(c) <= 159 else "?" for c in value)
-    print(value)
+    try:
+        print(value)
+    except UnicodeEncodeError:
+        # A cp1252 console cannot carry every script this tool answers in. A half sentence that
+        # survives is better than a traceback where the answer should have been.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(value.encode(encoding, "replace").decode(encoding, "replace"))
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="agent", description="Review-first Python developer agent (MVP)")
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Check Python, local Ollama, Docker and key presence")
+    first = sub.add_parser("setup", help="Run the first checks in order, and prove the red line offline")
+    first.add_argument("--repo", type=Path, help="Check this project folder for a runnable command")
+    first.add_argument("--provider", default="", help="Provider to check instead of Ollama")
+    first.add_argument("--endpoint", default="", help="Endpoint for that provider")
+    first.add_argument("--model", default="", help="Model the windows should land on")
+    first.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
+    first.add_argument("--yes", action="store_true", help="Answer every offer yes, for a script")
+    first.add_argument("--no-demo", action="store_true", help="Do not offer the offline proof")
     repo = sub.add_parser("map", help="Read-only repository map: files with their parsed declarations")
     repo.add_argument("--repo", type=Path, required=True)
     draft = sub.add_parser("plan", help="Explore a repository and save a proposed diff; never writes code")
@@ -63,43 +76,114 @@ def doctor() -> dict:
               "docker": bool(shutil.which("docker")),
               "openrouter_key_present": bool(os.environ.get("OPENROUTER_API_KEY")),
               "local_models": [], "ollama_models": []}
-    try:
-        models = ollama_models()
-        result["ollama_models"] = [m["id"] for m in models]
-        result["local_models"] = [m["id"] for m in models if not m["cloud"]]
-        result["ollama"] = "reachable"
-    except AgentError:
+    # The same probe `agent setup` reads, so the two cannot disagree about whether Ollama answered.
+    entries, _source, error = setup.reach(config.OLLAMA)
+    if error:
         result["ollama"] = "unreachable"
+    else:
+        result["ollama_models"] = [item["id"] for item in entries]
+        result["local_models"] = [item["id"] for item in entries if not item["cloud"]]
+        result["ollama"] = "reachable"
     return result
 
 
 def demo() -> dict:
-    class DemoProvider:
-        model = "deterministic-demo-no-llm"
-        turn = 0
+    """The offline proof, in `setup` because the wizard and the window offer it too."""
+    return setup.run_demo()
 
-        def generate(self, messages):
-            self.turn += 1
-            if self.turn == 1:
-                return json.dumps({"action": "read_file", "path": "calculator.py"})
-            return json.dumps({"action": "propose", "summary": "Fix addition in a synthetic fixture.",
-                               "checks": ["Run addition tests in an isolated worker."],
-                               "changes": [{"path": "calculator.py", "content": "def add(a, b):\n    return a + b\n"}]})
 
-    with tempfile.TemporaryDirectory(prefix="ai-agent-demo-") as temp:
-        root = Path(temp) / "repo"
-        root.mkdir()
-        (root / "calculator.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
-        session_path = plan(Workspace(root), "Fix add", DemoProvider(), Settings(), Path(temp) / "runs", progress=lambda _: None)
-        proposal = load_session(session_path)
-        apply_proposal(session_path, proposal["proposal_hash"])
-        result = verify(session_path)
-        changed = (root / "calculator.py").read_text() == "def add(a, b):\n    return a + b\n"
-        rollback(session_path, proposal["proposal_hash"])
-        restored = (root / "calculator.py").read_text() == "def add(a, b):\n    return a - b\n"
-        return {"proposal_apply_rollback": "passed" if changed and restored else "failed",
-                "static_checks": result, "llm_used": False,
-                "note": "Synthetic demo only. No project code executed. No build/test verification claimed."}
+def ask_line(prompt: str, ask=input) -> str:
+    """One line from the operator. Ctrl-D is an empty answer, not a traceback."""
+    try:
+        return str(ask(prompt) or "").strip()
+    except EOFError:
+        return ""
+
+
+def wants(prompt: str, args, ask=input, interactive=True) -> bool:
+    """One yes/no. A pipe gets a no and a line saying so, not a hang.
+
+    `apply` already refuses to block on a pipe; a wizard that waited on `input()` in a CI job would be
+    the same mistake with a friendlier name.
+    """
+    if getattr(args, "yes", False):
+        return True
+    if not interactive:
+        safe_print("(not an interactive terminal, so that question is answered no)")
+        return False
+    return ask_line(prompt, ask).lower() in {"y", "yes", "ok", "نعم", "ايه", "أيوه"}
+
+
+def run_setup(args, ask=input, interactive=None) -> int:
+    """The first-run wizard: check, prove, explain. It writes nothing outside a temporary folder.
+
+    Choosing the model, granting the folder and picking the write position all happen in the window,
+    because that is where those preferences are stored — a second copy of the same choices kept by the
+    terminal is exactly how two surfaces begin to disagree. So this run reports, offers the proof, and
+    then names the three things to do there.
+    """
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if args.arabic:
+        # A console that defaults to cp1252 cannot print Arabic at all, and the person who asked for
+        # Arabic rows is exactly the one who needs to read them rather than see question marks.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError, ValueError):
+            pass
+    repo = str(args.repo) if args.repo else ""
+    rows = setup.audit(repo=repo, provider=args.provider, endpoint=args.endpoint,
+                       model=args.model, arabic=args.arabic)
+    safe_print(setup.render(rows))
+
+    if args.repo is None and not args.yes and wants(
+            "Name a project folder to check it for a runnable command? (y/n): ",
+            args, ask, interactive):
+        typed = ask_line("Project folder: ", ask).strip('"')
+        if typed:
+            rows = setup.audit(repo=typed, provider=args.provider, endpoint=args.endpoint,
+                               model=args.model, arabic=args.arabic)
+            safe_print(setup.render([row for row in rows if row["id"] == "project"]))
+        else:
+            safe_print("No folder named, so nothing was checked against one.")
+    elif args.repo is None:
+        # A scripted run answered yes to everything, and there is nothing to guess here: the folder is
+        # the one question a yes cannot answer.
+        safe_print("No folder named with --repo, so nothing was checked against one.")
+
+    if not args.no_demo and wants("Run the offline proof? It writes only to a temporary folder, and "
+                                  "rolls it back. (y/n): ", args, ask, interactive):
+        safe_print("Running it…")
+        safe_print(setup.render([setup.demo_row(setup.run_demo(), arabic=args.arabic)]))
+
+    safe_print("")
+    safe_print(setup.render([setup.policy_row(arabic=args.arabic)]))
+    accepted = wants("Accept those five lines before the window offers you a write? (y/n): ",
+                     args, ask, interactive)
+
+    counts = setup.counts(rows)
+    safe_print("")
+    if args.arabic:
+        lines = [
+            "الخطوات الجاية في النافذة: افتح `agent ui`، اختار الموديل من Settings، افتح مجلد من "
+            "الشريط الجانبي، وبعدها حدد الشارة: Chat أو Read-only أو Change.",
+            "الكتابة التلقائية مفتاح فوق Change، ومتشغلش غير لو كنت مستعد ترجع بـ git.",
+        ]
+        if not accepted:
+            lines.insert(0, "لم تتم الموافقة على السياسة: الأداة لسه هتشتغل، بس مش هتكتب في ملفاتك.")
+    else:
+        lines = [
+            "Next, in the window: start it with `agent ui`, pick the model in Settings, open a folder "
+            "from the sidebar, then set the badge to Chat, Read-only or Change.",
+            "Auto-Apply is the switch on top of Change — leave it off unless you are ready to reverse "
+            "the writes with git.",
+        ]
+        if not accepted:
+            lines.insert(0, "The policy was not accepted. The tool still runs, but no write should be "
+                            "approved until you have read those lines.")
+    safe_print("\n".join(lines))
+    safe_print(f"\n{counts['ok']} ok · {counts['warn']} to watch · {counts['bad']} blocking.")
+    return 1 if counts["bad"] else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             safe_print(json.dumps(doctor(), indent=2))
+        elif args.command == "setup":
+            return run_setup(args)
         elif args.command == "map":
             safe_print(Workspace(args.repo).repo_map())
         elif args.command == "plan":

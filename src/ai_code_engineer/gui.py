@@ -15,7 +15,7 @@ from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
 
 from .catalog import LIVE, models_for
-from .chat import create_chat, load_chat, respond, title_for
+from .chat import create_chat, context_block, load_chat, respond, title_for
 from . import config
 from .config import Settings
 from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, load_session, plan,
@@ -29,7 +29,7 @@ from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
 from . import planbook, repair, runner
-from . import host
+from . import host, intent
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
 
@@ -191,6 +191,11 @@ class AgentWindow:
         # Chained mode turns an attached plan into an ordered ledger: the tool picks the
         # next unverified step, and a passing command run is what unlocks the one after it.
         self.chained = tk.BooleanVar(value=bool(self._saved_ui.get("plan_chained")))
+        # This window has no Chat/Change badge: naming a folder has always meant "work on it". So the
+        # axis arrives here as one switch, and it is the strict end of it — Read-only, which refuses
+        # even the proposal. It does not persist per folder the way the web window's does; see
+        # `_save_state`, where it is stored with the rest of this window's own settings.
+        self.read_only = tk.BooleanVar(value=bool(self._saved_ui.get("read_only")))
         self.plan_status = tk.StringVar(value="")
         self.memory_info = tk.StringVar(value="Choose a project folder to edit its notes.")
         self.mode = tk.StringVar(value="Ollama")
@@ -714,6 +719,14 @@ class AgentWindow:
         self.job_controls.extend([(self.mode_box, "readonly"), (self.model_box, "readonly")])
         self.button(actions, "Settings", self.show_settings, track=False,
                     tip="API key, model filter and details").pack(side="left")
+        # Next to Send, because this is the one control that decides what Send is allowed to become —
+        # the same rule the web window draws as a badge over its own prompt.
+        self.read_only_box = ttk.Checkbutton(actions, variable=self.read_only, text="Read-only")
+        self.read_only_box.pack(side="left", padx=(10, 0))
+        self.job_controls.append((self.read_only_box, "normal"))
+        Tooltip(self.read_only_box, intent.switched(intent.READ) + " The folder is still read, searched "
+                "and mapped — nothing is written, and the project command asks first.")
+        self.read_only.trace_add("write", self.read_only_changed)
         self.start_button = self.button(actions, "Send  ↑", self.start_plan, accent=True, tip="Send (Enter)")
         self.start_button.configure(font=("Segoe UI Semibold", 11), padx=18, pady=6)
         self.start_button.pack(side="right")
@@ -916,17 +929,43 @@ class AgentWindow:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def read_only_changed(self, *_):
+        """The switch answers its own click: what it just promised, and which buttons that changes."""
+        self.update_buttons()
+        folder = Path(self.repo.get().strip()).name if self.repo.get().strip() else ""
+        if self.read_only.get():
+            self.say(intent.switched(intent.READ, arabic=self.arabic, project=folder))
+        else:
+            self.say(intent.unchecked(arabic=self.arabic))
+        self._save_state()
+
+    @property
+    def reading_only(self):
+        """The one question every write gate and every run gate asks.
+
+        The web window holds the same position as a third value of its badge and reads it through
+        `intent.read_only`; this window has never had a mode badge at all, so it is a switch. What both
+        refuse, and in what words, comes from `intent` — that is the part the drift test pins.
+        """
+        return bool(self.read_only.get())
+
     def update_buttons(self):
         for widget, enabled in self.job_controls:
             widget.configure(state="disabled" if self.busy else enabled)
         self.task.configure(state="disabled" if self.busy else "normal")
         state = self.session.get("state") if self.session else None
-        self.apply_button.configure(state="normal" if not self.busy and state == "WAITING_APPROVAL" else "disabled")
+        # A control that is greyed out is a promise the window keeps before the click, not an
+        # invitation to press something that will answer with a refusal.
+        reading = self.read_only.get()
+        self.apply_button.configure(state="normal" if not self.busy and not reading
+                                    and state == "WAITING_APPROVAL" else "disabled")
         self.verify_button.configure(state="normal" if not self.busy and state in MUTABLE_STATES else "disabled")
-        self.rollback_button.configure(state="normal" if not self.busy and state in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"} else "disabled")
+        self.rollback_button.configure(state="normal" if not self.busy and not reading
+                                       and state in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"} else "disabled")
         runnable = not self.busy and state in MUTABLE_STATES and bool(self.recipes)
         self.run_button.configure(state="normal" if runnable else "disabled")
-        self.fix_button.configure(state="normal" if runnable else "disabled")
+        # "Run & fix" spends its round on a proposal, which is the one thing this switch refuses.
+        self.fix_button.configure(state="normal" if runnable and not reading else "disabled")
         self.stop_button.configure(state="normal" if self.busy and self.cancellable else "disabled")
         if self.busy and self.cancellable:
             self.stop_button.pack(side="right", before=self.start_button, padx=3)
@@ -1036,7 +1075,7 @@ class AgentWindow:
         ui = {"mode": self.mode.get(), "last_project": self.repo.get().strip(),
               "last_chat": self.chat_id, "request_timeout": self.request_timeout_seconds(),
               "endpoints": dict(self.endpoints), "profile": self.profile,
-              "plan_chained": bool(self.chained.get())}
+              "plan_chained": bool(self.chained.get()), "read_only": bool(self.read_only.get())}
         model = self.model.get() or self._pending_model
         if model:
             ui["model"] = model
@@ -1430,6 +1469,11 @@ class AgentWindow:
         if not repo:
             self.start_chat(task, settings, cloud, paid, key)
             return
+        if self.reading_only:
+            # The position is decided before the message is read: the only route from this box to a
+            # proposal is `plan()`, and building one is exactly what the switch refuses.
+            self.start_chat(task, settings, cloud, paid, key, intent.no_proposal(arabic=self.arabic))
+            return
         if plan_file:
             try:
                 read_plan_reference(Workspace(Path(repo)), plan_file, settings)
@@ -1499,26 +1543,52 @@ class AgentWindow:
             self.chat = create_chat(self.model.get() or Settings().model, self.chat_id)
         return self.chat
 
-    def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None):
-        """No project selected: plain question answering, no proposal, no file access."""
+    def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None,
+                   note: str = ""):
+        """Plain question answering, no proposal, no write.
+
+        With no folder selected it never touches the disk. With Read-only on it reads that folder's map
+        first: an analysis of a project the window cannot see is the one thing the switch was asked
+        for, and `repo_map()` is the same index the web window hands the model.
+        """
         chat = self.current_chat()
         self.session = self.session_path = None
         self.clear_review()
         self.title.set(chat.get("title") or task.replace("\n", " ")[:45])
         self.chat_message("You", task)
+        if note:
+            self.line("tool", "Tool", note)
         self.task.delete("1.0", "end")
+        reading = self.reading_only
+        repo = self.repo.get().strip() if reading else ""
 
         def work():
             provider = make_provider(settings, allow_cloud=cloud, data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
-            return respond(chat, provider, task, settings, self.chats)
+            return respond(chat, provider, task, settings, self.chats,
+                           context=self._chat_context(repo))
 
         def done(reply):
             self.chat_message("AI Code Engineer", reply)
             self.title.set(title_for(chat))
-            self.status.set("Answered. Choose a project when you want reviewed changes to real files.")
+            self.say(intent.answered(arabic=self.arabic) if reading else
+                     "Answered. Choose a project when you want reviewed changes to real files.")
             self.refresh_recent()
         self.run_job(work, done, "Thinking…")
+
+    def _chat_context(self, repo: str) -> str:
+        """The repository map and the standing notes, or nothing at all if the folder cannot be read.
+
+        A question about a project is not a reason to fail the question, so a folder that moves or
+        cannot be walked answers with no context rather than with an error.
+        """
+        if not repo or not Path(repo).is_dir():
+            return ""
+        try:
+            return context_block(Workspace(Path(repo)).repo_map(),
+                                 memory_store.read(self.memory_dir, repo))
+        except (AgentError, OSError):
+            return ""
 
     def stop(self):
         if self.busy and self.cancellable:
@@ -1804,6 +1874,12 @@ class AgentWindow:
     def apply(self):
         if self.busy or not self.session or self.session.get("state") != "WAITING_APPROVAL":
             return
+        if self.reading_only:
+            # The button is already greyed out. This is the answer for everything that reaches the
+            # method another way: a proposal left on screen when the switch moved, a key binding, a
+            # queued step. The mode is a promise about the folder, not about which widget was clicked.
+            self.say(intent.no_write("Apply", arabic=self.arabic))
+            return
         again = ""
         if self._auto_fix and self.selected_recipe():
             again = shared_note("apply_rerun_warning", arabic=self.arabic,
@@ -1990,6 +2066,17 @@ class AgentWindow:
         if recipe is None:
             self.status.set(status_text("no_recipe", arabic=self.arabic))
             return
+        if self.reading_only:
+            # Reading a folder is not running inside it. This is the only action in the mode that can
+            # execute anything — a build runs whatever its own scripts do — so it names the command
+            # and asks for that one, and a fix round (whose output is a proposal) is off the table.
+            if not self.ask("Run this command?",
+                            intent.run_ask(runner.display_command(recipe), arabic=self.arabic,
+                                           project=Path(self.session["root"]).name),
+                            ok_label="Run it"):
+                self.say(intent.run_declined(arabic=self.arabic))
+                return
+            auto_fix = False
         self._auto_fix = bool(auto_fix)
         if auto_fix:
             self._fix_round = 0
@@ -2061,6 +2148,12 @@ class AgentWindow:
         The bound and the two reasons to stop early are `repair`'s decision, not this window's: the
         web window asks the same question and must get the same answer.
         """
+        if self.reading_only:
+            # A round ends in a proposal, so no round starts here — and the run it would have followed
+            # did happen, because the operator approved that one command.
+            self.line("tool", "Tool", intent.no_fix_round(arabic=self.arabic))
+            self._auto_fix = False
+            return
         stop, reason = repair.should_stop(self.round_history(), self._fix_round)
         if stop:
             self.stop_fix_loop(reason)
@@ -2123,7 +2216,13 @@ class AgentWindow:
         self.run_job(lambda: verify(path), done, "Checking syntax in changed files…")
 
     def undo(self):
-        if self.busy or not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
+        if self.busy:
+            return
+        if self.reading_only:
+            # Rolling back is a write with a friendly name: it puts different bytes on the same paths.
+            self.say(intent.no_write("Roll back", arabic=self.arabic))
+            return
+        if not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
             return
         if not messagebox.askyesno("Roll back changes", "Restore this task's files to their previous contents?\nLater edits will block rollback to protect your work.", parent=self.root):
             return

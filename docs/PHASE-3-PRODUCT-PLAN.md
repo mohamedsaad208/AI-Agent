@@ -122,3 +122,42 @@ until `detect()` stopped re-resolving every executable against PATH once per mod
 Tests: 1023 → 1045, including a two-module Python fixture where the same recipe passes in one module
 and fails in the other. Browser-verified: the picker listed `demo2 (whole project)`, `backend`,
 `frontend`, and choosing `frontend` changed the offered command to `npm test`.
+
+**4. Read-only mode** — `src/ai_code_engineer/intent.py`, and the plan in `docs/READ-ONLY-MODE.md`.
+The ladder turned out to be three positions plus a switch, and the switch already existed:
+
+- `Chat` answers in prose. **`Read-only`** reads, searches, maps and explains, and refuses the
+  proposal. `Change` proposes a diff. Auto-Apply stays a per-folder switch on top of `Change`, not a
+  fourth rung — making it a mode would have duplicated `_auto_pref`, which already persists per folder.
+- The refusal set is one module's: `no_proposal` (also for a code block clicked into a proposal),
+  `no_write` for Apply *and* Roll back, `no_fix_round`, `no_auto_apply`, `run_ask` / `run_declined`,
+  `needs_folder`, `answered`, `unchecked` and `subtitle` — thirteen sentences, each in English and
+  Arabic, each written once. Both windows call them, and `tests/test_intent.py` fails if either writes
+  one of them out again: that is the exact drift that made two windows refuse two different things.
+- **Read-only is decided before the message is read.** `as_change` exists to promote a chat that turned
+  out to name files, and promotion is what this position refuses, so the gate sits above it.
+- **A command asks per command.** `runner.display_command()` names it in the question, and the answer
+  belongs to that command alone; declining says nothing ran. A fix round is refused where the loop
+  actually decides, so the sentence lands after a real failure rather than as a warning about
+  something that may not happen.
+- The position is remembered per folder like every other pref, and `_select_branch` now arms
+  Auto-Apply only for a branch actually in Change mode. That was a hole: the pref was read back on its
+  own, so restarting a folder left in Read-only would have re-armed the write switch under the refusal.
+
+Tk turned out to have **no positions at all** — its `self.mode` is the provider picker, and its rule
+has always been "a folder named → `plan()`; none → chat". So it holds the one rung it can: a Read-only
+switch beside Send that greys Apply / Roll back / Run & fix and refuses the same set, with Tk's chat
+answers now carrying the repository map and the project notes (they had never passed a `context=` at
+all, so read-only there would otherwise have been blind).
+
+A defect surfaced in the same file: the bound-chat tooltip was built from two adjacent string literals
+with no `+`, so ASI made it two statements — `node --check` passes, the sentence shipped ending "…a
+proposal you ", and its second half was dead code. `tools/scan_asi_strings.py` walks the static files
+for that shape, because no syntax checker can see it; it finds one case in the tree, now fixed.
+
+Tests: 1045 → 1084 (`test_intent` 15, `ReadOnlyModeTests` 10, Tk 6, the preview 5, `display_command` 3,
+plus the contrast ledger gaining `info-ink on info-bg` for the new pill). Browser-verified on the
+preview: the badge opens a three-row sheet, choosing Read-only turns the pill blue, an imperative is
+answered with the refusal row and prose, `canApply` and `canRollback` come back false, the Auto-Apply
+pill answers with the shared refusal, Run asks with `mvn -B test` named in the question, Cancel runs
+nothing, and "Run it" runs.
