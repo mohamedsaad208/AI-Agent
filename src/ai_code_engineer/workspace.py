@@ -8,7 +8,7 @@ import re
 import stat
 import tempfile
 
-from . import runner, symbols
+from . import ignore, runner, symbols
 from .errors import MissingFileError, PolicyError
 
 MAX_FILE_BYTES = 128 * 1024
@@ -19,23 +19,11 @@ TEXT_SUFFIXES = {".py", ".java", ".kt", ".kts", ".xml", ".gradle", ".md", ".txt"
 # The suffix gate is a text-or-binary check, and a few real text files have no suffix at all.
 # Refusing them does not protect anything: it stops an agent that scaffolds projects from
 # writing the one file that keeps its own `target/` and `.venv/` out of the first commit.
-# Credentials stay refused by the gates that run before this one (BLOCKED_PARTS, SECRET_NAME),
-# and none of these names is in AGENT_RULE_FILES, so none is a hook an agent could leave behind.
+# Credentials stay refused by the gates that run before this one (`ignore.refused_dir`: protected paths,
+# credential names, NTFS aliases), and none of these names is in AGENT_RULE_FILES, so none is a hook an
+# agent could leave behind.
 TEXT_NAMES = {".gitignore", ".gitattributes", ".editorconfig", ".dockerignore",
               "dockerfile", "makefile", "jenkinsfile", "license", "readme"}
-BLOCKED_PARTS = {".git", ".env", ".ssh", ".aws", ".azure", ".gnupg", ".codex",
-                 ".agents", ".agent-runs", ".agent-projects.json", ".agent-plans", ".agent-memory",
-                 ".venv", "venv", "node_modules", "target",
-                 "build", "dist", "__pycache__", ".idea", ".gradle", ".m2"}
-# Matches files that *are* credentials (.env, token.json, aws-secret.txt) rather than
-# source files that merely contain the word in an identifier (JwtTokenProvider.java).
-SECRET_NAME = re.compile(
-    r"(^\.env($|\.)|(^|[-_.])(credentials?|secrets?|passwords?|tokens?|keys?|private[-_]?key)s?($|[-_.]))",
-    re.I)
-# NTFS keeps an 8.3 alias for every name whose long form it had to shorten, and opening
-# the alias reads the same bytes. "TOKEN~1.JSON" would otherwise be a name the checks
-# above never saw, so it is rejected by shape before it is ever resolved.
-SHORT_NAME = re.compile(r"~\d{1,2}(?:\.[^.]+)?$", re.I)
 # Instruction, rules and auto-launch config for the agents and editors that may open this
 # folder next. A model that writes one gains a hook that outlives the session — read back
 # as instructions, or executed on open — so none of them is ever writable. They are readable
@@ -114,6 +102,10 @@ class Workspace:
         if not self.root.is_dir():
             raise PolicyError("Workspace must be a directory.")
         self._cache_key = str(self.root)
+        # What the last walk stopped at, counted by `files()` and spoken by `map_note()`. Zero until a
+        # walk has run, which is the honest answer to "what did you not show me".
+        self.skipped_generated = 0
+        self.skipped_ignored = 0
 
     def path(self, relative: str, *, writable: bool = False) -> Path:
         if not isinstance(relative, str) or not relative or len(relative) > 400:
@@ -125,8 +117,7 @@ class Workspace:
             p in {"", ".", ".."} or p.rstrip(" .") != p for p in parts
         ):
             raise PolicyError("Absolute paths, traversal and ambiguous paths are blocked.")
-        if any(p.casefold() in BLOCKED_PARTS or SECRET_NAME.search(p) or SHORT_NAME.search(p)
-               for p in parts):
+        if any(ignore.refused_dir(p) for p in parts):
             raise PolicyError("Protected path.")
         if any(re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", p) for p in parts):
             raise PolicyError("Device paths are blocked.")
@@ -141,8 +132,7 @@ class Workspace:
             raise PolicyError("Path escapes workspace.")
         # The name the model typed and the name NTFS finally opens are not always the
         # same (case, aliases, mount points), so the resolved form is checked too.
-        if any(p.casefold() in BLOCKED_PARTS or SECRET_NAME.search(p)
-               for p in resolved.relative_to(self.root).parts):
+        if any(ignore.refused_dir(p) for p in resolved.relative_to(self.root).parts):
             raise PolicyError("Protected path.")
         if (current.suffix.lower() not in TEXT_SUFFIXES
                 and current.name.casefold() not in TEXT_NAMES):
@@ -177,12 +167,50 @@ class Workspace:
         return {"path": relative, "sha256": digest(raw), "content": content}
 
     def files(self, limit: int = 2000) -> list[str]:
+        """Every path this tool is willing to look at, in one walk.
+
+        Three things decide together here, and they must keep deciding together: the directory names
+        `ignore` owns, the repository's own `.gitignore` (including nested ones, for the directories the
+        walk actually reaches), and the policy gate in `path()`. The map, the search and the composer's
+        context count all read this list, so a file that is invisible to one is invisible to all three —
+        which is the only version of that story a person can live with.
+
+        What was hidden as noise is counted and reported by `repo_map()`, because "where did my file
+        go" is a question a silent filter makes unanswerable. Credentials and policy paths stay
+        uncounted and unmentioned: they are refusals, not tidiness.
+        """
         found = []
+        self.skipped_generated = 0
+        self.skipped_ignored = 0
+        root_rules = ignore.Rules.load(self.root)
+        in_force = {"": root_rules}          # rules for a directory, keyed by its own relative path
         for base, dirs, names in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d.casefold() not in BLOCKED_PARTS
-                             and not SECRET_NAME.search(d) and not is_link(Path(base) / d))
+            walked = Path(base).relative_to(self.root).as_posix()
+            own = "" if walked == "." else walked
+            rules = in_force.get(own.rsplit("/", 1)[0] if "/" in own else "", root_rules)
+            prefix = own + "/" if own else ""
+            if ".gitignore" in names and own:
+                try:
+                    rules = rules.child((Path(base) / ".gitignore").read_text(
+                        encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+            in_force[own] = rules
+            # A link is dropped here rather than in `ignore`: recognising one needs this root, and the
+            # decision "do not follow it out of the workspace" belongs to the gate, not to tidiness.
+            kept, hidden, skipped = ignore.walk_prune(
+                [name for name in dirs if not is_link(Path(base) / name)], rules)
+            self.skipped_generated += hidden
+            self.skipped_ignored += skipped
+            dirs[:] = kept
             for name in sorted(names):
-                relative = (Path(base) / name).relative_to(self.root).as_posix()
+                relative = prefix + name
+                if rules and rules.ignores(relative, False):
+                    self.skipped_ignored += 1
+                    continue
+                if ignore.generated_file(name):
+                    self.skipped_generated += 1
+                    continue
                 try:
                     self.path(relative)
                 except PolicyError:
@@ -209,11 +237,28 @@ class Workspace:
         return results
 
     def repo_map(self) -> str:
+        files, rows = self.index()
+        # A folder with several builds in it gets its map spread across them: the budget is the same
+        # 12 000 characters either way, and in a reactor alphabetical order spends all of it on the
+        # first three modules.
+        return symbols.render(rows, files, spread_files=len(runner.projects(self.root)) > 1,
+                              note=self.map_note())
+
+    def index(self) -> tuple[list[str], list[dict]]:
+        """The visible files and the parsed declarations for the code among them.
+
+        Split out of `repo_map()` because a symbol query needs the rows without the prose: rendering
+        costs 12 000 characters of text, and `find_symbol` wants the structures behind them. The cache
+        in `_index_row` makes the second call in a turn nearly free, which is the whole reason both
+        surfaces can afford to ask.
+        """
         files = self.files(limit=symbols.MAX_FILES)
         rows = []
         indexed = set()
         for name in files:
-            if not symbols.indexable(name):
+            # Code gets its declarations; the handful of configuration files that describe the project
+            # get their facts. Everything else stays a line in the list, as it always was.
+            if not (symbols.indexable(name) or symbols.noteworthy(name)):
                 continue
             row = self._index_row(name)
             if row is not None:
@@ -222,10 +267,42 @@ class Workspace:
         for stale in [key for key in list(INDEX_CACHE)
                       if key[0] == self._cache_key and key[1] not in indexed]:
             del INDEX_CACHE[stale]
-        # A folder with several builds in it gets its map spread across them: the budget is the same
-        # 12 000 characters either way, and in a reactor alphabetical order spends all of it on the
-        # first three modules.
-        return symbols.render(rows, files, spread_files=len(runner.projects(self.root)) > 1)
+        return files, rows
+
+    def sources(self, rows: list[dict]) -> list[tuple[str, str]]:
+        """The text of every indexed file — code, and only code.
+
+        A reference search over the whole workspace would answer `register` with a Spring key in
+        `application.yml` and spend the hit budget on configuration; `search_code` is the verb for text,
+        this one is for names. A file the gates refuse (too large, not UTF-8) is left out rather than
+        failing the query, because a partial answer about references is still the answer being asked.
+        """
+        out = []
+        for row in rows:
+            if row.get("kind") == "config":
+                continue
+            try:
+                out.append((row["path"], self.read(row["path"])["content"]))
+            except PolicyError:
+                continue
+        return out
+
+    def map_note(self) -> str:
+        """One line on what the walk left out, so an empty result is not mistaken for an empty project.
+
+        The counts come from the same walk that produced the list, so they cannot drift from it; a model
+        that knows 400 generated files were skipped will read a path by name instead of concluding the
+        code it was asked about does not exist.
+        """
+        hidden = []
+        if self.skipped_generated:
+            hidden.append(str(self.skipped_generated) + " built or generated")
+        if self.skipped_ignored:
+            hidden.append(str(self.skipped_ignored) + " listed in .gitignore")
+        if not hidden:
+            return ""
+        return ("(not shown: " + " and ".join(hidden) + " path(s) the walk stopped at. "
+                "Name a path and read it if you need one.)")
 
     def _index_row(self, relative: str) -> dict | None:
         """This file's declarations, reusing the last parse when the file still fits.
@@ -248,7 +325,8 @@ class Workspace:
             content = self.read(relative)["content"]
         except PolicyError:
             return None
-        row = symbols.parse(relative, content)
+        row = (symbols.parse(relative, content) if symbols.indexable(relative)
+               else symbols.config_row(relative, content))
         if row is not None:
             INDEX_CACHE[key] = (info.st_mtime_ns, info.st_size, row)
         return row

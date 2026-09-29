@@ -520,5 +520,67 @@ class TheWarningThatRunIsNotSandboxed(unittest.TestCase):
         self.assertGreater(len(english), 60)
 
 
+class TheRowThatThoughtOutLoud(unittest.TestCase):
+    """UI 4.2 phase 2: the deliberation a reasoning model returns beside its answer is a row, not a reply.
+
+    The shape is decided by what the thread is for: a reader scanning it wants to know *that* the model
+    spent 1,200 characters thinking and roughly on what, and wants the whole text one click away. So the
+    line carries one preview and the record carries the rest, and the words are said in the task's own
+    language like every other row.
+    """
+
+    def test_the_line_previews_one_line_and_the_rest_lives_behind_the_row(self):
+        thought = "the email check has to come first\nsecond line of the deliberation"
+        line = labels.step_line(False, "model_reasoning", count=len(thought), detail=thought)
+        self.assertIn("the email check has to come first", line)
+        self.assertNotIn("second line", line, "opening the row is where the rest of it lives")
+        self.assertIn(str(len(thought)), line)
+        self.assertTrue(line.endswith("…"), line)
+
+    def test_a_long_first_line_is_cut_so_the_thread_stays_scanable(self):
+        line = labels.step_line(False, "model_reasoning", count=900, detail="x" * 900)
+        self.assertLess(len(line), 200)
+        self.assertEqual(line.count("…"), 1)
+
+    def test_a_row_with_nothing_to_show_does_not_end_on_a_colon(self):
+        self.assertFalse(labels.step_line(False, "model_reasoning", count=0, detail="").endswith(":"))
+
+    def test_both_languages_say_the_same_thing_about_the_same_thought(self):
+        english = labels.step_line(False, "model_reasoning", count=214, detail="the email check")
+        arabic = labels.step_line(True, "model_reasoning", count=214, detail="the email check")
+        self.assertIn("Thought for 214 characters", english)
+        self.assertNotIn("Thought for", arabic)
+        self.assertIn("\u0641\u0643\u0631", arabic)          # "thought"
+        self.assertIn("\u062d\u0631\u0641", arabic)          # "characters"
+        self.assertIn("214", arabic)
+        self.assertIn("the email check", arabic)
+        self.assertTrue(is_arabic(arabic))
+        self.assertFalse(is_arabic(english))
+
+    def test_a_thought_opens_only_when_there_is_a_thought(self):
+        self.assertTrue(labels.step_has_detail("model_reasoning", {"detail": "a"}))
+        self.assertFalse(labels.step_has_detail("model_reasoning", {"detail": ""}))
+        self.assertFalse(labels.step_has_detail("model_reasoning", {}))
+
+    def test_the_error_that_came_back_names_the_count_the_recipe_and_the_line(self):
+        english = labels.step_line(False, "unresolved_error", count=3, label="mvn -B test",
+                                   detail="[ERROR] Tests run: 14, Failures: 2")
+        self.assertIn("3 earlier task(s)", english)
+        self.assertIn("mvn -B test", english)
+        self.assertIn("[ERROR] Tests run: 14", english)
+        arabic = labels.step_line(True, "unresolved_error", count=3, label="mvn -B test",
+                                  detail="[ERROR] x")
+        self.assertTrue(is_arabic(arabic))
+        self.assertIn("mvn -B test", arabic, "a command stays latin inside an Arabic thread")
+        self.assertIn("3", arabic)
+        self.assertFalse(labels.step_line(False, "unresolved_error", count=1).endswith(":"))
+
+    def test_an_unresolved_error_says_everything_on_its_line_so_it_never_opens(self):
+        """UI 4.1's rule: a row opens to say more than its line does. The count, the recipe and the
+        error are all in the sentence already, so a chevron here would open an echo."""
+        for fields in ({"detail": "[ERROR] x", "count": 3, "label": "mvn -B test"}, {"detail": ""}):
+            self.assertFalse(labels.step_has_detail("unresolved_error", fields))
+
+
 if __name__ == "__main__":
     unittest.main()

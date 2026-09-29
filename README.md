@@ -54,8 +54,8 @@ forget and hardest to undo.
 
 | What you should know before you rely on it | |
 | :--- | :--- |
-| **Run and Check syntax execute your project's own code** | They invoke `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` in that folder with *your* permissions. A build script is code, and code from a repository you did not write gets run here. The command list is an allowlist and the environment is stripped of credentials — that is a **limit**, not a sandbox. |
-| **Docker is the isolation, if you need isolation** | For a folder you do not trust, run the tool inside a container with a mount you are willing to lose. Nothing inside this program contains a project's build script. |
+| **Run and Check syntax execute your project's own code** | They invoke `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` in that folder with *your* permissions. A build script is code, and code from a repository you did not write gets run here. The command list is an allowlist and the environment is stripped of credentials — that is a **limit**, not a sandbox. The row below is the sandbox. |
+| **The sandbox is a tick on the Run button** | `Run in Docker` runs the project's command against a **copy** of the folder, in a container with no network, no capabilities, a read-only root and an image pinned by `sha256` digest — so the build's reports are still read afterwards, and your tree is never mounted into it. Without Docker the run is refused rather than quietly done on the host. Verified here as an argv, not as a build: no container has run on the machine this was written on. |
 | **The repository map is context, not a compiler** | Symbols are parsed with `ast` for Python and bounded scanners for Java, Kotlin, Go, Rust and TypeScript. It tells the model what files declare; it does not type-check, resolve imports or prove the code works. Only running the project's command does that, and a run that never ran is reported as `unverified`, not as a pass. |
 | **Small local models write small diffs** | The reference setup is a CPU-only `qwen2.5-coder` on Ollama. Larger models produce better proposals; none of them produce a diff you should apply without reading. |
 | **A cloud endpoint means your code leaves the device** | Cloud rows are refused until you approve, the approval is asked per task, cleartext to a remote host is refused outright, and API keys live in memory only — never in a config file, a log line or an error message. |
@@ -74,6 +74,10 @@ cd AI-Agent
 ```
 
 ```bash
+# First run, in order: what this machine can run, who answers, which models exist, what the folder
+# grants, the offline proof, the five promises, and what `Send` may become. Exit 1 if a row blocks.
+python agent.py setup                       # add --repo PATH to check a folder, --arabic, or --yes
+
 # Self-diagnostics: python version, Ollama reachability, Docker, key variables (never their values)
 python agent.py doctor
 
@@ -163,8 +167,18 @@ python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 The application features a sleek, local WebApp interface served on `127.0.0.1` with:
 - 📂 **Multi-Project Workspace:** Manage isolated branches, project memory notes, and saved tasks.
 - ⚡ **Review-First Diff Inspector:** Side-by-side **Diff / Now / Was** inspector with one-click rollbacks.
-- 🤖 **Universal Model Selector:** Switch on the fly between local models (Ollama/DeepSeek) and cloud APIs (Groq, OpenAI, OpenRouter).
+- 🤖 **Universal Model Selector:** Switch on the fly between local models (Ollama/DeepSeek) and cloud APIs (Groq, OpenAI, OpenRouter). A thinking model's deliberation arrives as its own collapsible row — capped, redacted, and never folded into the JSON the loop acts on — and an answer or a proposal streams in as it is written instead of appearing all at once after a minute of dots.
 - 🧪 **Evidence-Based Checks:** Native test suite runner with JUnit XML proofs and self-healing fix rounds.
+- 🐳 **A sandbox you can tick:** the same Checks card runs the project's command inside a pinned image —
+  no network, no capabilities, the project as a copy — and says so in the run line and in the exported
+  report, so a green from a container never reads as a green from your machine.
+- 🧭 **First-Run Card:** On a machine that has never granted a folder, the window opens with the same
+  audit `agent setup` prints — what it can run, what answers, the five promises, the three positions —
+  built from rows that ask nothing over the network until you press **Run the checks**.
+
+Both windows are the same product: the web window and the `--tk` fallback share the engine, the
+sentences and the decisions, and each keeps its proposed files in a viewer of its own — a sheet over the
+chat there, a second window you can move beside the conversation on the desktop.
 
 ---
 
@@ -213,6 +227,7 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
                                                   |  - Toolchain Detectors        |
                                                   |  - JUnit XML Evidence Parser  |
                                                   |  - Autonomous Repair Loop     |
+                                                  |  - Optional Docker Sandbox    |
                                                   +-------------------------------+
 ```
 
@@ -222,10 +237,10 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
 
 | path | what it is |
 | :--- | :--- |
-| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command, `labels.py` holds every sentence in both languages, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
+| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
 | `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
 | `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | **the gate.** 951 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `tests/` | **the gate.** 1403 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
 | `docs/` | plans, implementation status, code reviews. Every measured claim in this README points at one of these. |

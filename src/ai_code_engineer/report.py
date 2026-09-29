@@ -141,6 +141,9 @@ def runs_of(session: dict) -> list[dict]:
         rows.append({"recipe": run.get("recipe", ""), "label": run.get("label", ""),
                      # Which module of a multi-project folder ran, "" when it was the folder itself.
                      "folder": run_folder(run),
+                     # And in what: a green inside a pinned image is a claim about that image, and an
+                     # audit read a year later cannot tell the two apart without the name on the row.
+                     "sandbox": (run.get("sandbox") or {}).get("image", ""),
                     "command": run.get("command", ""), "status": run.get("status", ""),
                     "exit_code": run.get("exit_code"), "seconds": run.get("seconds"),
                     "tests": proof.get("tests") or 0, "failures": proof.get("failures") or 0,
@@ -271,9 +274,10 @@ def render_markdown(session: dict) -> str:
         counted = (str(run["tests"]) + " tests, " + str(run["failures"]) + " failed, "
                    + str(run["errors"]) + " errors"
                    if run["proof_source"] else "no test count was produced")
-        parts.append("### {} — `{}`{} · {}\n\n".format(index, _line(run["label"] or run["recipe"]),
-                                                       " in `" + run["folder"] + "`"
-                                                       if run["folder"] else "", run["status"]))
+        parts.append("### {} — `{}`{}{} · {}\n\n".format(
+            index, _line(run["label"] or run["recipe"]),
+            " in `" + run["folder"] + "`" if run["folder"] else "",
+            " inside `" + _line(run["sandbox"]) + "`" if run["sandbox"] else "", run["status"]))
         parts.append("- Command: `{}`\n".format(_line(run["command"])))
         parts.append("- Exit {} in {} s · {} · source: `{}`\n".format(
             run["exit_code"], run["seconds"], counted, _line(run["proof_source"] or "-")))

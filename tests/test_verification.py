@@ -20,8 +20,6 @@ from ai_code_engineer.workspace import Workspace, digest
 
 IMAGE = "python@sha256:" + "a" * 64
 DOCKER = "/usr/local/bin/docker"
-# The one text the container is started with; it is a constant, so changing it is a decision.
-PROLOGUE = 'cp -R /input/. /work/ && exec "$@"'
 
 
 class Process:
@@ -207,27 +205,43 @@ class DockerSpawnTests(unittest.TestCase):
             result = verification.docker_check(self.sandbox, recipe, image, timeout=timeout)
         return result, popen.call_args, cleanup
 
-    def test_the_container_is_sealed_and_the_project_is_only_ever_mounted_read_only(self):
+    def test_the_container_is_sealed_and_the_only_mount_is_the_copied_project(self):
         _result, call, _cleanup = self.spawn("python-unittest", Process(b"Ran 3 tests\n"))
         argv = call[0][0]
         self.assertEqual(argv[0], DOCKER)
         for flag in ("--pull=never", "--network=none", "--read-only", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges", "--user=65534:65534",
-                     "--pids-limit=128", "--entrypoint=/bin/sh"):
+                     "--pids-limit=128", "--rm"):
             self.assertIn(flag, argv)
-        mount = [part for part in argv if part.startswith("type=bind")]
-        self.assertEqual(mount, [f"type=bind,source={self.sandbox},target=/input,readonly"])
+        mounts = [part for part in argv if part.startswith("type=bind")]
+        self.assertEqual([part.split("target=")[1] for part in mounts], ["/work"],
+                         "one filesystem is writable, and it is the folder the caller copied into")
+        self.assertIn("source=" + self.sandbox.as_posix(), mounts[0])
+        self.assertNotIn("readonly", mounts[0], "the build's reports have to outlive it")
         self.assertIn("/tmp:rw,nosuid,size=128m", argv)
-        self.assertTrue(any(part.startswith("/work:rw,exec,nosuid") for part in argv),
-                        "the tests need a writable place that is not the mounted project")
 
-    def test_the_recipe_is_handed_over_as_argv_behind_a_fixed_shell_prologue(self):
+    def test_the_recipe_is_handed_over_as_argv_and_no_shell_is_asked_for(self):
+        """The call used to start `/bin/sh -c 'cp -R … && exec "$@"'`. The copy happens on the host now,
+        so the only text left in the argv is the recipe's own argv — which is what "no model or user
+        text reaches a command line" is worth when somebody can actually read the call."""
         for recipe in sorted(verification.RECIPES):
             with self.subTest(recipe=recipe):
                 _result, call, _cleanup = self.spawn(recipe, Process(b"Ran 3 tests\n"))
                 argv = call[0][0]
-                self.assertEqual(argv[argv.index("-c") + 1], PROLOGUE)
-                self.assertEqual(argv[argv.index("agent") + 1:], verification.RECIPES[recipe])
+                image = argv.index(IMAGE)
+                self.assertNotIn("/bin/sh", argv)
+                self.assertNotIn("-c", argv[image:], "the image's own entrypoint runs the recipe")
+                self.assertEqual(argv[image + 1:], verification.container_command(recipe))
+
+    def test_a_build_that_would_download_is_told_there_is_no_network(self):
+        """The container has no network, and the two tables that used to hold these commands had
+        already drifted on exactly that flag. One table now, derived from the runner's."""
+        self.assertEqual(verification.container_command("maven-test"), ["mvn", "-o", "-B", "test"])
+        self.assertEqual(verification.container_command("gradle-test"),
+                         ["gradle", "--offline", "--no-daemon", "test"])
+        python = verification.container_command("python-unittest")
+        self.assertEqual(python[0], runner.IMAGE_PYTHON)
+        self.assertNotIn(sys.executable, python, "no image has this machine's interpreter path")
 
     def test_the_child_is_given_a_scrubbed_environment_and_not_the_applications_own(self):
         os.environ["OPENROUTER_API_KEY"] = "synthetic-secret"

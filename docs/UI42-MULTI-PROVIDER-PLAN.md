@@ -208,3 +208,154 @@ Three deviations worth keeping in mind, all measured rather than guessed:
 `check_endpoint`'s refusals stay English, like every other sentence at the provider layer: a
 PolicyError raised in `config` has no language to ask about, and `friendly_error` has no Arabic
 parameter to answer with. Recorded rather than half-fixed.
+
+## As built — Phase 2, the reasoning field
+
+**1309 → 1341 tests green.** `providers.read_reasoning` reads the field beside `content` — under all
+three names the providers have been seen using (`reasoning`, `reasoning_content`, `thinking`) — caps it
+at 1200 characters, redacts it at capture rather than at the surface, and resets it at the top of every
+`generate` so a stale thought cannot be announced for a turn that had none. The loop turns each reply
+that carried one into a `model_reasoning` step row: the line previews a single sentence, the whole text
+is fetched behind the chevron like every other UI 4.1 detail, and the thought is never sent back to the
+model as history. `parse_action` now takes the *action-shaped* balanced object rather than the first
+one, so a reply that quotes braces in prose before answering keeps its turn.
+
+Two premises died under measurement, both on this machine's own Ollama (qwen3:4b, granite4.2:3b,
+2026-09-29) — and one death was of my own misreading, written down because it is the kind that would
+otherwise survive into the next plan. An early probe reported thinking tags inside `content`; that
+probe had been written through the shell wrapper, which ate part of its marker strings, so what it was
+actually matching was a bare `<` character. Rebuilt with the markers held together inside the file, the
+same call reports none.
+
+1. **"Strip inline thinking tags from `content` before `parse_action`" describes a shape this
+   transport never produces.** Measured on `/api/chat`, qwen3:4b: `think:false` with `format:"json"`
+   (a proposal turn) returns 151 clean characters and no tag anywhere in them; `think:true` with the
+   same format returns the deliberation in `message.thinking` and content still clean; `think:false`
+   with `format` unset (a chat turn) returns 1284 characters of *untagged* prose headed "Okay, the
+   user wants me to…" ending in `done_reason:"length"`. There is nothing between a `<` and a `>` to
+   cut in any of the three, so the rule was implemented, tested against the real endpoint, and removed
+   again. What the measurement found instead is a real defect with a different owner: on a turn with no
+   JSON grammar, `think:false` puts the model's deliberation *in the answer* and burns the output
+   budget arriving at none. Asking for the field instead is not free — `think:true` with
+   `format:"json"` spent all 400 tokens on thinking and answered with nothing at all — so this is a
+   trade to decide, not a bug to patch. Recorded as task #56.
+2. **The reasoning row does not need an "earlier errors" twin.** D42's `unresolved_error` row had been
+   given a detail block, but its line already carries the count, the recipe and the error text, so
+   opening it would have shown an echo. UI 4.1's rule says that row never opens; the dead branch and
+   its section title are gone.
+
+The preview window builds its scripted row through `labels.step_line` rather than typing the sentence
+out — a reviewer deciding a row's shape from `--fake` would otherwise be reviewing a sentence the
+engine cannot produce. Verified in the browser on the preview: the row reads
+"Thought for 358 characters: …" and opens onto "What it thought first" with all three sentences, and
+the second click closes it (the fake had been missing the real window's empty-id guard).
+
+## As built — Phase 3, streaming
+
+**1341 → 1373 tests green.** `providers.read_stream` opens the request the same way the buffered call
+does — same `ProxyHandler({})`, same `NoRedirect()`, same timeout, same `_refuse` translation — with the
+2 MB cap moved from the length of a body to the count of bytes read, and it hands each piece to
+`on_token` while returning the assembled text. That second half is the point: the loop parses, hashes
+and stores what the provider actually sent, never what survived the trip to a browser. Two readers under
+that one rule, `ollama_chunk` for NDJSON and `openai_chunk` for SSE `data:` frames with `[DONE]`, and
+both of them read the thinking field a delta can carry as well as the text.
+
+`OllamaProvider.generate` and `OpenAICompatibleProvider.generate` gained `on_token=None` and a
+`supports_stream = True`, and every call site — `chat.respond`, `engine.plan`, the window — asks the
+flag before passing a callback, which is what lets the scripted models in the tests keep the
+two-argument `generate` they have always had. A listener is opt-in in the other direction too: with
+`on_token` absent the request still says `stream: false`, so no proposal turn pays for a reader.
+
+Verified against the real endpoint rather than only against doubles: an NDJSON read of
+`qwen2.5-coder:1.5b` came back as three pieces in order (`Streaming`, ` works`, `.`) assembled to
+`Streaming works.` with `finish: stop`, and a `think:true` read of `qwen3:4b` accumulated 296
+characters of deliberation in one field while its answer stayed in the other.
+
+On the surface, `LineFeed` is what makes a stream safe to show. Redaction is line-shaped, and a key that
+arrives as `sk-or-vl-` in one frame and the rest of it in the next is invisible to the pattern in either,
+so fragments are reassembled to a line before `controller._token` scrubs and caps it — through one
+`_stream` owner shared with `_build_line`, which is why the `self._emit(` ceiling in `test_host.py`
+stayed at 21 instead of growing a second sink. `chat.respond` stores the assembled reply, and the two
+copies differ on purpose where a secret is involved: the ephemeral channel is scrubbed, the transcript
+keeps the model's own text, because a chat that redacted what it was asked to explain would answer a
+different question than the one that was asked.
+
+The client's `appendToken` had been dead for four rounds, which is the failure mode to design against
+rather than merely fix. It now paints from a `STREAM` buffer kept outside `DATA.messages`, for the same
+reason `LIVE` is: a snapshot goes out on other events, and a half answer held only in the message list
+would be wiped mid-sentence by a push that knows nothing about it. The bubble draws from
+`STREAM || DATA.pending`, so an arriving line shows without the window having to claim a job is running
+— the preview's Read-only contract says an answer starts no job, and that stayed true. `test_webapp.py`
+grew a guard that reads every `case 'kind'` the page listens for and proves a server can send it: the
+test that would have caught the dead stub four rounds ago, and it now holds `token`, `log_chunk`,
+`confirm` and `folder` honest.
+
+Two deviations from the plan, both measured:
+
+1. **Proposals stream into Activity, not into a live step row.** Phase 3 assumed UI 4.1 had left a
+   running row whose body accumulates lines. That row belongs to an `executing` action — a project
+   command that is running — and a model turn has no row of its own. Inventing one for the envelope
+   would be a new surface rather than a use of the old one, so the writing goes where text that is
+   still arriving already goes, and the preview scripts three frames of it.
+2. **Stop still waits for the body.** The answered decision deferred this, and the streaming read does
+   not make it worse: a Stop click cancels between turns exactly as it did against a blocking call. The
+   case that needs `cancelled` checked inside `read_stream` is a model that will not stop talking, and
+   it stays open.
+
+## As built — #56, the thinking model that answers in prose
+
+Phase 2 and 3 left this open as a trade to decide. It was not a trade: the two paths want opposite
+settings, and the split is already a variable in the one function that builds the request.
+
+```python
+if self.supports_thinking:
+    payload["think"] = not json_mode      # providers.py, OllamaProvider.generate
+```
+
+**Why prose asks for the field.** Re-measured on the same endpoint (qwen3:4b, 400-token budget) with the
+question kept short enough to finish:
+
+| turn | `think` | thinking | content | `done_reason` |
+| --- | --- | --- | --- | --- |
+| prose | off | 0 | 712 chars, deliberation first, closing marker inside it | `stop` |
+| prose | on | 522 | 180 chars, the sentence that was asked for | `stop` |
+| prose | unset | 522 | 180 | `stop` |
+| envelope (`format:"json"`) | off | 0 | 269 chars of clean JSON | `stop` |
+
+All three prose rows cost the same 136 tokens: the switch does not make the model think more, it decides
+**which field the thinking lands in**. That corrects the wording in phase 2's item 1, which reported the
+prose reply as *untagged* — that sample was cut at `done_reason:"length"` before it ever reached its
+closing marker, so the marker it did have was past the end of what was measured. One sample, one path, and
+a conclusion about a transport. The envelope row is the only place `think:true` was ever expensive, and it
+keeps `think:false` for exactly that reason.
+
+**Proved through the app's own chat path, not the endpoint.** `chat.respond` with a real
+`OllamaProvider` on `qwen3:4b`, at the production budget (`output_tokens=4096`), buffered and streamed:
+answer 174 characters, no marker, `load_chat()`'s stored turn byte-identical to the returned one,
+`provider.reasoning` filled (capped at 1200 by `read_reasoning`). The streamed leg delivered **31 pieces,
+the first of them `A`** — the first character a reader sees is the first character of the answer, which is
+the whole point of the change.
+
+**What it costs, and where that is recorded.** A thinking model on CPU spent minutes on that deliberation
+before the first content token, and `read_stream` hands `on_token` only content pieces, so the bubble sits
+empty for the wait. That is task #57, and it is a display problem with a display-shaped fix (a second sink
+for thought pieces, or a bounded budget) — not a reason to put the deliberation back into the answer.
+The wait is prompt-shaped, not question-shaped: the same one-sentence question with a bare prompt
+deliberated ~130 tokens and answered in 40 s, while through `chat.respond` — the app's own system prompt,
+the same 4096-token budget — each of the two turns took five to six minutes. A third probe that ran 17
+minutes without answering was **my own malformed request**, not a measurement: it set `num_predict: 4096`
+and left `num_ctx` alone, so it asked for a generation longer than the 4096-token window the server
+reported, which is exactly the mistake `config.context_window` exists to prevent. `think_budget` was tried
+at 120 and 200 on the bare prompt and changed nothing, because the thought there was already shorter than
+the budget — so whether Ollama 0.34 honours the key at all is still unmeasured.
+Two smaller findings from the same run:
+
+- A cold model plus a long reply beat the default `timeout_seconds=120` on the **buffered** path and came
+  back as `Provider connection failed or timed out`. The windows stream, and a stream keeps the socket
+  alive token by token, so the shipped path is not exposed; the CLI's buffered turn is.
+- The probe that measured this had to be written with the Write tool: the first attempt put its marker
+  strings through the shell wrapper, which ate them — the same trap that produced phase 2's wrong
+  measurement, recorded in `[[non-ascii-breaks-the-shell-wrapper]]`.
+
+**1379 → 1380 tests**: one new case in `TheReasoningField` pins both halves of the split — a prose turn
+asks with the field on, an envelope asks with it off.

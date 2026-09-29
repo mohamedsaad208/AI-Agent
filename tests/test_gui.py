@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import intent, labels, memory, repair, runner
+from ai_code_engineer import intent, labels, memory, repair, runner, setup
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import (atomic_json, load_session, plan, proposal_hash)
 from ai_code_engineer.errors import Cancelled
@@ -353,7 +353,7 @@ class DesktopTests(unittest.TestCase):
             self.ui.start_plan()
             self.wait_for_job()
         self.assertEqual(self.ui.session["state"], "WAITING_APPROVAL")
-        self.assertIn("removes 11 of 12 existing lines", self.ui.removal_notice())
+        self.assertIn("removes 11 of 12 existing lines", self.ui.approval_notice())
         with patch("ai_code_engineer.gui.messagebox.askyesno", return_value=False) as confirm:
             self.ui.apply()
         self.assertIn("Removes most of an existing file", confirm.call_args[0][1])
@@ -725,8 +725,10 @@ Validate the token.
                 self.wait_for_job()
             seen = {}
 
-            def record(repo, recipe, timeout=60, progress=lambda line: None, target="."):
+            def record(repo, recipe, timeout=60, progress=lambda line: None, target=".",
+                       sandbox=""):
                 seen["target"] = target
+                seen["sandbox"] = sandbox
                 return self.run_result("passed")
 
             with patch("ai_code_engineer.gui.runner.run", side_effect=record):
@@ -954,20 +956,260 @@ Validate the token.
 
     def test_the_switch_survives_a_restart_and_arrives_with_the_buttons_greyed(self):
         self.ui.read_only.set(True)
+        self.reopen()
+        self.assertTrue(self.ui.read_only.get(), "a promise made at the window is forgotten by it")
+        self.assertEqual(str(self.ui.apply_button["state"]), "disabled")
+
+    # ------------------------------ the side viewer ------------------------------
+    # UI 4.0 deleted the web window's Changes pane and answered "where do I see the files?" with a
+    # rail card and a sheet. This window's version of that pane was a third tab, and a tab is a place
+    # you have to navigate to while the diff is the thing you navigated away from.
+    def test_the_desktop_lost_its_changes_page(self):
+        self.assertFalse(hasattr(self.ui, "review_tab"))
+        self.assertEqual(list(self.ui.view_buttons), ["details", "task"])
+        self.assertEqual(len(self.ui.tabs.winfo_children()), 2, "the page stack still holds a viewer")
+
+    def test_a_proposal_raises_the_viewer_and_leaves_the_conversation_alone(self):
+        self.draft()
+        self.root.update()
+        self.assertTrue(self.ui.review_window.winfo_viewable(), "the proposal arrived hidden")
+        self.assertIs(self.ui.tabs.current, self.ui.task_tab,
+                      "the reader stays on the conversation that just told them about it")
+        self.assertIn(self.ui.state_label.get(), self.ui.review_window.title())
+
+    def test_closing_the_viewer_hides_it_and_keeps_the_proposal(self):
+        """Destroying the window would take the widgets every writer addresses with it, so the exit is
+        a withdraw: the next task paints into the same diff view rather than raising on a dead path."""
+        self.draft()
+        self.root.update()
+        self.ui.close_review()
+        self.root.update()
+        self.assertFalse(self.ui.review_window.winfo_viewable())
+        self.assertTrue(self.ui.review_window.winfo_exists())
+        self.assertEqual(self.ui.session["state"], "WAITING_APPROVAL")
+        self.assertEqual(str(self.ui.apply_button["state"]), "normal")
+        self.ui.clear_review()
+        self.ui.open_review()
+        self.root.update()
+        self.assertTrue(self.ui.review_window.winfo_viewable(), "a viewer that was closed is unopenable")
+
+    def test_a_hidden_viewer_is_not_retitled_behind_your_back(self):
+        """The title is the only sentence a window you are not looking at can say, and `open_review`
+        writes it from the live state — so a hidden retitle buys nothing and risks a stale taskbar."""
+        self.draft()
+        self.root.update()
+        self.ui.close_review()
+        self.root.update()
+        self.ui.clear_review()
+        self.assertEqual(self.ui.state_label.get(), "No proposal yet")
+        self.assertNotIn("No proposal yet", self.ui.review_window.title())
+        self.ui.open_review()
+        self.assertIn("No proposal yet", self.ui.review_window.title())
+
+    def test_the_conversation_names_the_window_it_just_opened(self):
+        """Closing the viewer is allowed, so the line in the chat has to say where Apply went — the
+        same sentence the web sheet's header answers with, out of `labels`."""
+        self.draft()
+        self.assertIn(labels.note("review_here"), self.texts())
+
+    def test_the_artifact_card_is_a_door_not_a_description(self):
+        button = self.find_button("Review proposed files  ↗", self.ui.sources_panel)
+        self.assertIsNotNone(button, "the card lost its way back to the viewer")
+        self.assertFalse(self.ui.review_window.winfo_viewable())
+        button.invoke()
+        self.root.update()
+        self.assertTrue(self.ui.review_window.winfo_viewable())
+
+    # ------------------------------ the container switch ------------------------------
+    PINNED = "python@sha256:" + "a" * 64
+
+    def test_the_container_choice_is_greyed_out_on_a_machine_without_docker(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=False):
+            self.ui.sandbox_changed()
+            self.assertEqual(str(self.ui.sandbox_box["state"]), "disabled")
+            self.assertIn(labels.NOTE_TEMPLATES["sandbox_missing"][0], self.ui.sandbox_info.get())
+
+    def test_the_image_box_only_opens_for_a_ticked_switch_and_a_digest_is_demanded(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True):
+            self.ui.sandbox_on.set(False)
+            self.ui.sandbox_changed()
+            self.assertEqual(str(self.ui.sandbox_entry["state"]), "readonly",
+                             "a box that nothing reads must not invite a typed digest")
+            self.assertIn(labels.NOTE_TEMPLATES["sandbox_off"][0], self.ui.sandbox_info.get())
+            self.ui.sandbox_on.set(True)
+            self.ui.sandbox_image.set("python:3.11")
+            self.ui.sandbox_changed()
+            self.assertIn(labels.NOTE_TEMPLATES["sandbox_unpinned"][0], self.ui.sandbox_info.get())
+            self.ui.sandbox_image.set(self.PINNED)
+            self.ui.sandbox_changed()
+            self.assertEqual(str(self.ui.sandbox_entry["state"]), "normal")
+            self.assertIn(labels.NOTE_TEMPLATES["sandbox_on"][0], self.ui.sandbox_info.get())
+
+    def test_a_run_carries_the_image_the_switch_was_ticked_with_and_nothing_otherwise(self):
+        self.applied_draft()
+        self.make_runnable()
+        seen = []
+
+        def record(repo, recipe, timeout=60, progress=lambda line: None, target=".", sandbox=""):
+            seen.append(sandbox)
+            return self.run_result("passed", sandbox={"image": sandbox, "container": "ai-agent-1"}
+                                   if sandbox else None)
+
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True), \
+                patch("ai_code_engineer.gui.runner.run", side_effect=record):
+            self.ui.sandbox_on.set(True)
+            self.ui.sandbox_image.set(self.PINNED)
+            self.ui.sandbox_changed()
+            self.ui.run_tests(False)
+            self.wait_for_job()
+        self.assertEqual(seen, [self.PINNED])
+        self.assertIn("Docker", self.ui.status.get(),
+                      "the line under the buttons says where the build just ran")
+        with patch("ai_code_engineer.gui.runner.run", side_effect=record):
+            self.ui.sandbox_on.set(False)
+            self.ui.run_tests(False)
+            self.wait_for_job()
+        self.assertEqual(seen, [self.PINNED, ""],
+                         "unticking the box has to stop the run, not remember the old answer")
+
+    def test_the_container_choice_survives_a_restart(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True):
+            self.ui.sandbox_on.set(True)
+            self.ui.sandbox_image.set(self.PINNED)
+            self.ui.sandbox_changed()
+        self.reopen()
+        self.assertTrue(self.ui.sandbox_on.get())
+        self.assertEqual(self.ui.sandbox_image.get(), self.PINNED)
+
+    # ------------------------------ first run ------------------------------
+    def pump(self, seconds=1.4):
+        """Let the window's own timers fire: the card opens itself on a `root.after`, and a test that
+        called `show_setup` directly would not prove anyone would ever see it."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.02)
+
+    def reopen(self):
         self.ui.cancel_timers()
         self.root.destroy()
-        root = tk.Tk()
-        root.withdraw()
-        reopened = None
-        try:
-            reopened = AgentWindow(root, self.app_dir)
-            root.update_idletasks()
-            self.assertTrue(reopened.read_only.get(), "a promise made at the window is forgotten by it")
-            self.assertEqual(str(reopened.apply_button["state"]), "disabled")
-        finally:
-            if reopened is not None:
-                reopened.cancel_timers()
-            root.destroy()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.ui = AgentWindow(self.root, self.app_dir)
+        self.root.update_idletasks()
+
+    def granted(self, *paths):
+        atomic_json(self.app_dir / ".agent-projects.json",
+                    {"projects": [str(path) for path in paths], "ui": {}})
+
+    def setup_body(self):
+        return self.ui.setup_body.get("1.0", "end").rstrip("\n")
+
+    def record_said(self):
+        """Every sentence the window speaks. The status line is a shared surface — the startup catalog
+        refresh writes over it — so a test that reads it is racing a timer, not a bug."""
+        said = []
+        patcher = patch.object(self.ui, "say", side_effect=lambda text: said.append(text))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return said
+
+    def test_the_checks_open_themselves_on_a_machine_that_has_granted_nothing(self):
+        self.pump()
+        self.assertTrue(self.ui._setup_window is not None and self.ui._setup_window.winfo_exists())
+        self.assertIn("Setup checks", self.ui._setup_window.title())
+
+    def test_a_machine_that_has_a_project_never_sees_the_dialog(self):
+        self.granted(self.repo)
+        self.reopen()
+        self.pump()
+        self.assertIsNone(self.ui._setup_window)
+
+    def test_the_dialog_prints_exactly_what_the_terminal_prints(self):
+        """The whole point of the shared module: one audit, three surfaces. A Tk-only sentence here
+        would be a fourth voice, and the check is `==` rather than a substring for that reason."""
+        self.ui.show_setup()
+        rows = self.ui.setup_rows()
+        self.assertEqual(self.setup_body(), setup.render(rows))
+        self.assertEqual([row["id"] for row in self.ui._setup_rows], list(setup.STEP_IDS))
+
+    def test_opening_the_dialog_asks_nothing_over_the_network(self):
+        with patch("ai_code_engineer.setup.reach", side_effect=AssertionError("the dialog probed")):
+            self.ui.show_setup()
+        self.assertIn(setup.MARK[setup.INFO], self.setup_body())
+
+    def test_the_checks_button_is_the_one_that_probes_and_it_says_the_tally(self):
+        entries = [{"id": "qwen2.5-coder:1.5b", "cloud": False}]
+        self.ui.show_setup()
+        said = self.record_said()
+        with patch("ai_code_engineer.setup.reach", return_value=(entries, "live", "")) as probed:
+            self.ui.run_setup_check()
+            self.wait_for_job()
+        self.assertEqual(probed.call_count, 1)
+        counts = setup.counts(self.ui._setup_rows)
+        self.assertIn(setup.checks_done(counts), said)
+        self.assertIn("qwen2.5-coder:1.5b", self.setup_body())
+
+    def test_the_offline_proof_lands_in_the_dialog_and_says_the_web_windows_sentence(self):
+        self.ui.show_setup()
+        said = self.record_said()
+        result = {"proposal_apply_rollback": "passed", "note": ""}
+        with patch("ai_code_engineer.setup.run_demo", return_value=result):
+            self.ui.run_setup_demo()
+            self.wait_for_job()
+        self.assertIn(setup.proof_done(True), said)
+        self.assertEqual(self.ui._setup_demo, result)
+        self.assertIn(setup.MARK[setup.OK] + " " + setup.demo_row(result, arabic=False)["text"],
+                      self.setup_body())
+
+    def test_a_proof_that_did_not_complete_is_said_as_one_here_too(self):
+        self.ui.show_setup()
+        said = self.record_said()
+        with patch("ai_code_engineer.setup.run_demo",
+                   return_value={"proposal_apply_rollback": "failed", "note": "rollback did not hold"}):
+            self.ui.run_setup_demo()
+            self.wait_for_job()
+        self.assertIn(setup.proof_done(False, "rollback did not hold"), said)
+        self.assertIn(setup.MARK[setup.BAD], self.setup_body())
+
+    def test_dont_show_this_again_outlives_the_window(self):
+        self.ui.show_setup()
+        self.ui.hide_setup()
+        self.reopen()
+        self.pump()
+        self.assertIsNone(self.ui._setup_window)
+        registry = json.loads((self.app_dir / ".agent-projects.json").read_text(encoding="utf-8"))
+        self.assertTrue(registry["ui"]["setup_seen"])
+
+    def test_the_dialog_is_one_window_not_a_stack(self):
+        self.ui.show_setup()
+        first = self.ui._setup_window
+        self.ui.show_setup()
+        self.assertIs(self.ui._setup_window, first, "a second click opened a second wizard")
+
+    def find_button(self, label, widget=None):
+        widget = self.ui.settings_window if widget is None else widget
+        for child in widget.winfo_children():
+            try:
+                if child.cget("text") == label:
+                    return child
+            except tk.TclError:
+                pass
+            found = self.find_button(label, child)
+            if found is not None:
+                return found
+        return None
+
+    def test_the_checks_are_reachable_from_settings_after_a_dismissal(self):
+        """Hiding the card must not hide the checks: the button in Settings is the only way back once
+        the card is gone, and the operator is the one who asked for it to be gone."""
+        self.ui.show_setup()
+        self.ui.hide_setup()
+        self.assertIsNone(self.ui._setup_window)
+        button = self.find_button("Setup checks")
+        self.assertIsNotNone(button, "the Settings page lost its way back to the checks")
+        button.invoke()
+        self.assertTrue(self.ui._setup_window.winfo_exists())
 
 
 if __name__ == "__main__":

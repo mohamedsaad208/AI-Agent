@@ -385,6 +385,23 @@ NOTE_TEMPLATES = {
                        "طُلب الإيقاف. في انتظار انتهاء طلب الموديل الحالي، ولن تُطبَّق أي تغييرات."),
     "syntax_failed": ("Syntax check found a problem. Open the Checks tab for details.",
                       "فحص الصياغة وجد مشكلة. افتح تبويب Checks للتفاصيل."),
+    # Both windows say this after a proposal lands, because both now keep the diff in a viewer of its
+    # own rather than in a pane inside the conversation: the sentence has to name where to look.
+    "review_here": ("Review the files in the proposal viewer, then press Apply to write them.",
+                    "راجع الملفات في نافذة المقترح، ثم اضغط Apply لكتابتها."),
+    # The four answers the sandbox switch gives, in the card where the switch sits. Both windows say
+    # the same sentence because the same question is being asked at the same moment: right before Run.
+    "sandbox_missing": ("Docker is not installed on this machine, so every command runs here.",
+                        "Docker غير مثبّت على هذا الجهاز، لذلك تُشغَّل كل الأوامر هنا."),
+    "sandbox_off": ("The command runs on this machine, inside the project folder.",
+                    "يُشغَّل الأمر على هذا الجهاز داخل مجلد المشروع."),
+    "sandbox_unpinned": ("Name a preloaded image as name@sha256:… — a tag can be retagged while a "
+                         "build is running.",
+                         "اكتب اسم صورة مُحمَّلة مسبقًا بالشكل name@sha256:… لأن الوسم يمكن تغييره "
+                         "أثناء تشغيل البناء."),
+    "sandbox_on": ("The command runs on a copy of the project, with no network and nothing written "
+                   "back to your files.",
+                   "يُشغَّل الأمر على نسخة من المشروع، بلا شبكة وبدون كتابة أي شيء في ملفاتك."),
     "syntax_clean": ("Syntax checks finished. Project tests have not run; verification remains "
                      "incomplete.",
                      "انتهى فحص الصياغة. اختبارات المشروع لم تُشغَّل، فالتحقق ما زال ناقصًا."),
@@ -451,8 +468,10 @@ def status_text(key: str, *, arabic: bool = False, tail: str = "") -> str:
 STEP_MAX_FILES = 6
 # The fields a step record carries. `digest` is the eight leading characters of what was read, and it
 # is in the record and not the sentence because "it read the file" and "it read the file as it stood
-# before the last write" are different claims — that difference is what a row opens to say.
-STEP_FIELDS = ("path", "query", "count", "names", "reason", "detail", "digest")
+# before the last write" are different claims — that difference is what a row opens to say. `label` is
+# the recipe name a build error came from: the rebuild in `display_session` filters the stored record
+# through this tuple, so a field left out of it makes a reopened task say less than the live row did.
+STEP_FIELDS = ("path", "query", "count", "names", "reason", "detail", "digest", "label")
 
 
 def step_has_detail(action: str, fields: dict | None = None) -> bool:
@@ -472,11 +491,45 @@ def step_has_detail(action: str, fields: dict | None = None) -> bool:
         return bool(fields.get("names"))
     if action == "read_file":
         return bool(fields.get("digest"))
+    if action == "model_reasoning":
+        return bool(fields.get("detail"))
     return action in {"search_code", "list_files"}
 
 
+# Why the engine picked a file, said in the thread's own words. The engine sends a code and the symbol
+# it came from; a reason written at the call site would be a sentence in the engine's voice, which is
+# how the two windows ended up disagreeing about a refusal once already.
+CONTEXT_REASON = {
+    "declares": ("declares {}", "يُعرّف {}"),
+    "defines": ("defines {}", "يحوي تعريف {}"),
+    "imports": ("imports {}", "يستقدم {}"),
+    "module": ("its folder is named in the task", "مجلده مذكور في المهمة"),
+    "names": ("the task names this file", "المهمة تسمي هذا الملف"),
+}
+
+
+def graph_caption(arabic: bool, *, nodes: int, edges: int, cyclic: bool = False,
+                  hidden: int = 0) -> str:
+    """One line under the module graph: what is drawn, and what the drawing leaves out.
+
+    Server-written for the same reason the setup tally is: the sheet is one surface and the sentence
+    about what it omits belongs with the code that did the omitting. A cycle is said out loud because a
+    column that is approximate looks exactly like a column that is right.
+    """
+    parts = [say(arabic, en=f"{nodes} modules, {edges} dependencies",
+                 ar=f"{nodes} موديول، {edges} تبعية")]
+    if cyclic:
+        parts.append(say(arabic, en="a cycle was found, so its column is approximate",
+                         ar="لقيت دورة، فالعمود بتاعها تقريبي"))
+    if hidden:
+        parts.append(say(arabic, en=f"{hidden} smaller modules are not drawn",
+                         ar=f"{hidden} موديول أصغر مش رسمانين"))
+    return " · ".join(parts)
+
+
 def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", count: int = 0,
-              names: list | None = None, reason: str = "", detail: str = "", digest: str = "") -> str:
+              names: list | None = None, reason: str = "", detail: str = "", digest: str = "",
+              label: str = "") -> str:
     """One line for one thing the agent just did.
 
     These reach the chat as tool rows, so they are plain text by construction. An action this
@@ -502,6 +555,37 @@ def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", cou
                    ar=f"\u270d\ufe0f اقتراح تعديلات على {count} ملف(ات)")
         named = ", ".join(listed)
         return f"{body}: {named}" if named else body
+    if action == "find_symbol":
+        return say(arabic, en=f"\U0001f9ed Looking up: {query}", ar=f"\U0001f9ed البحث عن الرمز: {query}")
+    if action == "find_references":
+        return say(arabic, en=f"\U0001f9ed Finding uses of: {query}",
+                   ar=f"\U0001f9ed البحث عن استخدامات: {query}")
+    if action == "context_files":
+        # The reason travels as a code and a symbol, never as a finished sentence: which file was chosen
+        # is the engine's decision, and how it is said belongs here with the rest of the thread's words.
+        listed = []
+        for row in (names or []):
+            phrase = CONTEXT_REASON.get(str(row.get("why", "")), "")
+            why = say(arabic, en=phrase[0], ar=phrase[1]).replace("{}", str(row.get("symbol", ""))) \
+                if phrase else ""
+            listed.append(f"{row.get('path', '')}" + (f" ({why})" if why else ""))
+        body = say(arabic, en=f"\U0001f3af Chose {count} file(s) for this task",
+                   ar=f"\U0001f3af اختيرت {count} ملف(ات) لهذه المهمة")
+        return f"{body}: {', '.join(listed)}" if listed else body
+    if action == "model_reasoning":
+        # The preview is one line; the whole thought is what the row opens to. A model that thinks out
+        # loud gets to be read, but not at the cost of the thread it works in.
+        shown = str(detail or "").strip().splitlines()[0][:110] if detail else ""
+        body = say(arabic, en=f"\U0001f9ed Thought for {count} characters",
+                   ar=f"\U0001f9ed فكر {count} حرف")
+        return f"{body}: {shown}…" if shown else body
+    if action == "unresolved_error":
+        # D42: the same failure, from a task this window is not looking at. Said once at the start of a
+        # turn rather than rediscovered by a model that has no memory of the last conversation.
+        body = say(arabic, en=f"\U0001f501 {count} earlier task(s) left this build error open",
+                   ar=f"\U0001f501 {count} مهمة سابقة سابت خطأ البناء ده من غير حل")
+        where = f" ({label})" if label else ""
+        return f"{body}{where}: {detail}" if detail else f"{body}{where}"
     if action == "blocked":
         return say(arabic, en=f"\u26d4 Blocked: {reason}", ar=f"\u26d4 توقفت المهمة: {reason}")
     if action == "applied":
@@ -622,12 +706,24 @@ DETAIL_SECTIONS = {
     "file": ("File", "الملف"),
     "read": ("Read by the agent", "قرأها الوكيل"),
     "search": ("Search", "البحث"),
+    "reasoning": ("What it thought first", "ما فكر فيه الأول"),
 }
 
 
 def detail_section(arabic: bool, key: str) -> str:
     english, arabic_text = DETAIL_SECTIONS[key]
     return say(arabic, en=english, ar=arabic_text)
+
+
+def graph_empty_line(*, arabic: bool) -> str:
+    """The answer to a click on the graph button when there is no graph.
+
+    A sheet that opens empty reads as a project with no structure; the true sentence is that this window
+    has no folder to walk, or none with a source file in it yet.
+    """
+    return say(arabic,
+               en="Nothing to draw yet: this window has no project folder with source files in it.",
+               ar="مفيش حاجة ارسمها لحد دلوقتي: النافذة دي ملهاش فولدر بروجيكت فيه ملفات كود.")
 
 
 def step_missing_line(*, arabic: bool) -> str:

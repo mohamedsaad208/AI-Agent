@@ -44,12 +44,13 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, STEP_FIELDS, TONE, UNV
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
                       say, state_label,
                       status_text, step_has_detail, step_line, step_missing_line,
+                      graph_caption, graph_empty_line,
                       write_notice)
 from ..labels import note as shared_note     # `note` is a local variable in three methods here
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
-from .. import git_integration, host, intent, planbook, repair, runner, setup, symbols
+from .. import git_integration, host, ignore, intent, planbook, repair, runner, setup, symbols
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 
@@ -179,6 +180,37 @@ def asks_for_a_change(text: str) -> bool:
 
 def _clock() -> str:
     return datetime.now().strftime("%H:%M")
+
+
+class LineFeed:
+    """Whole lines out of a token stream.
+
+    A model answers in fragments of a few characters, and redaction reads a line: a key that arrives
+    as ``sk-`` then ``abcdef`` is one the pattern cannot see in either piece. So the fragments are
+    reassembled here and handed on a line at a time — which is also the grain a reader watches, and
+    the reason a build output has always streamed by the line rather than by the character.
+    """
+
+    def __init__(self, emit, cap: int = 500):
+        self.emit = emit
+        self.cap = cap
+        self.held = ""
+
+    def feed(self, piece: str) -> None:
+        self.held += piece
+        while "\n" in self.held:
+            line, self.held = self.held.split("\n", 1)
+            self.emit(line)
+        if len(self.held) > self.cap:
+            # A model that never breaks a line must not make the reader wait for the whole answer, and
+            # must not grow this buffer without bound. Cut at the cap, on a line the redactor has seen.
+            self.emit(self.held)
+            self.held = ""
+
+    def close(self) -> None:
+        if self.held:
+            self.emit(self.held)
+            self.held = ""
 
 
 # How long a question may wait for the browser before the worker gives up on it. The window has to
@@ -375,6 +407,10 @@ class AgentController:
         except (OSError, ValueError, KeyError, TypeError):
             self.projects, self.icons = {}, {}
         self.chained = bool(self._saved_ui.get("plan_chained"))
+        # The container choice belongs to the machine, never to the project: a repository must not get
+        # to name the image the tool builds that repository inside.
+        self.sandbox_on = bool(self._saved_ui.get("sandbox_on"))
+        self.sandbox_image = str(self._saved_ui.get("sandbox_image") or "")
         saved_auto = self._saved_ui.get("auto_apply")
         if isinstance(saved_auto, dict):
             self._auto_pref = {str(row): bool(flag) for row, flag in saved_auto.items()}
@@ -926,6 +962,8 @@ class AgentController:
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self._fix_round},
             # Said where the button is, not only in the docstring of the module that runs it.
             "runWarning": run_warning(arabic=self.arabic),
+            # And said where the command it warns about will actually run.
+            "sandbox": self.sandbox_info(),
             "memory": {"info": self._memory_info()},
             "settings": {"project": self.repo, "plan": self.plan_file, "chained": self.chained,
                          "auto_apply": self.auto_apply, "bound": bool(self.branch.get("bound")),
@@ -966,13 +1004,20 @@ class AgentController:
             "git_restore": self.git_restore,
             "apply_block": lambda: self.offer_block(payload),
             "verify": self.check_changes, "run": lambda: self.run_tests(bool(payload.get("fix"))),
+            # The container switch and its image field: one action, because a tick without the digest
+            # it belongs to is half an answer.
+            "sandbox": lambda: self.set_sandbox(payload),
             # Opening a step row: the id is the handle on the records this session already keeps, and
             # an empty one closes the row. Nothing here reads or writes the project.
             "step_detail": lambda: self.open_step(str(payload.get("id", ""))),
+            # The module graph. No id, no payload: it describes the folder this window is on, and the
+            # answer is the data itself, fetched on the click.
+            "show_graph": self.open_graph,
             "new_chat": self.new_chat, "new_project": self.new_project, "example": self.example,
-            # The first-run card: two buttons that do work, two that only change what is on screen.
+            # The first-run card: the two buttons that do work, and the one that dismisses it for good.
+            # There is deliberately no bare "show it again": the only way back is the Settings entry
+            # that says it will ask the machine, so re-opening and re-checking are the same click.
             "setup_check": self.run_setup_check, "setup_demo": self.run_setup_demo,
-            "setup_show": lambda: self.set_setup_open(True),
             "setup_hide": lambda: self.set_setup_open(False),
             "open": lambda: self.open_item(payload.get("kind", "session"), payload.get("id", "")),
             "pick_project": self.browse,
@@ -1018,7 +1063,7 @@ class AgentController:
         for entry in sorted(root.iterdir(), key=lambda p: p.name.casefold()):
             try:
                 if entry.is_dir():
-                    if not _hidden(entry) and entry.name.casefold() not in SKIP_DIRS:
+                    if not _hidden(entry) and not ignore.picker_dir(entry.name):
                         dirs.append(entry)
                 elif want_files and entry.suffix.lower() in {str(s) for s in want_files}:
                     files.append(entry)
@@ -1599,7 +1644,10 @@ class AgentController:
                                            api_key=self.key.strip() or None, model=self.model,
                                            arabic=self.arabic, demo=self._setup_demo, probe=False)
         counts = setup.counts(self._setup_rows)
+        # The tally travels as a sentence: the card's numbers are the server's verdict in the window's
+        # language, not a string the front end assembles from bare counts.
         return {"show": self._setup_open, "rows": self._setup_rows, "counts": counts,
+                "tally": setup.tally(counts, arabic=self.arabic),
                 "demo": self._setup_demo, "busy": self.busy}
 
     def run_setup_check(self) -> None:
@@ -1618,11 +1666,7 @@ class AgentController:
         def done(rows):
             self._setup_rows = rows
             self._setup_open = True
-            counts = setup.counts(rows)
-            self.say(say(arabic, en="Checks done: {} ok, {} to watch, {} blocking.".format(
-                            counts["ok"], counts["warn"], counts["bad"]),
-                        ar="الفحوص خلصت: {} تمام، {} تحت الملاحظة، {} مانع.".format(
-                            counts["ok"], counts["warn"], counts["bad"])))
+            self.say(setup.checks_done(setup.counts(rows), arabic=arabic))
 
         self.run_job(work, done, "Checking this machine…")
 
@@ -1634,17 +1678,12 @@ class AgentController:
 
         def done(result):
             self._setup_demo = result
-            passed = result.get("proposal_apply_rollback") == "passed"
             if self._setup_rows:
                 self._setup_rows = [setup.demo_row(result, arabic=arabic) if item["id"] == "demo" else item
                                     for item in self._setup_rows]
             self._setup_open = True
-            self.say(say(arabic,
-                         en="The proof held: a proposal was applied, checked and rolled back in a "
-                            "temporary folder." if passed else
-                            "The proof did not complete: " + str(result.get("note", ""))[:120],
-                         ar="الدليل نجح: مقترح اتطبّق واتفحص واتراجع في مجلد مؤقت." if passed else
-                            "الدليل ما كملش: " + str(result.get("note", ""))[:120]))
+            self.say(setup.proof_done(result.get("proposal_apply_rollback") == "passed",
+                                     result.get("note", ""), arabic=arabic))
 
         self.run_job(setup.run_demo, done, "Running the offline proof…")
 
@@ -1887,11 +1926,19 @@ class AgentController:
             provider = make_provider(settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
-            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
-                        progress=lambda line: self._progress(line),
-                        step=self._step,
-                        cancelled=self.cancel_event.is_set, plan_file=plan_file, chat_id=chat_id,
-                        plan_step=step_id, memory=notes)
+            # A model turn has no row of its own, so its writing streams to the one place built for
+            # text that is still arriving: the Activity panel. A JSON envelope is not prose, and the
+            # reader's question during a turn is "is it still working", which is what this answers.
+            feed = LineFeed(self._build_line) if getattr(provider, "supports_stream", False) else None
+            try:
+                return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+                            progress=lambda line: self._progress(line),
+                            step=self._step, on_token=(feed.feed if feed else None),
+                            cancelled=self.cancel_event.is_set, plan_file=plan_file, chat_id=chat_id,
+                            plan_step=step_id, memory=notes)
+            finally:
+                if feed:
+                    feed.close()
 
         def done(path):
             if step_id is not None and self.ledger_path:
@@ -2002,6 +2049,29 @@ class AgentController:
         # A row the server has never heard of means the page is behind the task.
         self.step_detail = missing
 
+    def open_graph(self) -> dict:
+        """The module graph behind the Sources card, walked when the button is pressed.
+
+        It answers the click rather than riding the snapshot: building it walks the tree and parses every
+        source file, and a snapshot goes out on every streamed log line. The reply travels as `result`,
+        so nothing is stored and there is no stale copy to invalidate when the folder changes.
+        """
+        blank = {"nodes": [], "edges": [], "columns": 0, "cyclic": False, "hidden": 0,
+                 "caption": "", "note": graph_empty_line(arabic=self.arabic)}
+        root = Path(self.repo) if self.repo else None
+        if root is None or not root.is_dir():
+            return blank
+        try:
+            _files, rows = Workspace(root).index()
+        except (PolicyError, OSError):
+            return blank
+        data = symbols.graph(rows)
+        if not data["nodes"]:
+            return blank
+        return {**data, "caption": graph_caption(
+            self.arabic, nodes=len(data["nodes"]), edges=len(data["edges"]),
+            cyclic=data["cyclic"], hidden=data["hidden"])}
+
     def _detail_for(self, step: dict) -> dict | None:
         """The inside of one row, from the records this session already keeps."""
         action = str(step.get("action", ""))
@@ -2053,6 +2123,11 @@ class AgentController:
             if not digest:
                 return None
             sections = [[detail_section(self.arabic, "read"), [path, "sha256 " + digest]]]
+        elif action == "model_reasoning":
+            words = str(fields.get("detail") or "")
+            if not words:
+                return None
+            sections = [[detail_section(self.arabic, "reasoning"), words.splitlines()]]
         else:
             return None
         sections = [[title, [row for row in rows if str(row).strip()]]
@@ -2074,7 +2149,23 @@ class AgentController:
         if not text:
             return
         self.pending = text
-        self._emit({"kind": "log_chunk", "ts": _clock(), "text": text})
+        self._stream(text, "log_chunk")
+
+    def _stream(self, text: str, kind: str) -> None:
+        """One piece of untrusted output, already redacted, said on the SSE channel and nowhere else.
+
+        One owner because both consumers are the same promise with a different destination: build
+        output goes to the live row, a model's answer goes to the bubble, and neither may reach the
+        browser unscrubbed or unbounded. A snapshot would be wrong for both — the stored log keeps the
+        run's summary, and a streamed answer is not finished yet.
+        """
+        self._emit({"kind": kind, "ts": _clock(), "text": text})
+
+    def _token(self, text: str) -> None:
+        """One line of a model's answer, arriving while the rest of it is still being generated."""
+        text = redact(text).strip()[:500]
+        if text:
+            self._stream(text, "token")
 
     def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None,
                    note: str = "") -> None:
@@ -2099,7 +2190,16 @@ class AgentController:
             provider = make_provider(settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
-            return respond(chat, provider, task, settings, self.chats, context=self._chat_context(repo))
+            # A stream is offered only to a model that says it can hold one, and the answer it produces
+            # is the same one the buffered call returns: what arrives here is for the reader's sake.
+            feed = LineFeed(self._token) if getattr(provider, "supports_stream", False) else None
+            try:
+                return respond(chat, provider, task, settings, self.chats,
+                               context=self._chat_context(repo),
+                               on_token=(feed.feed if feed else None))
+            finally:
+                if feed:
+                    feed.close()
 
         def done(reply):
             self._add("assistant", "AI Code Engineer", reply)
@@ -2152,8 +2252,9 @@ class AgentController:
         return None
 
     # --------------------------- apply / check / undo ---------------------------
-    def removal_notice(self, session: dict | None = None) -> str:
-        return repair.removal_notice(session if session is not None else self.session)
+    def approval_notice(self, session: dict | None = None) -> str:
+        """The dialog text both windows show, from one owner: the removals and the unexpected files."""
+        return repair.approval_advisories(session if session is not None else self.session)
 
     def offer_block(self, payload: dict) -> None:
         """Turn one code block from an answer into a proposal, exactly like a model would.
@@ -2210,7 +2311,7 @@ class AgentController:
         if self._auto_fix and self.selected_recipe():
             again = shared_note("apply_rerun_warning", arabic=self.arabic,
                                 label=runner.RECIPES[self.selected_recipe()]["label"])
-        notice = self.removal_notice()
+        notice = self.approval_notice()
         prior = self._unverified_prior(self.chat_id, self.repo or "")
         # `must_ask` is the whole refusal rule, and it is the same one the switch's own tooltip
         # describes: an emptying proposal, or a folder a previous task left half-written.
@@ -2531,6 +2632,27 @@ class AgentController:
         return (not self.busy and bool(self.recipes) and bool(self.repo)
                 and Path(self.repo).is_dir() and state not in self.RUN_LOCKED_STATES)
 
+    def sandbox_info(self) -> dict:
+        """The container choice as the card draws it: the two values, whether this machine can honour
+        them, and the one sentence saying what pressing Run will do now.
+
+        The sentence is the same four answers the desktop window gives, out of `labels`, so a user who
+        switches windows is not answering a different question.
+        """
+        image = self.sandbox_image.strip()
+        available = runner.sandbox_available()
+        return {"on": bool(self.sandbox_on and available), "image": image, "available": available,
+                "note": shared_note(runner.sandbox_state(self.sandbox_on, image, available),
+                                    arabic=self.arabic)}
+
+    def set_sandbox(self, payload: dict) -> None:
+        """A tick, a typed digest, or both — the card sends what it holds and the answer comes back."""
+        if "on" in payload:
+            self.sandbox_on = bool(payload.get("on"))
+        if "image" in payload:
+            self.sandbox_image = str(payload.get("image") or "")
+        self._save_state()
+
     def run_tests(self, auto_fix: bool = False) -> None:
         if self.busy:
             return
@@ -2547,7 +2669,10 @@ class AgentController:
         # it -- `repair.record_run` refuses any state outside its own set, and writing into one of
         # those would rewrite a finished task's verdict.
         repo = self.session["root"] if self.session else self.repo.strip()
-        command = runner.display_command(recipe)
+        # Read at the click, not kept on the window: unticking the box has to stop the container run,
+        # and an image typed while it was unticked is not an answer to anything.
+        sandbox = self.sandbox_image.strip() if self.sandbox_on else ""
+        command = runner.display_command(recipe) + (" in Docker" if sandbox else "")
         if self.reading_only():
             # Reading a folder is not running inside it, and this is the only action in the mode that
             # can execute anything: a build runs whatever its own scripts do. So it asks once per
@@ -2577,7 +2702,7 @@ class AgentController:
 
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=self._build_line, target=target)
+                                progress=self._build_line, target=target, sandbox=sandbox)
             return (repair.record_run(path, result) if recordable else None), result
 
         def done(pair):
@@ -2590,7 +2715,7 @@ class AgentController:
                 self._add("tool", "Checks",
                           run_unrecorded_line(arabic=self.arabic, project=Path(repo).name))
 
-        self.run_job(work, done, f"Running {label} in {where}…")
+        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
 
     def report_run(self, result) -> None:
         summary = runner.summarize(result)
@@ -3092,7 +3217,7 @@ class AgentController:
                                       "time": ""})
             if session.get("changes"):
                 self.messages.append({"role": "tool", "author": "Changes",
-                                      "text": self.removal_notice(session) +
+                                      "text": self.approval_notice(session) +
                                       ", ".join(change["path"] for change in session["changes"])})
             self.refresh_recipes()
         self.refresh_plan_status()
@@ -3239,6 +3364,10 @@ class AgentController:
               "endpoints": dict(self.endpoints), "profile": self.profile,
               "request_timeout": self.timeout_seconds(), "plan_chained": bool(self.chained),
               "style": self._saved_ui.get("style", "claude"), "theme": self._saved_ui.get("theme", "light"),
+              # Written by "Don't show this again". The dict below is rebuilt from named keys, so a
+              # preference nobody lists here is erased by the next save of anything else.
+              "setup_seen": bool(self._saved_ui.get("setup_seen")),
+              "sandbox_on": bool(self.sandbox_on), "sandbox_image": self.sandbox_image.strip(),
               "collapsed": bool(self._saved_ui.get("collapsed", False))}
         if self.queue:
             # Stored so a batch survives the restart that would otherwise eat it, and restored held
@@ -3264,11 +3393,13 @@ class AgentController:
             self.key = ""
 
 
-SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "program files", "windows", "system32",
-             "appdata", "downloads", "$recycle.bin", "programdata", "perflogs", "recovery"}
-
-
 def _hidden(path: Path) -> bool:
+    """The picker's own rule, older than the shared one: a dot folder is not where the project is.
+
+    `ignore.picker_dir` decides the rest beside it. This stays separate because it is a *navigation*
+    choice — the file-system gate that protects `.git` and the credentials lives in `ignore`, and a
+    folder being tedious to browse is not the same reason to refuse it.
+    """
     return path.name.startswith(".")
 
 

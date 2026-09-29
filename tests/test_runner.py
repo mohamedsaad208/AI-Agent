@@ -682,5 +682,150 @@ class ProcessDisciplineTests(unittest.TestCase):
             self.assertIsNone(runner.report_counts([report]))
 
 
+class TheSandboxedRun(unittest.TestCase):
+    """#44: the project's own command inside the container the tool already knew how to start.
+
+    There is no Docker daemon on this machine and no test here pretends there is one — the argv is
+    recorded against a fake `Popen`, the standard `tests/test_verification.py` has always used. What a
+    real container would prove (that a build behind those flags cannot reach the network or the user's
+    tree) stays unverified here, and `docs/DOCKER-SANDBOX-PLAN.md` says so rather than implying it ran.
+    """
+
+    IMAGE = "python@sha256:" + "a" * 64
+    DOCKER = "/usr/local/bin/docker"
+    SUITE = '<testsuite tests="8" failures="1" errors="0" skipped="0"/>'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "project"
+        (self.root / "src").mkdir(parents=True)
+        (self.root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("secret-ish\n", encoding="utf-8")
+
+    def pretend(self, recipe="python-unittest", output="Ran 3 tests\nOK\n", exit_code=0,
+                reports=(), sandbox=None, which=DOCKER, target=""):
+        """One run with the binary replaced by a recording.
+
+        `reports` are written by the fake *inside the mount*, so a test that finds proof has proven the
+        evidence crossed the boundary — which is the whole reason the copy is a directory and not a
+        tmpfs.
+        """
+        seen = {}
+
+        class Process:
+            def __init__(self, argv):
+                self.returncode = exit_code
+                self.stdout = io.BytesIO(output.encode("utf-8"))
+                self.argv = argv
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def spawn(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["kwargs"] = kwargs
+            seen["copied"] = []
+            if any(part.startswith("type=bind") for part in argv):
+                source = self.mount(argv)
+                seen["source"] = source
+                seen["copied"] = sorted(path.relative_to(source).as_posix()
+                                        for path in source.rglob("*") if path.is_file())
+                for name in reports:
+                    out = source / name
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_text(self.SUITE, encoding="utf-8")
+            return Process(argv)
+
+        with patch("ai_code_engineer.runner.shutil.which", return_value=which), \
+                patch("ai_code_engineer.runner.subprocess.Popen", side_effect=spawn) as popen, \
+                patch("ai_code_engineer.runner.subprocess.run") as cleanup:
+            result = runner.run(self.root, recipe, timeout=30, target=target,
+                                sandbox=self.IMAGE if sandbox is None else sandbox)
+        seen["popen"] = popen
+        seen["cleanup"] = cleanup
+        return result, seen
+
+    @staticmethod
+    def mount(argv):
+        return Path([part for part in argv if part.startswith("type=bind")][0]
+                    .split("source=")[1].split(",")[0])
+
+    def test_the_folder_that_was_opened_is_never_mounted(self):
+        _result, seen = self.pretend()
+        argv = " ".join(seen["argv"])
+        self.assertNotIn(self.root.as_posix(), argv, "the copy is the boundary; the tree is not in it")
+        self.assertNotEqual(Path(self.mount(seen["argv"])), self.root)
+        self.assertIn("src/app.py", seen["copied"])
+
+    def test_a_version_control_folder_is_not_copied_into_the_sandbox(self):
+        _result, seen = self.pretend()
+        self.assertFalse([name for name in seen["copied"] if name.startswith(".git")], seen["copied"])
+
+    def test_a_machine_without_docker_refuses_and_spawns_nothing_on_the_host(self):
+        result, seen = self.pretend(which=None)
+        seen["popen"].assert_not_called()
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("did not run on the host either", result["reason"],
+                      "the refusal has to say it did not fall back")
+
+    def test_an_image_without_a_digest_is_refused_before_anything_is_copied(self):
+        with self.assertRaises(PolicyError) as refused:
+            self.pretend(sandbox="python:3.11")
+        self.assertIn("digest", str(refused.exception))
+
+    def test_the_recipe_runs_with_the_images_own_interpreter(self):
+        _result, seen = self.pretend()
+        argv = seen["argv"]
+        inner = argv[argv.index(self.IMAGE) + 1:]
+        self.assertEqual(inner[0], "python3")
+        self.assertNotIn(sys.executable, argv, "no image has this machine's python path")
+
+    def test_the_seal_is_the_one_verification_already_pinned(self):
+        _result, seen = self.pretend()
+        argv = seen["argv"]
+        for flag in ("--rm", "--pull=never", "--network=none", "--read-only", "--cap-drop=ALL",
+                     "--security-opt=no-new-privileges", "--user=65534:65534", "--pids-limit=128"):
+            self.assertIn(flag, argv)
+        self.assertNotIn("/bin/sh", argv, "the recipe is argv, not a string a shell parses")
+
+    def test_a_report_written_inside_the_container_is_still_the_proof(self):
+        result, _seen = self.pretend("maven-test", output="",
+                                     reports=("target/surefire-reports/TEST-com.example.AuthTest.xml",))
+        self.assertEqual(result["proof"]["tests"], 8)
+        self.assertEqual(result["proof"]["failures"], 1)
+        self.assertEqual(result["status"], "failed", "8 tests, 1 failing, whatever the exit code said")
+
+    def test_a_module_target_runs_at_its_own_workdir_inside_the_copy(self):
+        """A Maven module needs its parent pom: copying only the module would answer a reactor build
+        with a resolution error the host run never produces."""
+        (self.root / "backend").mkdir()
+        (self.root / "backend" / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+        (self.root / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+        result, seen = self.pretend("maven-test", target="backend")
+        argv = seen["argv"]
+        self.assertEqual(argv[argv.index("--workdir") + 1], "/work/backend")
+        self.assertIn("pom.xml", seen["copied"], "the parent came too")
+        self.assertIn("backend/pom.xml", seen["copied"])
+        self.assertEqual(result["target"], "backend")
+
+    def test_the_record_says_where_the_green_came_from(self):
+        result, _seen = self.pretend()
+        self.assertEqual(result["sandbox"]["image"], self.IMAGE)
+        self.assertTrue(result["sandbox"]["container"].startswith("ai-agent-"))
+
+    def test_a_host_run_records_no_sandbox_at_all(self):
+        result, _seen = self.pretend(sandbox="", which=sys.executable)
+        self.assertIsNone(result["sandbox"])
+        self.assertNotIn("docker", " ".join(result["command"]))
+
+    def test_a_container_that_was_killed_is_removed(self):
+        _result, seen = self.pretend()
+        call = seen["cleanup"].call_args
+        self.assertEqual(call[0][0][:3], [self.DOCKER, "rm", "-f"])
+        self.assertEqual(call[0][0][3], seen["argv"][seen["argv"].index("--name") + 1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -18,10 +19,30 @@ from . import runner
 from .workspace import Workspace, digest
 
 RECIPES = {
+    # The container has no network, so a build that would have downloaded a dependency on the host has
+    # to be told not to try. These are `runner.RECIPES` with that one flag added, and nothing else: a
+    # second table of hand-copied commands is how the two drifted apart on exactly that flag.
     "python-unittest": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"],
     "maven-test": ["mvn", "-o", "-B", "test"],
     "gradle-test": ["gradle", "--offline", "--no-daemon", "test"],
 }
+
+# Which flag each recipe needs to be honest about a machine with no network, keyed on the program so a
+# recipe added to `runner.RECIPES` is not silently missing an offline mode here.
+OFFLINE = {"mvn": "-o", "gradle": "--offline"}
+
+
+def container_command(recipe: str) -> list[str]:
+    """The runner's own argv for a recipe, with the offline flag a `--network=none` build needs.
+
+    `sys.executable` becomes the image's interpreter: this machine's absolute path to a python under a
+    user profile means nothing inside a container, and a recipe that names it would fail to start.
+    """
+    command = [runner.IMAGE_PYTHON if part == sys.executable else str(part)
+               for part in runner.RECIPES[recipe]["command"]]
+    if command[0] in OFFLINE:
+        command.insert(1, OFFLINE[command[0]])
+    return command
 
 
 def static_check(session: dict) -> list[dict]:
@@ -99,21 +120,21 @@ def snapshot(ws: Workspace, target: Path) -> dict:
 
 
 def docker_check(source: Path, recipe: str, image: str, timeout: int = 180) -> dict:
+    """The session's own verification run: the snapshot copied to a temp folder, built inside a container.
+
+    `source` is that copy, never the user's tree, and it is mounted as the only writable filesystem the
+    build sees — which is also why the copy is a directory and not a tmpfs: the test reports have to be
+    readable afterwards, and a green with no proof is the answer this tool refuses to give elsewhere.
+    """
     docker = shutil.which("docker")
     if not docker:
         return {"status": "blocked", "reason": "Docker is not installed. Host execution is disabled."}
-    if recipe not in RECIPES or not re.fullmatch(r"[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}", image):
+    if recipe not in RECIPES:
         raise PolicyError("Choose a built-in recipe and a preloaded image pinned by sha256 digest.")
     name = "ai-agent-" + uuid.uuid4().hex
-    # Only constant shell text; no model or user command interpolation.
-    args = [docker, "run", "--name", name, "--rm", "--pull=never", "--network=none",
-            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-            "--user=65534:65534", "--pids-limit=128", "--memory=1g", "--cpus=1",
-            "--mount", f"type=bind,source={source},target=/input,readonly",
-            "--tmpfs", "/tmp:rw,nosuid,size=128m",
-            "--tmpfs", "/work:rw,exec,nosuid,size=512m,mode=1777",
-            "--workdir=/work", "--env", "HOME=/tmp", "--entrypoint=/bin/sh", image,
-            "-c", 'cp -R /input/. /work/ && exec "$@"', "agent", *RECIPES[recipe]]
+    # The flags live in one place now, with the runner's; this call used to carry its own copy of them
+    # and had already drifted from it on the one flag that matters without a network.
+    args = runner.sandbox_argv(docker, Path(source), image, name, container_command(recipe))
     output = bytearray()
     exceeded = threading.Event()
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0

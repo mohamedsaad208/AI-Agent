@@ -6,6 +6,7 @@ whitelist, the loopback rule that refused a URL path - is now one row of a table
 are what keeps the rows honest.
 """
 from dataclasses import replace
+import inspect
 import json
 import os
 from pathlib import Path
@@ -15,12 +16,14 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import catalog, config
+from ai_code_engineer import catalog, config, providers
 from ai_code_engineer.config import KINDS, Settings, check_endpoint, kind_for, needs_consent, settings_for, validate
 from ai_code_engineer.errors import AgentError, PolicyError, ProviderError
 from ai_code_engineer.labels import catalog_status_line, friendly_error
-from ai_code_engineer.providers import OpenAICompatibleProvider, OllamaProvider, make_provider
+from ai_code_engineer.providers import (OpenAICompatibleProvider, OllamaProvider, make_provider,
+                                        REASONING_CHARS, read_reasoning)
 
 ANSWER = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
 
@@ -177,6 +180,86 @@ class TheOpenAIShapedProvider(unittest.TestCase):
             provider.generate([{"role": "user", "content": "x"}])
             self.assertEqual(request.call_args.args[0], "http://127.0.0.1:11434/api/chat")
             self.assertEqual(request.call_args.args[1]["format"], "json")
+
+
+class TheReasoningField(unittest.TestCase):
+    """A thinking model answers twice, and only one of the two answers is the action.
+
+    Measured on the local endpoint (2026-09-29): with `think` set, Ollama returns the deliberation in
+    `message.thinking` and leaves `message.content` as clean JSON; with it unset the words are simply
+    gone and the same answer costs 1,200 characters of prose instead. The field is what this transport
+    really separates, so it is read here, at the boundary, and nowhere near the envelope.
+    """
+
+    def answer(self, message):
+        return {"message": dict(message)}
+
+    def test_each_name_a_provider_uses_for_the_field_is_read(self):
+        for name in providers.REASONING_KEYS:
+            self.assertEqual(read_reasoning({name: "  weigh the options  "}), "weigh the options")
+
+    def test_a_model_that_kept_its_reasoning_to_itself_reads_as_nothing(self):
+        for message in ({}, {"content": "{}"}, {"reasoning": ""}, {"reasoning": "   "},
+                        {"reasoning": 7}, {"reasoning": ["list"]}, {"thinking": None},
+                        None, "not a message", 5):
+            self.assertEqual(read_reasoning(message), "")
+
+    def test_the_field_is_capped_at_a_stated_size(self):
+        thought = read_reasoning({"reasoning": "x" * (REASONING_CHARS + 500)})
+        self.assertEqual(len(thought), REASONING_CHARS)
+
+    def test_a_credential_quoted_in_a_chain_of_thought_is_still_quoted_by_nobody(self):
+        secret = "sk-or-vl-abcdefghijklmnopqrstuvwxyz123456"
+        self.assertNotIn(secret, read_reasoning({"reasoning": "call it with " + secret}))
+        self.assertNotIn("hunter2hunter2", read_reasoning({"thinking": "password = hunter2hunter2"}))
+
+    def test_ollama_keeps_the_thinking_field_out_of_the_reply(self):
+        provider = OllamaProvider(Settings())
+        with patch("ai_code_engineer.providers.request_json",
+                   side_effect=[self.answer({"content": '{"action":"list_files"}',
+                                             "thinking": "First, look at what exists."}),
+                                self.answer({"content": '{"action":"list_files"}'})]) as request:
+            self.assertEqual(provider.generate([]), '{"action":"list_files"}')
+            self.assertEqual(provider.reasoning, "First, look at what exists.")
+            self.assertEqual(provider.generate([]), '{"action":"list_files"}')
+            self.assertEqual(provider.reasoning, "",
+                             "a stale thought would be announced as a row for a turn that had none")
+        self.assertNotIn("thinking", json.dumps(request.call_args.args[1]))
+
+    def test_a_prose_turn_asks_a_thinking_model_for_its_deliberation_as_a_field(self):
+        """The defect this pins: `think: false` on a chat turn does not stop a thinking model from
+        thinking, it only moves the working-out into `content` — measured with its closing marker
+        sitting in the sentence the user was given. The envelope path keeps asking for no thinking."""
+        provider = OllamaProvider(Settings())
+        provider.supports_thinking = True
+        answer = self.answer({"content": "A mutex lets one thread in at a time."})
+        with patch("ai_code_engineer.providers.request_json", return_value=answer) as request:
+            provider.generate([], json_mode=False)
+            self.assertTrue(request.call_args.args[1]["think"],
+                            "a prose answer must arrive without the deliberation in front of it")
+            provider.generate([])
+            self.assertFalse(request.call_args.args[1]["think"],
+                             "a model that thinks inside a JSON envelope answers nothing")
+
+    def test_the_openai_shaped_names_are_read_from_the_choice(self):
+        for name in providers.REASONING_KEYS:
+            provider = OpenAICompatibleProvider(replace(Settings(), provider="groq",
+                                                        endpoint="https://api.groq.com/openai/v1",
+                                                        model="m"), api_key="k")
+            with patch("ai_code_engineer.providers.request_json",
+                       return_value={"choices": [{"finish_reason": "stop",
+                                                  "message": {"content": "{}",
+                                                              name: "thought " + name}}]}):
+                self.assertEqual(provider.generate([]), "{}")
+                self.assertEqual(provider.reasoning, "thought " + name)
+
+    def test_a_reasoning_field_alongside_a_truncated_answer_still_raises(self):
+        provider = OllamaProvider(Settings())
+        with patch("ai_code_engineer.providers.request_json",
+                   return_value={"done_reason": "length",
+                                 "message": {"content": "partial", "thinking": "long thought"}}):
+            with self.assertRaises(ProviderError):
+                provider.generate([])
 
 
 class ConsentAtTheFactory(unittest.TestCase):
@@ -463,5 +546,205 @@ class TheConnectionRowInAWindow(unittest.TestCase):
             self.controller.join()
         stored = json.dumps(self.controller.snapshot()["log"])
         self.assertNotIn(secret, stored)
-        self.assertIn("[redacted]", stored)
         self.assertIn("HTTP 401", stored, "the reason is what the user has to act on")
+        self.assertIn("[redacted]", stored)
+
+class AStreamedAnswer(unittest.TestCase):
+    """Phase 3: the same reply, arriving piece by piece, has to end up exactly the same.
+
+    A stream is a new transmission boundary, so these test the four things that can only go wrong
+    there: pieces landing out of order or missing, the reasoning field splitting across frames, a body
+    that never stops, and a failure that would otherwise carry the request with it. The doubles are
+    line-iterable responses, because that is the only part of an HTTP response a reader sees.
+    """
+
+    def setUp(self):
+        self.opened = []
+
+    def serve(self, lines):
+        class Body:
+            def __init__(self, lines):
+                self.lines = list(lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                return iter(self.lines)
+
+        class Opener:
+            def __init__(self, lines, opened):
+                self.lines, self.opened = lines, opened
+
+            def open(self, request, timeout=None):
+                self.opened.append(request)
+                return Body(self.lines)
+
+        patcher = patch("ai_code_engineer.providers._opener",
+                        return_value=Opener(lines, self.opened))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def ollama(self, *frames):
+        return [json.dumps(frame).encode() + b"\n" for frame in frames]
+
+    def content(self, piece):
+        return {"message": {"content": piece}}
+
+    def data(self, payload):
+        return b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+    def groq(self):
+        return OpenAICompatibleProvider(replace(Settings(), provider="groq",
+                                                endpoint="https://api.groq.com/openai/v1",
+                                                model="m"), api_key="k")
+
+    def test_the_pieces_arrive_in_order_and_the_whole_is_what_is_returned(self):
+        asked = []
+        self.serve(self.ollama(self.content("The "), self.content("register "),
+                               {"message": {"content": "flow"}},
+                               {"done": True, "done_reason": "stop"}))
+        value = OllamaProvider(Settings()).generate(
+            [{"role": "user", "content": "x"}], on_token=asked.append)
+        self.assertEqual(value, "The register flow")
+        self.assertEqual(asked, ["The ", "register ", "flow"], "nothing was dropped or reordered")
+        self.assertTrue(json.loads(self.opened[0].data)["stream"])
+
+    def test_a_thinking_field_split_across_frames_is_still_one_thought(self):
+        self.serve(self.ollama({"message": {"thinking": "weighing "}},
+                               {"message": {"thinking": "the options"}},
+                               self.content("{}"), {"done": True, "done_reason": "stop"}))
+        provider = OllamaProvider(Settings())
+        self.assertEqual(provider.generate([], on_token=lambda piece: None), "{}")
+        self.assertEqual(provider.reasoning, "weighing the options")
+
+    def test_a_stream_that_never_stops_is_refused_at_the_same_size_as_a_body(self):
+        self.serve(self.ollama(*([self.content("x" * 1000)] * 20)))
+        with self.assertRaises(ProviderError) as caught:
+            providers.read_stream("http://127.0.0.1:11434/api/chat", {}, max_bytes=8000,
+                                  on_token=lambda piece: None)
+        self.assertIn("exceeds size limit", str(caught.exception))
+
+    def test_a_truncated_stream_fails_the_way_the_buffered_one_does(self):
+        self.serve(self.ollama(self.content("partial"),
+                               {"message": {"content": ""}, "done": True, "done_reason": "length"}))
+        with self.assertRaises(ProviderError) as caught:
+            OllamaProvider(Settings()).generate([], on_token=lambda piece: None)
+        self.assertIn("truncated", str(caught.exception))
+
+    def test_an_empty_stream_says_there_was_no_content(self):
+        self.serve(self.ollama({"done": True, "done_reason": "stop"}))
+        with self.assertRaises(ProviderError) as caught:
+            OllamaProvider(Settings()).generate([], on_token=lambda piece: None)
+        self.assertIn("No model content returned", str(caught.exception))
+
+    def test_a_frame_that_carries_no_text_says_nothing_to_the_reader(self):
+        said = []
+        self.serve(self.ollama(self.content("hi"), {"done": True}) + [b"\n", b"not json\n"],)
+        self.assertEqual(OllamaProvider(Settings()).generate([], on_token=said.append), "hi")
+        self.assertEqual(said, ["hi"], "a keep-alive or a broken frame is not a token")
+
+    def test_event_stream_frames_are_read_and_the_sentinel_ends_the_read(self):
+        asked = []
+        self.serve([self.data({"choices": [{"delta": {"content": "Hel"}}]}),
+                    b": keep-alive\n\n",
+                    self.data({"choices": [{"delta": {"content": "lo"},
+                                            "finish_reason": "stop"}]}),
+                    b"data: [DONE]\n\n",
+                    self.data({"choices": [{"delta": {"content": "never read"}}]})])
+        self.assertEqual(self.groq().generate([], json_mode=False, on_token=asked.append), "Hello")
+        self.assertEqual(asked, ["Hel", "lo"])
+        self.assertTrue(json.loads(self.opened[0].data)["stream"])
+
+    def test_a_reasoning_delta_is_kept_out_of_the_answer_and_the_envelope(self):
+        self.serve([self.data({"choices": [{"delta": {"reasoning_content": "think "}}]}),
+                    self.data({"choices": [{"delta": {"reasoning_content": "hard"}}]}),
+                    self.data({"choices": [{"delta": {"content": "{}"},
+                                            "finish_reason": "stop"}]}),
+                    b"data: [DONE]\n\n"])
+        provider = OpenAICompatibleProvider(replace(Settings(), provider="deepseek",
+                                                    endpoint="https://api.deepseek.com/v1",
+                                                    model="m"), api_key="k")
+        self.assertEqual(provider.generate([], on_token=lambda piece: None), "{}")
+        self.assertEqual(provider.reasoning, "think hard")
+
+    def test_a_stream_that_ends_without_saying_it_finished_is_discarded(self):
+        self.serve([self.data({"choices": [{"delta": {"content": "{"},
+                                            "finish_reason": "length"}]}), b"data: [DONE]\n\n"])
+        with self.assertRaises(ProviderError) as caught:
+            self.groq().generate([], on_token=lambda piece: None)
+        self.assertIn("did not finish normally", str(caught.exception))
+
+    def test_the_upstream_that_answered_is_reported_from_the_stream(self):
+        self.serve([self.data({"model": "upstream/actual",
+                               "choices": [{"delta": {"content": "{}"},
+                                            "finish_reason": "stop"}]}), b"data: [DONE]\n\n"])
+        provider = OpenAICompatibleProvider(replace(Settings(), provider="openrouter",
+                                                    endpoint="https://openrouter.ai/api/v1",
+                                                    model="openrouter/free"), api_key="k")
+        provider.generate([], on_token=lambda piece: None)
+        self.assertEqual(provider.model, "upstream/actual")
+
+    def test_a_failure_on_a_stream_carries_the_code_and_loses_the_key(self):
+        import io
+        from urllib.error import HTTPError
+
+        secret = "sk-or-vl-abcdefghijklmnopqrstuvwxyz123456"
+
+        class Opener:
+            def open(self, request, timeout=None):
+                raise HTTPError("http://127.0.0.1:11434/api/chat", 500, "boom", {},
+                                io.BytesIO(b"password = hunter2hunter2 " + secret.encode()))
+
+        patcher = patch("ai_code_engineer.providers._opener", return_value=Opener())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with self.assertRaises(ProviderError) as caught:
+            providers.read_stream("http://127.0.0.1:11434/api/chat", {}, on_token=lambda piece: None)
+        text = str(caught.exception)
+        self.assertIn("HTTP 500", text)
+        self.assertNotIn("hunter2hunter2", text)
+        self.assertNotIn(secret, text)
+        self.assertNotIn("127.0.0.1", text, "the URL is not part of the answer")
+
+    def test_a_connection_that_dies_mid_stream_says_so(self):
+        from urllib.error import URLError
+
+        class Opener:
+            def open(self, request, timeout=None):
+                raise URLError("connection reset")
+
+        patcher = patch("ai_code_engineer.providers._opener", return_value=Opener())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with self.assertRaises(ProviderError) as caught:
+            providers.read_stream("http://127.0.0.1:11434/api/chat", {}, on_token=lambda piece: None)
+        self.assertIn("connection failed or timed out", str(caught.exception))
+
+    def test_no_listener_gets_the_old_single_reply(self):
+        """`on_token` is opt-in: a turn that only needs the parsed envelope must not pay for a reader."""
+        with patch("ai_code_engineer.providers.request_json",
+                   return_value={"message": {"content": "{}"}}) as request:
+            self.assertEqual(OllamaProvider(Settings()).generate([]), "{}")
+        self.assertFalse(request.call_args.args[1]["stream"])
+
+    def test_a_model_that_cannot_stream_is_asked_before_anything_is_listened_for(self):
+        """The scripted models the suite runs on keep the two-argument `generate` they have always had.
+
+        `supports_stream` is the gate a window asks before it passes `on_token`, which is what lets the
+        transport grow a third argument without changing shape under the ~10 doubles in the tests.
+        """
+        from doubles import ChatModel, ProposalModel
+        for cls in (ChatModel, ProposalModel):
+            self.assertFalse(hasattr(cls, "supports_stream"), cls.__name__)
+            self.assertEqual(len(inspect.signature(cls.generate).parameters), 3, cls.__name__)
+        self.assertTrue(OllamaProvider(Settings()).supports_stream)
+        self.assertTrue(self.groq().supports_stream)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

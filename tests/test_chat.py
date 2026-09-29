@@ -31,6 +31,63 @@ class Recorder:
         return self.reply
 
 
+class AStreamingRecorder(Recorder):
+    """A provider that answers in pieces when somebody is listening, and says it can."""
+
+    supports_stream = True
+
+    def __init__(self, reply="Two numbers, added.", pieces=("Two ", "numbers, ", "added.")):
+        super().__init__(reply)
+        self.pieces = list(pieces)
+
+    def generate(self, messages, json_mode=True, on_token=None):
+        self.calls.append((messages, json_mode))
+        for piece in (self.pieces if on_token is not None else ()):
+            on_token(piece)
+        return self.reply
+
+
+class AnAnswerThatArrivesPieceByPiece(unittest.TestCase):
+    """Phase 3: streaming is a display consumer, never the record.
+
+    The reply that is stored has to be the one the provider returned, so a browser that missed a
+    frame — or a client that joined them out of order — cannot change what the chat says was said.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Path(self.temp.name)
+
+    def answer(self, provider, on_token=None):
+        chat = create_chat("test-local")
+        reply = respond(chat, provider, "what does add do?", Settings(), self.store,
+                        on_token=on_token)
+        return chat, reply
+
+    def test_the_pieces_are_handed_on_and_the_whole_is_what_is_stored(self):
+        heard = []
+        provider = AStreamingRecorder()
+        chat, reply = self.answer(provider, on_token=heard.append)
+        self.assertEqual(heard, ["Two ", "numbers, ", "added."])
+        self.assertEqual(reply, "Two numbers, added.")
+        self.assertEqual(chat["turns"][-1]["content"], "Two numbers, added.",
+                         "the transcript is the assembled reply, not whatever arrived on screen")
+
+    def test_a_model_that_cannot_stream_is_never_asked_to(self):
+        """The doubles the suite runs on keep a two-argument `generate`; passing a callback to one
+        would be a TypeError inside the answer path, which is the shape of bug this gate exists for."""
+        plain = Recorder()
+        chat, reply = self.answer(plain, on_token=lambda piece: None)
+        self.assertEqual(reply, "Two numbers, added.")
+        self.assertEqual(chat["turns"][-1]["role"], "assistant")
+        self.assertEqual(len(plain.calls[0]), 2, "the call stayed exactly as it was")
+
+    def test_a_reply_that_never_arrived_is_still_no_answer(self):
+        with self.assertRaises(Exception):
+            self.answer(AStreamingRecorder(reply="   "), on_token=lambda piece: None)
+
+
 class ChatModeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

@@ -2,6 +2,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -9,10 +10,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ai_code_engineer import engine, repair
 from ai_code_engineer.cli import demo
-from ai_code_engineer.config import Settings, load_settings
+from ai_code_engineer.config import MIN_CONTEXT_CHARS, Settings, load_settings
 from ai_code_engineer.engine import (apply_proposal, atomic_json, chat_sessions, DEFAULT_CHECKS, diff_size,
-                                     MAX_TASK_CHARS, NO_SUMMARY, load_session,
+                                     MAX_TASK_CHARS, NO_SUMMARY, SYSTEM, load_session,
                                      parse_action, plan, prepare_changes, project_key,
                                      propose_block, proposal_hash, review, rollback, shrink_warning)
 from ai_code_engineer.errors import AgentError, PolicyError, ProviderError
@@ -599,7 +601,7 @@ class AgentTests(unittest.TestCase):
 
     UNKNOWN = {"action": "shell", "command": "whoami"}
     ECHO = ("Unknown action or invalid fields. Allowed: list_files, read_file, search_code, "
-            "propose, blocked.")
+            "find_symbol, find_references, propose, blocked.")
 
     def blocked(self, reason):
         return {"action": "blocked", "reason": reason}
@@ -1123,6 +1125,45 @@ class ChunkProposalTests(unittest.TestCase):
         self.assertEqual(self.accepts([{"path": "db.changelog-master.xml", "content": changelog}]),
                          ["db.changelog-master.xml"])
 
+    def test_a_namespaced_pom_is_checked_like_every_pom_that_exists(self):
+        """D43's real defect, and not the one the spec named: `xmlns` makes ElementTree report the tag
+        as `{http://…}dependency`, so the raw comparison returned at the root and the gate was a no-op
+        on every Maven file in the wild — including the one this project dogfoods on."""
+        import xml.etree.ElementTree as ElementTree
+        namespace = ' xmlns="http://maven.apache.org/POM/4.0.0"'
+        bad = self.BAD_POM.replace("<project>", "<project" + namespace + ">", 1)
+        ElementTree.fromstring(bad)                            # well-formed, as always
+        message = self.refused([{"path": "pom.xml", "content": bad}])
+        self.assertIn("Unrecognised tag", message)
+        good = self.GOOD_POM.replace("<project>", "<project" + namespace + ">", 1)
+        self.assertEqual(self.accepts([{"path": "pom.xml", "content": good}]), ["pom.xml"])
+
+    def resources_case(self, opening: str, closing: str) -> str:
+        """A pom with `<resources>` in position `opening`/`closing` — empty for the top level."""
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<project'
+                ' xmlns="http://maven.apache.org/POM/4.0.0">\n<modelVersion>4.0.0</modelVersion>'
+                + opening + "<resources><directory>src/main/resources/custom</directory></resources>"
+                + closing + "</project>\n")
+
+    def test_resources_at_the_top_of_the_pom_is_refused_for_what_it_actually_does(self):
+        """Maven does not reject a misplaced `<resources>`; it ignores it. The build passes and the
+        changelog is not on the classpath, so the failure arrives turns later as a missing file — which
+        is a worse bug to read than a refusal that says where the element belongs."""
+        message = self.refused([{"path": "pom.xml", "content": self.resources_case("", "")}])
+        self.assertIn("<build>", message)
+
+    def test_resources_under_build_and_under_a_profile_build_are_accepted(self):
+        for opening, closing in (("<build>", "</build>"),
+                                 ("<profiles><profile><build>", "</build></profile></profiles>")):
+            self.assertEqual(self.accepts([{"path": "pom.xml",
+                                            "content": self.resources_case(opening, closing)}]),
+                             ["pom.xml"], opening)
+
+    def test_resources_inside_a_plugins_configuration_are_accepted(self):
+        content = self.resources_case("<build><plugins><plugin><configuration>",
+                                      "</configuration></plugin></plugins></build>")
+        self.assertEqual(self.accepts([{"path": "pom.xml", "content": content}]), ["pom.xml"])
+
     # ------------------------------ the delete entry (D31) ------------------------------
     def test_a_delete_prepares_with_the_bytes_it_takes(self):
         prepared = prepare_changes(self.ws, [{"path": "app.py", "delete": True}],
@@ -1348,6 +1389,526 @@ class BlockProposalTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             propose_block(self.ws, "keep it", "src/main.py", "def add(a, b):\n    return 1\n",
                           self.runs, chat_id="../elsewhere")
+
+
+class TheSymbolVerbs(unittest.TestCase):
+    """`find_symbol` and `find_references` — the questions the index could already answer.
+
+    Measured in the ecommerce run: a 3 B model shown a type name it had to edit spent its turns
+    `read_file`-ing paths it invented from that name, because the only lookup offered was a substring
+    search over text. These two verbs are the difference between guessing a filename and being told it,
+    and the tests are written as a conversation: a scripted model asks, and the next prompt is what it
+    was told.
+    """
+
+    MAIN = "def add(a, b):\n    return a + b\n"
+    CALLER = "from main import add\n\n\ndef run():\n    return add(1, 2)\n"
+    CONFIG = "eureka:\n  client:\n    register-with-eureka: false\n    register: true\n"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        root = self.base / "repo"
+        (root / "src").mkdir(parents=True)
+        for name, text in {"main.py": self.MAIN, "caller.py": self.CALLER,
+                           "application.yml": self.CONFIG}.items():
+            (root / "src" / name).write_text(text, encoding="utf-8", newline="\n")
+        self.ws = Workspace(root)
+
+    def proposal(self, content="def add(a, b):\n    return a - b\n"):
+        return {"action": "propose", "summary": "Fix add", "checks": ["unit tests"],
+                "changes": [{"path": "src/main.py", "content": content}]}
+
+    def ask(self, *actions):
+        """One scripted conversation: the lookups under test, then a real read, then a proposal.
+
+        The read is not padding. A proposal that replaces a file the model never opened is refused, so
+        without it the loop asks again and the test measures a rejection rather than the answer it is
+        looking at.
+        """
+        provider = RecordingProvider(list(actions)
+                                     + [{"action": "read_file", "path": "src/main.py"},
+                                        self.proposal()])
+        path = plan(self.ws, "fix add", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        return load_session(path), " ".join(message["content"] for message in provider.prompts[-1])
+
+    def test_a_name_answers_with_the_file_that_declares_it(self):
+        session, told = self.ask({"action": "find_symbol", "query": "add"})
+        self.assertIn('"declarations"', told)
+        self.assertIn("src/main.py", told)
+        self.assertIn("add(a, b)", told, "the signature is what tells a model this is the one it wants")
+        rows = [item for item in session["events"] if item["kind"] == "tool"]
+        self.assertEqual([(row["name"], row["count"]) for row in rows if row["name"] == "find_symbol"],
+                         [("find_symbol", 1)], "the lookup ran once, over the index, and said what it found")
+
+    def test_a_declared_type_answers_with_the_line_it_sits_on(self):
+        """Python's index keeps a file-level function as a signature, so a line for it would be
+        invented; a declared type is recorded with one, and that is the case worth the verb's cost."""
+        (self.ws.root / "Api.java").write_text("package web;\n\npublic class Api {\n}\n",
+                                               encoding="utf-8", newline="\n")
+        _session, told = self.ask({"action": "find_symbol", "query": "Api"})
+        self.assertIn("Api.java", told)
+        self.assertIn('"line": 3', told)
+
+    def test_a_use_answers_with_every_site_and_its_role(self):
+        _session, told = self.ask({"action": "find_references", "query": "add"})
+        self.assertIn('"declaration"', told)
+        self.assertIn('"import"', told)
+        self.assertIn('"call"', told)
+        self.assertIn("src/caller.py", told)
+
+    def test_a_name_the_project_does_not_declare_is_answered_as_an_answer(self):
+        """Empty is information. The guidance that follows is what stops a small model searching for the
+        same name again instead of proposing the file the plan asks for."""
+        _session, told = self.ask({"action": "find_symbol", "query": "subtract"})
+        self.assertIn('"declarations": []', told)
+        self.assertIn("does not define it", told)
+        self.assertIn('"next_step"', told, "an empty answer with no next step costs another turn")
+
+    def test_a_configuration_key_is_not_reported_as_a_use_of_a_name(self):
+        """`register-with-eureka` is a real occurrence of `register`, and reporting it would spend the
+        hit budget on YAML. Text search is the verb for that; this one is about code, so the key must
+        not reach the prompt at all — the map lists the file, never its contents."""
+        _session, told = self.ask({"action": "find_references", "query": "register"})
+        self.assertIn('"sites": []', told)
+        self.assertNotIn("register-with-eureka", told)
+
+    def test_a_query_with_the_wrong_fields_is_refused_with_the_shape_named(self):
+        _session, told = self.ask({"action": "find_symbol", "path": "src/main.py"},
+                                  {"action": "find_symbol", "query": "add"})
+        self.assertIn("Unknown action or invalid fields", told)
+        self.assertIn("action find_symbol with fields action, path", told)
+
+    def test_the_verbs_the_prompt_offers_are_the_verbs_the_loop_accepts(self):
+        """The drift this guards is the expensive kind: a verb in the system prompt that the handler
+        chain does not know costs a turn per attempt, and one the chain knows but the prompt never
+        mentions is code no model will ever ask for."""
+        text = (Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer"
+                / "engine.py").read_text(encoding="utf-8")
+        offered = set(re.findall(r'\n- action="(\w+)":', text))
+        # Only the handler chain's own comparisons: `name == "..."` also appears as `os.name == "nt"`,
+        # which is a platform check and not an action the model can ask for.
+        handled = set(re.findall(r'(?:elif|if) name == "(\w+)" and', text))
+        self.assertEqual(offered, handled, "the menu and the kitchen disagree")
+        self.assertIn("find_symbol", offered)
+        self.assertIn("find_references", offered)
+
+
+class TheRankedContext(unittest.TestCase):
+    """Files chosen because the task is *about* them, and the thread saying which and why.
+
+    The rule this replaces was a substring test on the filename, so a task that described the bug
+    instead of naming the file arrived with no context at all. The other half of the change is the
+    sentence: a context block nobody can explain is the thing the memory notes already record as
+    complaints about injected text, so the reason travels with the file and reaches the thread.
+    """
+
+    CALLER = "def run():\n    return compute()\n"
+    HELPER = "def compute():\n    return 41\n"
+    # "why does run return the wrong number", from code points so this file stays ASCII.
+    ARABIC_TASK = "".join(map(chr, [0x0644, 0x064a, 0x0647])) + " run " + \
+                "".join(map(chr, [0x064a, 0x0631, 0x062c, 0x0639]))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        root = self.base / "repo"
+        root.mkdir()
+        (root / "caller.py").write_text(self.CALLER, encoding="utf-8", newline="\n")
+        (root / "helper.py").write_text(self.HELPER, encoding="utf-8", newline="\n")
+        self.ws = Workspace(root)
+
+    def proposal(self, content="def run():\n    return 42\n"):
+        return {"action": "propose", "summary": "Fix run", "checks": ["unit tests"],
+                "changes": [{"path": "caller.py", "content": content}]}
+
+    def send(self, task):
+        """Two proposals, because the second case is the one that needs them.
+
+        A file the engine did not inject cannot be proposed without being read first, so the loop
+        refuses the first attempt, hands the model the content, and asks again. Scripting one reply
+        would make that test measure a `StopIteration` instead of the absence of a line.
+        """
+        provider = RecordingProvider([self.proposal(), self.proposal()])
+        lines = []
+        plan(self.ws, task, provider, Settings(), self.base / "runs", progress=lines.append)
+        return " ".join(message["content"] for message in provider.prompts[0]), lines
+
+    def test_a_file_the_task_never_named_still_reaches_the_prompt(self):
+        task = "why does run return the wrong number?"
+        self.assertNotIn("caller.py", task, "the premise of this test is that no path was typed")
+        prompt, _lines = self.send(task)
+        self.assertIn("File snapshot", prompt)
+        self.assertIn("def run():", prompt)
+        self.assertIn("caller.py", prompt, "the ranked file is injected by the index, not by luck")
+
+    def test_the_thread_says_which_files_were_chosen_and_why(self):
+        _prompt, lines = self.send("why does run return the wrong number?")
+        chosen = [line for line in lines if "Chose" in line]
+        self.assertEqual(len(chosen), 1, chosen)
+        self.assertIn("caller.py", chosen[0])
+        self.assertIn("(defines run)", chosen[0], "a reason the operator can check, not a file count")
+
+    def test_no_injection_means_no_line_about_it(self):
+        """A task that matches nothing must not announce a choice of zero files — the thread is read
+        for what happened, and "Chose 0 file(s)" is a sentence about nothing."""
+        _prompt, lines = self.send("nothing in this project is called FrobnicateToday")
+        self.assertFalse([line for line in lines if "Chose" in line], lines)
+
+    def test_the_reason_arrives_in_the_language_the_task_was_asked_in(self):
+        _prompt, lines = self.send(self.ARABIC_TASK)
+        chosen = [line for line in lines if "run" in line and "Chose" not in line]
+        self.assertTrue(any(0x0600 <= ord(ch) <= 0x06ff for line in chosen for ch in line), chosen)
+
+    def test_the_smallest_legal_budget_still_carries_a_task_and_a_file(self):
+        """`context_chars` has a floor because the instruction block and the repository map are spent
+        before any of the project's own files are read. Retrieval was then allowed a fixed third of the
+        window *on top* of that, so a task already near the limit was refused outright, with a message
+        that blamed the repository for the tool's own prompt."""
+        provider = RecordingProvider([self.proposal(), self.proposal()])
+        plan(self.ws, "why does run return the wrong number?", provider,
+             Settings(context_chars=MIN_CONTEXT_CHARS), self.base / "runs",
+             progress=lambda _line: None)
+        first = provider.prompts[0]
+        self.assertLessEqual(sum(len(message["content"]) for message in first), MIN_CONTEXT_CHARS)
+        self.assertIn("def run():", " ".join(message["content"] for message in first),
+                      "the floor is meant to leave room for one real file, not just for the prompt")
+
+    def test_the_instruction_block_fits_the_floor_it_is_given(self):
+        """The floor is a claim about the size of this prompt, and the prompt changes. If it grows past
+        the smallest number the config will accept, every legal budget refuses every task."""
+        self.assertLess(len(SYSTEM) + 400, MIN_CONTEXT_CHARS)
+
+
+class TheUnexpectedFileFlag(unittest.TestCase):
+    """D41: a change to a file the task never spoke about is said before it is approved.
+
+    The rule is a sentence, not a gate. A fix that spans two files is ordinary, and a refusal that fired
+    on every one of them would be answered by re-typing the task until the gate stopped — so the operator
+    sees which files came out of the map rather than the agent's own reading, and decides.
+    """
+
+    KEEP = "".join("import module%d\n" % i for i in range(12))
+
+    def session(self, task="fix the login in auth.py", paths=(), events=(), created=()):
+        return {"task": task, "state": "WAITING_APPROVAL", "root": "/tmp/repo", "summary": "s",
+                "checks": [], "proposal_hash": "h",
+                "events": [{"kind": kind, "path": path} for kind, path in events],
+                "changes": [{"path": path, "before": self.KEEP, "after": self.KEEP + "x = 1\n",
+                             "delete": False} for path in paths]
+                           + [{"path": path, "before": None, "after": "new file\n",
+                               "delete": False} for path in created]}
+
+    def names(self, session):
+        return engine.unrelated_files(session)
+
+    def test_a_file_the_task_named_is_not_flagged(self):
+        got = self.names(self.session(paths=("auth.py",)))
+        self.assertEqual(got, [])
+
+    def test_a_file_the_index_chose_for_the_task_is_not_flagged(self):
+        got = self.names(self.session(paths=("auth/LoginService.java",),
+                                      events=[("context_file", "auth/LoginService.java")]))
+        self.assertEqual(got, [])
+
+    def test_a_file_the_agent_read_during_the_turn_is_not_flagged(self):
+        """Reading is how the agent earns the right to edit, and the thread already shows the read — a
+        flag on every build-fix that touched a pom would teach the operator to ignore the sentence."""
+        got = self.names(self.session(paths=("pom.xml",), events=[("auto_read", "pom.xml")]))
+        self.assertEqual(got, [])
+
+    def test_a_file_nobody_spoke_about_is_named_in_the_dialog(self):
+        got = self.session(paths=("billing/Invoice.java",))
+        self.assertEqual(engine.unrelated_files(got), ["billing/Invoice.java"])
+        notice = engine.unexpected_notice(got)
+        self.assertIn("billing/Invoice.java", notice)
+        self.assertIn("repository map alone", notice)
+
+    def test_a_new_file_is_not_a_surprise_of_the_same_kind(self):
+        """A task that asks for a feature expects a file that has never existed; the artifact card says
+        "Created" and there is no prior content to have been written over."""
+        self.assertEqual(self.names(self.session(created=("auth/HealthController.java",))), [])
+
+    def test_a_removal_is_left_to_the_notice_that_already_owns_it(self):
+        self.assertEqual(self.names(self.session(paths=())), [])
+
+    def test_a_folder_relative_name_still_matches_the_file_the_task_named(self):
+        """The task says `pom.xml`; the change is `orders-service/pom.xml`. Same file as far as the
+        operator is concerned, and a flag here would be noise on every Maven task."""
+        got = self.session(task="bump the spring boot version in pom.xml",
+                           paths=("orders-service/pom.xml",))
+        self.assertEqual(engine.unrelated_files(got), [])
+
+    def test_the_flag_is_a_window_sentence_not_an_approval_block(self):
+        """Nothing here stops `apply_proposal`: the proposal stays approvable, exactly as it was."""
+        session = self.session(paths=("billing/Invoice.java",))
+        self.assertTrue(engine.unexpected_notice(session))
+        self.assertEqual(session["state"], "WAITING_APPROVAL")
+
+    def test_the_review_text_lists_the_stray_files_for_the_cli_too(self):
+        text = engine.review(self.session(paths=("billing/Invoice.java",)))
+        self.assertIn("Files this task never named or read:", text)
+        self.assertIn("billing/Invoice.java", text)
+
+    def test_the_dialog_carries_the_removal_warning_and_this_one_together(self):
+        """One owner for both advisories: the two windows used to call the removal notice directly, and
+        a sentence added to only one of them is the drift this project keeps paying for."""
+        emptied = {"task": "t", "root": "/tmp/repo", "events": [], "checks": [], "changes": [
+            {"path": "big.py", "before": "".join("line%d\n" % i for i in range(20)),
+             "after": "line0\n", "delete": False},
+            {"path": "other.py", "before": self.KEEP, "after": self.KEEP + "x = 1\n",
+             "delete": False}]}
+        text = repair.approval_advisories(emptied)
+        self.assertIn("Removes most of an existing file", text)
+        self.assertIn("other.py", text)
+        self.assertIn("big.py", text, "the emptied file was never named either, and says so")
+
+    def test_both_windows_read_the_one_aggregate(self):
+        """Source-level, because no Python test opens a dialog."""
+        import inspect
+        from ai_code_engineer import gui
+        from ai_code_engineer.webapp import controller as controller_module
+        for module in (gui, controller_module):
+            source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
+            self.assertIn("approval_advisories(", source, module.__name__)
+            self.assertNotIn("repair.removal_notice(", source,
+                             "%s still shows half of the warning" % module.__name__)
+
+
+class TheErrorThatCameBack(unittest.TestCase):
+    """D42 on the loop's side: a failure another task already left open is said before it is found again.
+
+    The record of every run is already on disk under `.agent-runs`, and the repair loop already reads it
+    for the conversation in front of it. This is the same reading widened to the project, because the
+    person who opens a second chat to finish what the first one could not is the case where the history
+    is worth anything — and a model that is not told repeats the fix that already failed.
+    """
+
+    OTHER_CHAT = "b" * 32
+    THIS_CHAT = "a" * 32
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "repo"
+        self.root.mkdir()
+        (self.root / "app.py").write_text("def total(items):\n    return sum(items)\n",
+                                          encoding="utf-8", newline="\n")
+        self.runs = self.base / "runs"
+        self.ws = Workspace(self.root)
+
+    def prior_session(self, *runs, chat=OTHER_CHAT, sid="old1"):
+        atomic_json(self.runs / sid / "session.json",
+                    {"schema": 1, "id": sid, "root": str(self.root), "task": "fix the totals",
+                     "state": "BLOCKED", "created": "2026-09-01T10:00", "events": [],
+                     "chat_id": chat, "runs": list(runs)})
+
+    def failing(self, at="2026-09-01T10:05", line=None):
+        return {"status": "failed", "label": "pytest", "at": at, "seconds": 3.0,
+                "failures": [line or "FAILED tests/test_cart.py::test_total - AssertionError: 3 != 4"],
+                "tail": "1 failed"}
+
+    def passing(self, at="2026-09-04T10:05"):
+        return {"status": "passed", "label": "pytest", "at": at, "seconds": 2.0,
+                "failures": [], "tail": "12 passed"}
+
+    def proposal(self):
+        return {"action": "propose", "summary": "Fix total", "checks": ["unit tests"],
+                "changes": [{"path": "app.py", "content": "def total(items):\n    return 0\n"}]}
+
+    def run_plan(self, chat=THIS_CHAT):
+        provider = RecordingProvider([self.proposal(), self.proposal()])
+        lines = []
+        plan(self.ws, "the sum in app.py is wrong", provider, Settings(), self.runs,
+             progress=lines.append, chat_id=chat)
+        return provider, " ".join(lines)
+
+    def test_an_open_error_from_another_task_is_said_in_the_thread(self):
+        self.prior_session(self.failing())
+        _provider, lines = self.run_plan()
+        self.assertIn("earlier task(s) left this build error open", lines)
+        self.assertIn("test_total", lines, "the row names the failure, not just that there was one")
+
+    def test_the_model_is_told_which_battle_was_already_lost(self):
+        self.prior_session(self.failing())
+        provider, _lines = self.run_plan()
+        prompt = " ".join(message["content"] for message in provider.prompts[0])
+        self.assertIn("already failed on", prompt)
+        self.assertIn("do not repeat a change that already failed", prompt)
+
+    def test_a_chat_is_not_quoted_back_at_its_own_rounds(self):
+        """`stalled()` already says this every round, under its own name. Two sentences about one thing
+        is how a thread starts sounding like a log."""
+        self.prior_session(self.failing(), chat=self.THIS_CHAT)
+        _provider, lines = self.run_plan()
+        self.assertNotIn("left this build error open", lines)
+
+    def test_an_error_a_later_pass_settled_stays_silent(self):
+        self.prior_session(self.failing(), self.passing())
+        _provider, lines = self.run_plan()
+        self.assertNotIn("left this build error open", lines)
+
+    def test_a_project_with_no_history_says_nothing_about_history(self):
+        _provider, lines = self.run_plan()
+        self.assertNotIn("left this build error open", lines)
+        self.assertNotIn("already failed on", lines)
+
+    def test_the_announce_row_carries_the_command_it_failed_in(self):
+        self.prior_session(self.failing(), self.failing(at="2026-09-02T10:05"))
+        _provider, lines = self.run_plan()
+        self.assertIn("pytest", lines, "which command the error belongs to travels with it")
+
+    def test_a_reopened_task_rebuilds_the_same_sentence(self):
+        """The stored record is filtered through `STEP_FIELDS` on the way back, so a field that is not
+        in that tuple makes history say less than the live row did — the drift class this keeps hitting."""
+        from ai_code_engineer import labels
+        self.prior_session(self.failing())
+        provider = RecordingProvider([self.proposal(), self.proposal()])
+        events = []
+
+        def record(line, step_id, action, fields):
+            events.append({"id": step_id, "action": action, **fields})
+
+        plan(self.ws, "the sum in app.py is wrong", provider, Settings(), self.runs,
+             progress=lambda _l: None, chat_id=self.THIS_CHAT, step=record)
+        row = next(item for item in events if item["action"] == "unresolved_error")
+        rebuilt = {key: row[key] for key in labels.STEP_FIELDS if key in row}
+        whole = {key: value for key, value in row.items() if key not in ("id", "action")}
+        self.assertEqual(labels.step_line(False, "unresolved_error", **rebuilt),
+                         labels.step_line(False, "unresolved_error", **whole))
+
+
+class ThoughtfulProvider(RecordingProvider):
+    """The transport's shape: an answer, plus the deliberation that arrived beside it.
+
+    With `pieces` it also advertises `supports_stream`, which is the only way a test can tell the
+    engine's streaming ask apart from a call at a model that has never taken one.
+    """
+
+    def __init__(self, responses, thoughts, pieces=None):
+        super().__init__(responses)
+        self.thoughts = iter(thoughts)
+        self.pieces = iter(pieces) if pieces is not None else None
+        self.reasoning = ""
+        if pieces is not None:
+            self.supports_stream = True
+
+    def generate(self, messages, on_token=None):
+        self.reasoning = next(self.thoughts)
+        if on_token is not None and self.pieces is not None:
+            for piece in next(self.pieces):
+                on_token(piece)
+        return super().generate(messages)
+
+
+class TheThoughtThatCameWithTheAnswer(unittest.TestCase):
+    """UI 4.2 phase 2: a reasoning model's thinking is read, shown once, and never re-sent.
+
+    Two separate losses were being paid here. The field the provider returns beside `content` was
+    dropped, so the operator could not see why a weak model picked the file it picked; and a reply
+    that put braces in prose lost its turn to "Return one JSON object", because the recovery took the
+    *first* balanced object rather than the one with an action in it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "repo"
+        self.root.mkdir()
+        (self.root / "app.py").write_text("answer = 1\n", encoding="utf-8")
+        self.ws = Workspace(self.root)
+        self.runs = self.base / "runs"
+
+    def proposal(self, content="answer = 2\n"):
+        return {"action": "propose", "summary": "Update answer", "checks": ["unit tests"],
+                "changes": [{"path": "app.py", "content": content}]}
+
+    def read_then_propose(self, thoughts, task="Update answer"):
+        provider = ThoughtfulProvider([{"action": "read_file", "path": "app.py"}, self.proposal()],
+                                      thoughts)
+        lines = []
+        path = plan(self.ws, task, provider, Settings(), self.runs, progress=lines.append)
+        return provider, lines, path
+
+    def test_the_envelope_wins_over_an_object_quoted_in_prose(self):
+        answer = json.dumps(self.proposal())
+        raw = "Files I weighed: {\"candidates\": {\"app.py\": \"the one\"}} — my answer is " + answer
+        self.assertEqual(parse_action(raw)["action"], "propose")
+        self.assertNotIn("candidates", parse_action(raw))
+
+    def test_a_whole_reply_is_still_taken_as_whole(self):
+        value = parse_action(json.dumps({"action": "propose", "summary": "s", "checks": [],
+                                         "notes": {"keep": True}, "changes": []}))
+        self.assertEqual(value["action"], "propose")
+        self.assertIn("notes", value, "the envelope comes back entire, not cut to its action")
+
+    def test_a_reply_with_no_action_in_it_falls_back_to_the_first_object(self):
+        # The family this project measured as `{"code": ...}`: right fix, wrong envelope. The loop has
+        # to see the model's own object and say why it is not an action, not a recovery of nothing.
+        value = parse_action('prose {"code": "answer = 2"} then {"other": 1}')
+        self.assertEqual(value, {"code": "answer = 2"})
+
+    def test_a_thought_is_said_once_per_reply_and_keeps_its_text_for_opening(self):
+        first, second = "weighing the two files", "writing the fix"
+        _provider, lines, path = self.read_then_propose([first, second])
+        rows = [line for line in lines if "Thought for" in line]
+        self.assertEqual(len(rows), 2, lines)
+        self.assertIn(first, rows[0])
+        self.assertIn("%d characters" % len(first), rows[0])
+        stored = load_session(path)["events"]
+        thought = [item for item in stored if item.get("action") == "model_reasoning"]
+        self.assertEqual([item["detail"] for item in thought], [first, second])
+        self.assertEqual([item["count"] for item in thought], [len(first), len(second)])
+
+    def test_the_row_comes_before_the_action_it_preceded(self):
+        """A thread read for what happened puts the deliberation where it happened: before the row."""
+        _provider, lines, _path = self.read_then_propose(["thinking first", None])
+        self.assertLess([index for index, line in enumerate(lines) if "Thought for" in line][0],
+                        next(index for index, line in enumerate(lines) if "Proposed" in line))
+
+    def test_a_model_that_shows_no_reasoning_announces_no_row(self):
+        provider = ScriptedProvider([{"action": "read_file", "path": "app.py"}, self.proposal()])
+        lines = []
+        path = plan(self.ws, "Update answer", provider, Settings(), self.runs, progress=lines.append)
+        self.assertFalse([line for line in lines if "Thought for" in line], lines)
+        self.assertFalse([item for item in load_session(path)["events"]
+                          if item.get("action") == "model_reasoning"])
+
+    def test_the_thought_never_goes_back_to_the_model_as_history(self):
+        provider, _lines, _path = self.read_then_propose(["a private aside about app.py", None])
+        second = json.dumps(provider.prompts[1])
+        self.assertNotIn("a private aside", second,
+                         "the next turn does not need to re-read the deliberation it just made")
+
+    def test_the_thought_is_announced_in_the_language_the_task_was_asked_in(self):
+        _provider, lines, _path = self.read_then_propose(["looked at app.py first", None],
+                                                        task="صلح القيمة في app.py")
+        row = next(line for line in lines if "\U0001f9ed" in line)
+        self.assertNotIn("Thought for", row)
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in row), row)
+
+    def test_a_streaming_ask_only_goes_to_a_model_that_offers_one(self):
+        """`plan` grows a third provider argument and must not hand it to a model that never took it."""
+        heard = []
+        provider = ThoughtfulProvider([{"action": "read_file", "path": "app.py"}, self.proposal()],
+                                      [None, None],
+                                      pieces=[('{"action": "rea', 'd_file"}',),
+                                              ('{"action": "pro', 'pose"}',)])
+        plan(self.ws, "Update answer", provider, Settings(), self.runs,
+             progress=lambda _line: None, on_token=heard.append)
+        self.assertEqual(heard, ['{"action": "rea', 'd_file"}', '{"action": "pro', 'pose"}'],
+                         "every turn's pieces are heard, in the order the model wrote them")
+        plain = ScriptedProvider([{"action": "read_file", "path": "app.py"}, self.proposal()])
+        path = plan(self.ws, "Update answer", plain, Settings(), self.runs,
+                    progress=lambda _line: None, on_token=heard.append)
+        self.assertEqual(len(heard), 4, "a model without the flag was not asked to stream")
+        self.assertEqual(load_session(path)["state"], "WAITING_APPROVAL",
+                         "and the loop still finished the way it always did")
 
 
 if __name__ == "__main__":

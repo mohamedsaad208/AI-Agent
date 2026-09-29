@@ -161,3 +161,28 @@ preview: the badge opens a three-row sheet, choosing Read-only turns the pill bl
 answered with the refusal row and prose, `canApply` and `canRollback` come back false, the Auto-Apply
 pill answers with the shared refusal, Run asks with `mvn -B test` named in the question, Cancel runs
 nothing, and "Run it" runs.
+
+**7. Better onboarding** — `src/ai_code_engineer/setup.py`, `agent setup`, and the plan in
+`docs/ONBOARDING-SETUP.md`. The spec asked for a wizard that checks Python, Ollama, a model, a
+workspace, a demo, the policy and the mode, plus one command. Measured against the code, four premises
+were wrong — `doctor`, `demo` and the launcher already existed, there are three positions rather than
+two, "pick a workspace" contradicts UI 2.8's no-global-default-folder decision, and `check_setup()`
+already runs at every launch — so `setup.py` **sequences the probes that exist** instead of adding new
+ones, and the eight rows it returns are shared by all three surfaces: the terminal wizard, the web
+card, the Tk dialog.
+
+Two properties the design turns on:
+
+- *A snapshot never probes.* The card is built with `probe=False`; `provider`/`model`/`demo` arrive as
+  "has not been asked yet", and only the **Run the checks** click reaches the network. A report that
+  goes out on every streamed log line cannot also be a request to Ollama and a walk of the folder.
+- *A row is only as confident as its probe.* `catalog` answers with built-in names when the live list
+  fails, so a first run that called those "installed" would promise a model nobody pulled. The fallback
+  case is a WARN that names where the list came from.
+
+Tests: 1084 → 1166 (`test_setup` 52, `FirstRunWizard` 14, `TheFirstRunCard` 13, Tk first-run 9). The
+two defects this round caught, and the one action it removed, are recorded in `docs/ONBOARDING-SETUP.md`
+— most importantly that `_save_state()` rebuilds its preference dict from named keys, so a flag nobody
+lists there is erased by the next unrelated save. Browser-verified on the preview: the card opens with
+8 rows and a server-written tally, the proof flips its row to OK and the tally to 5, "Don't show this
+again" empties the dock, and Settings → Setup checks brings it back with the provider row answered.

@@ -1,5 +1,32 @@
 # Implementation status — 2026-09-29
 
+## UI 4.3 — the container the command runs in, the desktop's own viewer, and one provider line
+
+Three queue items, each measured before it was written, each with its own record:
+`docs/DOCKER-SANDBOX-PLAN.md`, `docs/UI40-CHANGES-PANE-REMOVAL-PLAN.md` (*As built — the Tk twin*),
+`docs/UI42-MULTI-PROVIDER-PLAN.md` (*As built — #56*). **1380 → 1403 offline tests**, `node --check` clean.
+
+| what changed | where |
+| --- | --- |
+| the desktop window lost its Changes tab | the proposal viewer is a withdrawn `Toplevel` now, raised by `open_review()` and hidden by `close_review()` (title-bar X and Escape). Two views left in the stack, and the approval line names the window in the web sheet's own words. `transient()` was tried and is wrong here: a transient child of a withdrawn master cannot be mapped at all |
+| a thinking model's chat answer stopped carrying its working-out | `payload["think"] = not json_mode`. Measured: the same 136 tokens come back as `thinking:522 + content:180` with the field asked for and as 712 characters of `content` with it refused, the closing marker inside the sentence the user was handed. The envelope keeps `think:false`, where asking cost a whole budget and answered nothing |
+| `runner.run` can run inside the container | `sandbox="image@sha256:…"`: the project is copied to a host temp folder, that copy is the only writable mount, the recipe runs as argv with the image's own entrypoint, and the JUnit reports are read back off the copy. No Docker → `blocked`, and the reason says the host was not used either |
+| the second recipe table died | `verification.RECIPES` was a hand-copied list of three of the runner's eleven commands, and it had already drifted on the one flag a `--network=none` build needs. `container_command()` derives the container argv from `runner.RECIPES` and adds `OFFLINE = {"mvn": "-o", "gradle": "--offline"}` |
+| the shell prologue died with it | the old call started `/bin/sh -c 'cp -R /input/. /work/ && exec "$@"'` — two copies of the project and a tmpfs the evidence could not leave. The tests now pin the *absence* of shell text in the argv |
+| both windows ask the same four questions | `Run in Docker` plus one image field in the Checks card of each, `runner.sandbox_state()` deciding and `labels.NOTE_TEMPLATES["sandbox_*"]` saying, so a half-typed digest gets the same sentence on both screens |
+| the record says where a green came from | `run["sandbox"] = {image, container}`, `summarize()` says `in Docker`, the read-only question about a command names the container, and `agent export-session` prints `Maven test inside maven@sha256:… · passed` |
+
+**Unverified, on purpose and in words:** no container has run on this machine — there is no Docker here.
+Every claim above is an argv recorded against a fake `Popen`, at the same standard
+`tests/test_verification.py` has always held. Whether a Maven reactor builds with no network, whether a
+Windows temp path mounts cleanly, and whether uid 65534 can write the copy on a Linux host are questions
+for a Docker-capable machine, and `docs/DOCKER-SANDBOX-PLAN.md` says so rather than implying a run.
+
+**Left open from the same measurements:** a thinking model's chat turn is silent for the whole
+deliberation — five minutes on `qwen3:4b` through the app's own prompt — because `read_stream` hands
+`on_token` content pieces only (task #57); and the CLI still has no `run` command, which is where the
+sandbox would otherwise be reachable from a third surface.
+
 ## Phase 2 — cleanup: the boundary tested, the two windows made to share what they say
 
 An eight-item list framed as "not new features, less chance a future change regresses something"
@@ -145,8 +172,10 @@ width, visible the moment the window widened) — now `onClose` repaints the rai
 Verified in the live window on the real project, read-only: an applied session opened from history, its
 chip raised the sheet, the Checks tab drew the last `mvn -B test` verdict, and the buttons came up
 `Apply off / Check syntax on / Roll back on` for a change already on disk. `state.view` stayed `task`
-through all of it. **The Tk window keeps its Changes tab** — it has no side rail to receive these
-controls, so the same move there is a rebuild (decision 1, web only this round).
+through all of it. The Tk window kept its Changes tab in that round — no side rail to receive the
+controls, so the move there was a rebuild (decision 1, web only). **#28 has since shipped it**: the desktop
+viewer is its own window now and the tab is gone (`docs/UI40-CHANGES-PANE-REMOVAL-PLAN.md`,
+*As built — the Tk twin*).
 
 
 ## UI 3.9 — the seven open defects, plus the two the window itself reported
@@ -1358,7 +1387,9 @@ This is the first vertical slice, not the full production roadmap.
 ## Conversation-style desktop layout
 
 - Cool gray workspace: sidebar (new chat, open saved task, search, project chip, tasks/chats tree), central conversation, bottom composer, and a right artifact/source panel that shows the current proposal state and file count.
-- Chat and Changes/Activity are three views of the same center area, switched from the header; the active view is highlighted. Tab strips are not used.
+- Chat and Activity are the two views of the center area, switched from the header; the active view is
+  highlighted and tab strips are not used. The proposed files are not a third view: since #28 they open in
+  their own window, withdrawn until a proposal exists, with Apply/Check/Roll back in it.
 - The project is optional. With none selected the composer sends a plain question answered in prose (`.agent-chats/<id>/chat.json`, no workspace, no tools, no proposal, JSON mode off). With a project selected the same composer requests reviewed changes; the propose/apply/hash-verified path is unchanged.
 - Saved tasks and chats restore their own project, attachment and history. Opening a project-free chat detaches any project so a chat cannot silently edit the last folder used.
 - Enter (or Ctrl+Enter) sends; Shift+Enter adds a line. Progress and errors remain visible in Activity and the status area.

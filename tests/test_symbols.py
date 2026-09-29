@@ -619,5 +619,574 @@ class IndexCacheTests(unittest.TestCase):
         self.assertEqual([key[0] for key in workspace.INDEX_CACHE], [str(other.resolve())])
 
 
+PROVIDER = """package com.example.auth;
+
+import com.example.shared.Token;
+
+public class JwtTokenProvider {
+    private final Token token;
+
+    public JwtTokenProvider(Token token) { this.token = token; }
+
+    public String login(String user) { return token.sign(user); }
+}
+"""
+
+CONSUMER = """package com.example.web;
+
+import com.example.auth.JwtTokenProvider;
+
+class LoginEndpoint {
+    String go() { return new JwtTokenProvider(null).login("a"); }
+
+    // JwtTokenProvider was renamed in 2.0, so do not use it here
+    String note = "JwtTokenProvider is only the old name";
+}
+"""
+
+
+class SymbolLookupTests(unittest.TestCase):
+    """`find_symbol`: the index can already answer "where is this declared", and nothing asked it."""
+
+    def rows(self):
+        return [row_for("auth/JwtTokenProvider.java", PROVIDER),
+                row_for("web/LoginEndpoint.java", CONSUMER)]
+
+    def test_a_class_is_found_with_the_file_and_the_line_it_is_declared_on(self):
+        hits = symbols.find_symbol(self.rows(), "JwtTokenProvider")
+        types = [hit for hit in hits if hit["kind"] == "class"]
+        self.assertEqual([hit["path"] for hit in types], ["auth/JwtTokenProvider.java"])
+        self.assertGreater(types[0]["line"], 0)
+        self.assertIn("member", [hit["kind"] for hit in hits],
+                      "the constructor is declared under the same name, and a lookup that hid it "
+                      "would send a model to edit the type while its own file disagrees")
+
+    def test_a_method_is_found_with_the_type_that_owns_it(self):
+        hits = [hit for hit in symbols.find_symbol(self.rows(), "login") if hit["kind"] == "member"]
+        self.assertEqual([(hit["name"], hit["in"]) for hit in hits],
+                         [("login", "JwtTokenProvider")])
+        self.assertIn("login(String user)", hits[0]["signature"])
+
+    def test_a_name_that_is_declared_nowhere_returns_nothing(self):
+        """The first version of this function collected every row and filtered afterwards, so an
+        unanswered lookup came back as the whole project — the worst possible answer for a small model
+        deciding what to read next."""
+        self.assertEqual(symbols.find_symbol(self.rows(), "NoSuchService"), [])
+        self.assertEqual(symbols.find_symbol(self.rows(), ""), [])
+
+    def test_an_exact_name_is_offered_before_a_name_thatmerely_contains_it(self):
+        rows = self.rows() + [row_for("web/TokenProviderFactory.java",
+                                      "class TokenProviderFactory {\n}\n")]
+        hits = symbols.find_symbol(rows, "TokenProvider")
+        self.assertEqual(hits[0]["name"], "JwtTokenProvider", "a substring match outranked a real one")
+        self.assertTrue(all("tokenprovider" in hit["name"].casefold() for hit in hits), hits)
+
+    def test_a_type_declared_inside_another_is_found_by_its_own_name(self):
+        rows = [row_for("web/Outer.java", "class Outer {\n  static class Inner {\n  }\n}\n")]
+        hits = symbols.find_symbol(rows, "Inner")
+        self.assertEqual([hit["name"] for hit in hits], ["Inner"],
+                         "the JVM parser records a nested type by the name the source uses")
+
+
+class ReferenceTests(unittest.TestCase):
+    """`find_references`: the roles are the answer, not the count — `search_code` already gives counts."""
+
+    def sources(self):
+        return [("auth/JwtTokenProvider.java", PROVIDER), ("web/LoginEndpoint.java", CONSUMER)]
+
+    def rows(self):
+        return [row_for("auth/JwtTokenProvider.java", PROVIDER),
+                row_for("web/LoginEndpoint.java", CONSUMER)]
+
+    def sites(self, name="JwtTokenProvider", **kwargs):
+        return symbols.find_references(name, self.sources(), self.rows(), **kwargs)
+
+    def test_the_declaration_the_import_and_the_call_are_told_apart(self):
+        kinds = {(site["path"], site["kind"]) for site in self.sites()}
+        self.assertIn(("auth/JwtTokenProvider.java", "declaration"), kinds)
+        self.assertIn(("web/LoginEndpoint.java", "import"), kinds)
+        self.assertIn(("web/LoginEndpoint.java", "call"), kinds)
+
+    def test_a_comment_and_a_string_are_not_uses(self):
+        """The line exists in the file and the name appears in it. Both are still not a reference: the
+        parsers already had to learn this, and a lookup that had not would send a model to edit prose."""
+        paths = " ".join(site["text"] for site in self.sites())
+        self.assertNotIn("was renamed", paths)
+        self.assertNotIn("only the old name", paths)
+
+    def test_the_method_call_through_an_object_still_counts_as_a_use(self):
+        sites = [site for site in self.sites("login") if site["kind"] == "call"]
+        self.assertEqual([(site["path"], site["text"][:20]) for site in sites][0][0],
+                         "web/LoginEndpoint.java")
+
+    def test_one_busy_file_cannot_eat_the_answer(self):
+        """A site is a line, not an occurrence, and the cap counts lines: nine uses spread over nine
+        lines is exactly the case where the cap earns its place, because the tenth file would otherwise
+        never be shown at all."""
+        body = "\n".join(["class B {", "  void m() {"]
+                         + ["    C.x();" for _ in range(9)]
+                         + ["  }", "}"]) + "\n"
+        rows = [row_for("pkg/B.java", body)]
+        sites = symbols.find_references("C", [("pkg/B.java", body)], rows, per_file=3)
+        self.assertEqual([site["line"] for site in sites], [3, 4, 5])
+        every = symbols.find_references("C", [("pkg/B.java", body)], rows, per_file=99)
+        self.assertEqual(len(every), 9, "the cap is a cap, not a bug: without it all nine come back")
+
+    def test_the_total_cap_holds_and_a_name_used_nowhere_is_answered_with_nothing(self):
+        self.assertEqual(symbols.find_references("NothingHere", self.sources(), self.rows()), [])
+        many = [("pkg/M%d.java" % n, "class M%d {\n  void m() { C.x(); }\n}\n" % n) for n in range(60)]
+        self.assertEqual(len(symbols.find_references("C", many, [], limit=40)), 40)
+
+
+class RankingTests(unittest.TestCase):
+    """Which files a sentence is about — the ask that used to be "did you type the filename"."""
+
+    PROVIDER = ("package com.example.auth;\n\n"
+                "import com.example.shared.TokenStore;\n\n"
+                "public class JwtTokenProvider {\n"
+                "    public String login(String user) { return user; }\n"
+                "}\n")
+    CONSUMER = ("package com.example.web;\n\n"
+                "import com.example.auth.JwtTokenProvider;\n\n"
+                "class LoginEndpoint {\n"
+                "    String go() { return new JwtTokenProvider().login(\"a\"); }\n"
+                "}\n")
+    UNRELATED = "package com.example.web;\n\nclass BillingReport {\n    void total() {}\n}\n"
+
+    def rows(self):
+        return [row_for("auth/JwtTokenProvider.java", self.PROVIDER),
+                row_for("web/LoginEndpoint.java", self.CONSUMER),
+                row_for("web/BillingReport.java", self.UNRELATED)]
+
+    def paths(self, task, **kwargs):
+        ranked = symbols.rank(self.rows(), task, **kwargs)
+        return [(entry["path"], entry["why"]) for entry in ranked]
+
+    def test_a_described_file_is_found_without_being_named(self):
+        got = self.paths("why does login return the wrong token?")
+        self.assertEqual(got[0], ("auth/JwtTokenProvider.java", "declares"))
+        self.assertNotIn("web/BillingReport.java", [path for path, _ in got],
+                         "a file with nothing in common with the sentence must not ride along")
+
+    def test_two_words_reach_a_name_written_as_four(self):
+        """A person writes "token provider"; the source spells `JwtTokenProvider`. Neither the old
+        basename rule nor a whole-word comparison connects them."""
+        self.assertIn("auth/JwtTokenProvider.java", [path for path, _ in self.paths("the token provider")]
+                      )
+
+    def test_the_named_file_still_outranks_every_inference(self):
+        got = self.paths("edit web/LoginEndpoint.java now")
+        self.assertEqual(got[0], ("web/LoginEndpoint.java", "names"))
+
+    def test_one_hop_along_an_import_is_enough_to_be_interesting(self):
+        got = self.paths("fix the login flow")
+        self.assertIn(("web/LoginEndpoint.java", "imports"), got,
+                      "the caller of a function being changed is the second file a fix needs")
+
+    def test_a_verb_that_is_also_a_function_name_still_selects_the_file(self):
+        """"Fix add" is this tool's own dogfood sentence, and `add` was in the stop list as a verb --
+        so the one task the ranking exists for, a name typed in three letters, answered with nothing."""
+        rows = [row_for("calc/calculator.py", "def add(a, b):\n    return a + b\n")]
+        self.assertEqual([(entry["path"], entry["why"]) for entry in symbols.rank(rows, "Fix add")],
+                         [("calc/calculator.py", "defines")])
+
+    def test_a_task_that_names_nothing_answers_with_nothing(self):
+        for task in ("", "   ", "the and for with this that", "fix it"):
+            self.assertEqual(symbols.rank(self.rows(), task), [], task)
+
+    def test_the_budget_is_spent_on_the_best_score_not_the_first_path(self):
+        got = self.paths("login token provider report", limit=1)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "auth/JwtTokenProvider.java")
+
+    def test_a_tie_breaks_on_the_path_so_two_runs_agree(self):
+        same = [row_for("pkg/A.java", "class Alpha {\n}\n"), row_for("pkg/B.java", "class Alpha {\n}\n")]
+        first = [entry["path"] for entry in symbols.rank(same, "Alpha")]
+        self.assertEqual(first, sorted(first))
+
+    def test_every_reason_it_reports_is_a_reason_the_thread_can_say(self):
+        """The engine sends a code and `labels` words it. A code nobody knows would print a bare
+        identifier where the explanation should be, in both windows, for one file out of ten thousand."""
+        from ai_code_engineer import labels
+        used = {entry["why"] for entry in symbols.rank(self.rows(), "login token provider "
+                                                       "web BillingReport web/LoginEndpoint.java")}
+        self.assertTrue(used, "the fixture stopped producing a ranking at all")
+        self.assertTrue(used <= set(labels.CONTEXT_REASON), used - set(labels.CONTEXT_REASON))
+
+
+class ConfigFactTests(unittest.TestCase):
+    """The map's other half: what the build files and the runtime files say about the project.
+
+    These files are not source, so they have no symbols to index -- but they hold the module list, the
+    port each service listens on, and the registry it joins, which is what a starting order and a fix
+    both need. Three rules hold the feature together: the values come from an allow-list of keys, a key
+    that names a credential never yields its value, and a configuration row declares no symbols.
+    """
+
+    POM = '''<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.acme</groupId><artifactId>shop-parent</artifactId><version>1.0</version></parent>
+  <artifactId>auth-service</artifactId>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>common-lib</artifactId></dependency>
+    <dependency><groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId></dependency>
+  </dependencies>
+</project>
+'''
+
+    def facts(self, path, source):
+        return symbols.config_facts(path, source)
+
+    def test_a_pom_that_declares_its_namespaces_still_answers(self):
+        """Every real pom carries the Maven namespace and an `xsi:schemaLocation`. Stripping the
+        `xmlns` attributes from the text left that attribute's prefix unbound, the parse died, and the
+        whole JVM half of the map came out empty."""
+        got = dict(self.facts("auth-service/pom.xml", self.POM))
+        self.assertEqual(got["parent"], "shop-parent")
+        self.assertEqual(got["artifact"], "auth-service")
+        self.assertEqual(got["needs"], "common-lib, spring-boot-starter-web")
+
+    def test_a_reactor_pom_names_the_modules_it_builds(self):
+        got = dict(self.facts("pom.xml", '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+                                     "<artifactId>shop</artifactId><modules>"
+                                     "<module>auth-service</module><module>web</module>"
+                                     "</modules></project>"))
+        self.assertEqual(got["modules"], "auth-service, web")
+
+    def test_a_pom_with_a_doctype_is_not_parsed(self):
+        """An internal DTD expands inside ElementTree, and this file comes from a repository the tool
+        was asked to read rather than a build system it trusts. Real poms carry none, so refusing costs
+        nothing and closes the expansion."""
+        self.assertEqual(self.facts("pom.xml", '<?xml version="1.0"?>\n'
+                                              '<!DOCTYPE project [<!ENTITY x "A">]>\n'
+                                              "<project><artifactId>&x;</artifactId></project>"), [])
+
+    def test_a_long_dependency_list_is_cut_between_names_not_inside_one(self):
+        many = ("<project><artifactId>shop</artifactId><dependencies>"
+                + "".join("<dependency><artifactId>spring-boot-starter-module-%02d</artifactId>"
+                          "</dependency>" % i for i in range(14)) + "</dependencies></project>")
+        value = dict(self.facts("pom.xml", many))["needs"]
+        self.assertLessEqual(len(value), symbols.MAX_FACT_CHARS)
+        self.assertTrue(value.endswith(", ..."), value)
+        for name in value[:-len(", ...")].split(", "):
+            self.assertIn(name, [item for item in
+                                 ("spring-boot-starter-module-%02d" % i for i in range(14))],
+                          "a truncated token is a dependency the repository does not have")
+
+    def test_gradle_names_its_root_its_modules_and_its_needs(self):
+        got = dict(self.facts("settings.gradle", "rootProject.name = 'shop'\ninclude ':auth', ':web'\n"))
+        self.assertEqual(got["artifact"], "shop")
+        self.assertEqual(got["modules"], "auth, web")
+
+    def test_a_gradle_dependency_is_named_by_its_artifact(self):
+        """A coordinate is `group:artifact` or `group:artifact:version`, and the name a person types is
+        the artifact either way -- `implementation project(':common-lib')` is the internal edge the map
+        most wants, and it carries no group at all."""
+        got = dict(self.facts("app/build.gradle",
+                              "plugins { id 'org.springframework.boot' version '3.2.5' }\n"
+                              "dependencies {\n"
+                              '    implementation "org.springframework.boot:spring-boot-starter-web"\n'
+                              "    testImplementation 'com.h2database:h2:2.2.0'\n"
+                              "    implementation project(':common-lib')\n}\n"))
+        self.assertEqual(got["needs"], "common-lib, h2, spring-boot-starter-web")
+
+    def test_a_package_json_gives_its_name_scripts_and_dependencies(self):
+        got = dict(self.facts("package.json", '{"name": "shop-web", "scripts": '
+                                              '{"build": "vite build", "test": "vitest", "dev": "vite"}, '
+                                              '"dependencies": {"react": "^18.2.0"}, '
+                                              '"devDependencies": {"vitest": "^1.0.0"}}'))
+        self.assertEqual(got["artifact"], "shop-web")
+        self.assertEqual(got["scripts"], "build, test")
+        self.assertEqual(got["needs"], "react")
+        self.assertEqual(got["dev-needs"], "vitest")
+
+    def test_go_requires_read_in_both_spellings(self):
+        block = ("module github.com/acme/shop\n\ngo 1.22\n\nrequire (\n"
+                 "\tgithub.com/gin-gonic/gin v1.9.1\n\tgolang.org/x/jwt v4.5.0 // a comment\n)\n")
+        self.assertEqual(dict(self.facts("go.mod", block))["needs"],
+                         "github.com/gin-gonic/gin, golang.org/x/jwt")
+        self.assertEqual(dict(self.facts("go.mod", "module example.com/a\n"
+                                                   "require github.com/x/y v1.0.0\n"))["needs"],
+                         "github.com/x/y")
+
+    def test_both_toml_manifests_answer(self):
+        """`[package]` with a dependency table is Cargo; `[project]` with a dependency list is PEP 621.
+        Cargo.toml is TOML, so routing it to the Go reader meant a Rust project arrived with no facts."""
+        cargo = dict(self.facts("Cargo.toml", '[package]\nname = "shop"\nversion = "0.1.0"\n\n'
+                                               "[dependencies]\n"
+                                               'serde = { version = "1", features = ["derive"] }\n'
+                                               'tokio = "1"\n'))
+        self.assertEqual(cargo["artifact"], "shop")
+        self.assertEqual(cargo["needs"], "serde, tokio")
+        python = dict(self.facts("pyproject.toml", '[project]\nname = "shop-tools"\n'
+                                                   'dependencies = ["requests>=2.31", '
+                                                   '"flask[async]==3.0.0"]\n'))
+        self.assertEqual(python["artifact"], "shop-tools")
+        self.assertEqual(python["needs"], "flask, requests")
+
+    def test_a_runtime_yaml_gives_port_name_and_the_hosts_it_talks_to(self):
+        got = self.facts("auth-service/src/main/resources/application.yml",
+                         "server:\n  port: 8081\nspring:\n  application:\n    name: auth-service\n"
+                         "  datasource:\n    url: jdbc:postgresql://db.internal:5432/shop\n"
+                         "eureka:\n  client:\n    service-url:\n"
+                         "      defaultZone: http://localhost:8761/eureka/\n")
+        self.assertEqual(got, [("port", "8081"), ("name", "auth-service"),
+                               ("host", "db.internal:5432"), ("registry", "localhost:8761")])
+
+    def test_a_nested_parent_owns_the_keys_under_it(self):
+        """`application:` is a line with no value, so the first scanner skipped it and every child
+        resolved against the last key that *had* one: `spring.application.name` arrived as `port.name`
+        and the application's own name silently disappeared from the map."""
+        got = dict(self.facts("application.yml", "server:\n  port: 8081\n"
+                                                 "spring:\n  application:\n    name: auth-service\n"))
+        self.assertEqual(got["name"], "auth-service")
+
+    def test_a_properties_file_answers_the_same_way_as_yaml(self):
+        """`server.port=8080` is the same fact with a different separator, and a Spring project written
+        in properties used to arrive with no facts at all."""
+        got = dict(self.facts("api-gateway/src/main/resources/application.properties",
+                              "server.port=8080\nspring.application.name=api-gateway\n"
+                              "eureka.client.serviceUrl.defaultZone=http://localhost:8761/eureka/\n"
+                              "management.server.port=9091\n"))
+        self.assertEqual(got["port"], "8080")
+        self.assertEqual(got["name"], "api-gateway")
+        self.assertEqual(got["registry"], "localhost:8761")
+        self.assertEqual(got["management port"], "9091")
+
+    def test_a_key_that_names_a_credential_never_yields_its_value(self):
+        canary = "SHOULD_NOT_APPEAR_4f7b2c"
+        cases = [
+            ("application.yml", f"server:\n  port: 8080\nspring:\n  datasource:\n"
+                                f"    password: {canary}\n    username: {canary}\n"
+                                f"  security:\n    user:\n      name: {canary}\n"
+                                f"jwt:\n  secret: {canary}\n  token-key: {canary}\n"),
+            ("application.properties", f"server.port=8080\nspring.datasource.password={canary}\n"
+                                       f"aws.access-key={canary}\napp.token={canary}\n"),
+            ("application.yml", f"spring:\n  datasource:\n"
+                                f"    url: jdbc:postgresql://admin:{canary}@db.internal:5432/shop\n"),
+            ("config.gitlab-ci.yml", f"job:\n  variables:\n    SECRET_TOKEN: {canary}\n"),
+        ]
+        for path, source in cases:
+            flat = " ".join("%s %s" % fact for fact in symbols.config_facts(path, source))
+            self.assertNotIn(canary, flat, "%s leaked: %s" % (path, flat))
+
+    def test_the_credential_guard_covers_the_labels_too(self):
+        """`_shorten` is the last door: a parser that hands back a label naming a secret is refused
+        even when its value is already in hand."""
+        self.assertIsNone(symbols._shorten("password", "hunter2"))
+        self.assertIsNone(symbols._shorten("access-key", "AKIA123"))
+        self.assertEqual(symbols._shorten("artifact", "auth-service"), ("artifact", "auth-service"))
+
+    def test_a_name_only_means_the_application_when_its_owner_says_so(self):
+        """`logging.file.name` is a log file. Reported as `name`, it becomes a wrong fact about the
+        project that the model has no way to doubt, so the allow-list matches whole dotted paths."""
+        self.assertEqual(symbols.config_facts("application.yml",
+                                              "logging:\n  file:\n    name: app.log\n"), [])
+
+    def test_an_inline_comment_is_not_part_of_the_value(self):
+        got = dict(self.facts("application.yml", "server:\n  port: 8080   # the api port\n"))
+        self.assertEqual(got["port"], "8080")
+
+    def test_only_the_files_that_describe_the_project_are_read(self):
+        wanted = ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "package.json",
+                  "go.mod", "Cargo.toml", "pyproject.toml", "application.yml", "application.yaml",
+                  "bootstrap.properties", "src/main/resources/application-dev.yml")
+        noise = ("docker-compose.yml", "logback.xml", "ci.yml", "notes.md", "src/main.yml",
+                 "application.py", "openapi.yaml", ".gitignore")
+        for path in wanted:
+            self.assertTrue(symbols.noteworthy(path), path)
+        for path in noise:
+            self.assertFalse(symbols.noteworthy(path), path)
+
+    def test_a_config_row_declares_no_symbols(self):
+        """A pom that lists `auth-service` must not come back as a file that *declares* auth-service:
+        that is the confusion the row split keeps out of every name query in the module."""
+        row = symbols.config_row("auth-service/pom.xml", self.POM)
+        self.assertEqual(row["kind"], "config")
+        self.assertEqual(row["types"], [])
+        self.assertEqual(row["functions"], [])
+        self.assertEqual(symbols.find_symbol([row], "auth-service"), [])
+
+    def test_a_module_directory_still_outranks_its_own_pom(self):
+        """The pom is not source, but it does sit in the folder the task named, and that is a true
+        reason to read it -- so the ranking reaches it as `module`, never as a declaration."""
+        rows = [symbols.config_row("auth-service/pom.xml", self.POM)]
+        ranked = symbols.rank(rows, "auth-service")
+        self.assertEqual([entry["why"] for entry in ranked], ["module"])
+
+    def test_the_map_prints_facts_under_the_path(self):
+        row = symbols.config_row("pom.xml", self.POM)
+        text = symbols.render([row], ["pom.xml"])
+        self.assertIn("pom.xml\n  parent: shop-parent\n  artifact: auth-service", text)
+
+    def test_a_file_with_nothing_to_say_gets_no_block(self):
+        self.assertIsNone(symbols.config_row("application.yml", "# nothing here yet\n"))
+
+    def test_facts_are_counted_in_the_map_budget(self):
+        """Facts are the map's newest spend and the file list is the oldest: a project of a thousand
+        poms must still fit, and what it drops has to be named rather than quietly left out."""
+        rows = [symbols.config_row("m%03d/pom.xml" % i, "<project><artifactId>m%03d</artifactId>"
+                                                            "<dependencies>"
+                                                            "<dependency><artifactId>lib-a"
+                                                            "</artifactId></dependency>"
+                                                            "<dependency><artifactId>lib-b"
+                                                            "</artifactId></dependency>"
+                                                            "</dependencies></project>")
+                for i in range(120)]
+        files = ["m%03d/pom.xml" % i for i in range(120)]
+        text = symbols.render(rows, files, limit=2000)
+        self.assertLessEqual(len(text), 2400)
+        self.assertIn("index truncated", text)
+
+
+class GraphTests(unittest.TestCase):
+    """The picture: modules, the dependencies between them, and a column that means build order."""
+
+    def java(self, folder, name, imports):
+        body = "package %s;\n" % folder + "".join("import %s;\n" % item for item in imports)
+        return symbols.parse("%s/%s.java" % (folder, name), body + "class %s {\n}\n" % name)
+
+    def rows(self, *rows):
+        return [row for row in rows if row is not None]
+
+    def test_a_column_is_one_past_the_deepest_thing_a_module_needs(self):
+        """The leftmost column is what compiles first. Inverting it would draw a reactor backwards, and
+        the one thing the sheet claims to show — the build order — would be wrong in every detail."""
+        chain = self.rows(self.java("gateway", "Gateway", ["auth.TokenStore", "auth.Jwt"]),
+                          self.java("auth", "Jwt", ["core.Keys"]),
+                          self.java("core", "Keys", []))
+        got = {node["name"]: node["column"] for node in symbols.graph(chain)["nodes"]}
+        self.assertEqual(got, {"core": 0, "auth": 1, "gateway": 2})
+
+    def test_edges_point_at_what_a_module_needs_and_carry_a_file_count(self):
+        edges = symbols.graph(self.rows(self.java("web", "A", ["svc.One"]),
+                                        self.java("web", "B", ["svc.Two"]),
+                                        self.java("svc", "One", []),
+                                        self.java("svc", "Two", [])))["edges"]
+        self.assertEqual([(edge["from"], edge["to"], edge["count"]) for edge in edges],
+                         [("web", "svc", 2)])
+
+    def test_a_module_importing_its_own_sibling_is_not_an_edge(self):
+        got = symbols.graph(self.rows(self.java("svc", "One", ["svc.Two"]),
+                                      self.java("svc", "Two", [])))
+        self.assertEqual(got["edges"], [])
+        self.assertEqual([node["name"] for node in got["nodes"]], ["svc"])
+
+    def test_a_config_row_contributes_no_node_and_no_edge(self):
+        """A pom lists dependencies, but they are Maven's words about artifacts, not an import a file
+        made. Drawing it as an edge would put a library the code never named next to the modules."""
+        pom = symbols.config_row("shared/pom.xml", '<project><artifactId>shared</artifactId></project>')
+        code = self.java("svc", "One", ["shared.Helper"])
+        got = symbols.graph([code, pom])
+        self.assertNotIn("shared", [node["name"] for node in got["nodes"]])
+        self.assertEqual([edge["to"] for edge in got["edges"]], [])
+
+    def test_a_cycle_is_broken_at_one_node_and_said_out_loud(self):
+        """Two Maven modules that import each other have no longest path. The layering still finishes —
+        it breaks the loop somewhere — and the result says the column is approximate rather than letting
+        the picture imply an order the project does not have."""
+        pair = self.rows(self.java("left", "L", ["right.R"]), self.java("right", "R", ["left.L"]))
+        got = symbols.graph(pair)
+        self.assertTrue(got["cyclic"])
+        self.assertEqual(sorted(node["name"] for node in got["nodes"]), ["left", "right"])
+        self.assertEqual({node["column"] for node in got["nodes"]}, {0, 1})
+
+    def test_the_heaviest_modules_are_drawn_and_the_rest_are_counted(self):
+        rows = self.rows(*[self.java("m%02d" % i, "C%d" % i, []) for i in range(40)])
+        got = symbols.graph(rows)
+        self.assertLessEqual(len(got["nodes"]), symbols.MAX_GRAPH_NODES)
+        self.assertEqual(got["hidden"], 40 - len(got["nodes"]))
+
+    def test_a_dropped_module_takes_its_edges_with_it(self):
+        """An edge to a box that is not on the sheet would hang an arrow in empty space, and a module
+        left out but still pointed at reads as a dependency nobody has."""
+        rows = self.rows(self.java("big", "A", []), self.java("big", "B", []))
+        rows += self.rows(*[self.java("x%02d" % i, "C%d" % i, []) for i in range(symbols.MAX_GRAPH_NODES)])
+        rows.append(self.java("x99", "Late", ["big.A"]))
+        got = symbols.graph(rows)
+        drawn = {node["name"] for node in got["nodes"]}
+        for edge in got["edges"]:
+            self.assertIn(edge["from"], drawn)
+            self.assertIn(edge["to"], drawn)
+
+    def test_two_runs_of_the_same_index_draw_the_same_picture(self):
+        rows = self.rows(self.java("web", "A", ["svc.One"]), self.java("svc", "One", []),
+                         self.java("auth", "Two", ["svc.One"]))
+        first, second = symbols.graph(rows), symbols.graph(rows)
+        self.assertEqual(first, second)
+
+    def test_the_columns_the_sheet_is_sized_by_are_the_layers_plus_one(self):
+        got = symbols.graph(self.rows(self.java("a", "A", ["b.B"]), self.java("b", "B", []),
+                                      self.java("c", "C", ["d.D"]), self.java("d", "D", [])))
+        self.assertEqual(got["columns"], 2, "two independent chains, each two deep")
+        self.assertEqual(max(node["column"] for node in got["nodes"]), got["columns"] - 1)
+
+    def test_an_index_of_nothing_answers_with_an_empty_picture(self):
+        for rows in ([], None):
+            got = symbols.graph(rows)
+            self.assertEqual(got["nodes"], [])
+            self.assertFalse(got["cyclic"])
+
+
+class ConfigWorkspaceTests(unittest.TestCase):
+    """The same facts through the real gates, where a canary has to survive the walk, the read and the
+    render to reach a prompt -- and where a config file must not become a source."""
+
+    POM = ('<project xmlns="http://maven.apache.org/POM/4.0.0"><artifactId>auth-service</artifactId>'
+           "<dependencies><dependency><artifactId>common-lib</artifactId></dependency>"
+           "</dependencies></project>")
+    YML = ("server:\n  port: 8081\nspring:\n  application:\n    name: auth-service\n"
+           "  datasource:\n    password: SHOULD_NOT_APPEAR_4f7b2c\n    username: admin\n")
+
+    def setUp(self):
+        clear_index_cache()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.repo = Path(temp.name)
+        (self.repo / "auth-service/src/main/resources").mkdir(parents=True)
+        (self.repo / "auth-service/src/main/java/com/acme").mkdir(parents=True)
+        (self.repo / "auth-service/pom.xml").write_text(self.POM, encoding="utf-8")
+        (self.repo / "auth-service/src/main/resources/application.yml").write_text(
+            self.YML, encoding="utf-8")
+        (self.repo / "auth-service/src/main/java/com/acme/AuthService.java").write_text(
+            JAVA, encoding="utf-8")
+        self.ws = Workspace(self.repo)
+
+    def test_the_repo_map_carries_the_pom_and_the_runtime_facts(self):
+        text = self.ws.repo_map()
+        self.assertIn("artifact: auth-service", text)
+        self.assertIn("needs: common-lib", text)
+        self.assertIn("port: 8081", text)
+
+    def test_a_credential_in_a_config_file_never_reaches_the_map(self):
+        """The map is injected into every task without anyone asking for it and is copied into
+        `agent export-session`, so its facts are allow-listed rather than filtered after the fact.
+        A file the model reads on purpose is still its own verbatim bytes -- this is the boundary of
+        the automatic half, not of reading."""
+        self.assertNotIn("SHOULD_NOT_APPEAR_4f7b2c", self.ws.repo_map())
+        self.assertIn("SHOULD_NOT_APPEAR_4f7b2c", self.ws.read(
+            "auth-service/src/main/resources/application.yml")["content"])
+
+    def test_a_config_file_is_never_a_source_for_a_name_query(self):
+        """`register` is a Spring key in `application.yml` before it is a method anywhere, and a
+        reference search that spends its hits on configuration answers the wrong question."""
+        rows = self.ws.index()[1]
+        paths = [path for path, _ in self.ws.sources(rows)]
+        self.assertIn("auth-service/src/main/java/com/acme/AuthService.java", paths)
+        self.assertFalse([path for path in paths if path.endswith((".yml", ".pom", "pom.xml"))],
+                         paths)
+
+    def test_a_config_row_survives_a_restart_of_the_index(self):
+        files, rows = self.ws.index()
+        again = Workspace(self.repo).index()[1]
+        self.assertEqual([row.get("facts") for row in rows if row["kind"] == "config"],
+                         [row.get("facts") for row in again if row["kind"] == "config"])
+
+
 if __name__ == "__main__":
     unittest.main()

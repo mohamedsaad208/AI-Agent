@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, repair, setup
+from .. import config, git_integration, intent, labels, repair, runner, setup
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -95,6 +95,36 @@ FILES = [
     {"path": "src/main/java/com/demo/users/DuplicateEmailException.java", "before": None, "after": EXC},
 ]
 
+# The reasoning row, scripted. A thinking model answers twice and only one answer is the action, so the
+# preview needs the other half visible to be designed against: capped, redacted, and opened as its own
+# section rather than folded into the envelope.
+REASONING_SAMPLE = ("The register flow needs the email check before the token mint, so the typed error "
+                    "has to live outside the service or the controller cannot map it to 409.\n"
+                    "Adding a guard inside save() would leave the duplicate row half-written, so the "
+                    "check belongs at the top of register().\n"
+                    "The password is never in this file — the store hashes it, so nothing to redact here.")
+
+# The module graph, scripted. `show_graph` answers with this so the sheet, the column layout, the edge
+# widths and the caption's caveat clauses can all be reviewed in the preview window with no engine and no
+# folder attached. The back edge from `common-lib` to `auth` is deliberate: a shared library that imports
+# a service is the cycle this project's own dogfood target really has, and a graph that only ever draws a
+# clean tree never shows what it does when the layout cannot be exact.
+GRAPH_NODES = [
+    {"name": "common-lib", "files": 9, "column": 0},
+    {"name": "auth", "files": 6, "column": 1},
+    {"name": "users-service", "files": 12, "column": 2},
+    {"name": "api-gateway", "files": 5, "column": 3},
+]
+GRAPH_EDGES = [
+    {"from": "users-service", "to": "common-lib", "count": 6},
+    {"from": "auth", "to": "common-lib", "count": 4},
+    {"from": "api-gateway", "to": "users-service", "count": 3},
+    {"from": "users-service", "to": "auth", "count": 2},
+    {"from": "common-lib", "to": "auth", "count": 1},
+]
+GRAPH_COLUMNS = 4
+GRAPH_HIDDEN = 2
+
 # The state names and their tones come from labels.py rather than a copy of them here, because a
 # second table drifts: this one had no BLOCKED row and no DISCOVERING tone, so the two previews of
 # a blocked task disagreed with the real window.
@@ -121,6 +151,11 @@ class FakeController:
         self.busy = False
         self.cancellable = False
         self.chained = True
+        # The container switch is scripted as if this machine had Docker: on a machine without it the
+        # preview would show one frozen sentence, and the four answers are the thing to review here.
+        # The real window's `available` comes from `runner.sandbox_available()`.
+        self.sandbox_on = False
+        self.sandbox_image = ""
         self.composer = "chat"
         # The real window keys the composer placeholder and the auto-write note off this switch, so
         # the preview has to carry a live one or neither can be reviewed here.
@@ -210,6 +245,15 @@ class FakeController:
              "step": {"id": "st-3", "action": "search_code",
                       "fields": {"query": "existsByEmail", "count": 2},
                       "detail": labels.step_has_detail("search_code", {"count": 2})}},
+            {"role": "tool", "author": "Steps",
+             # Built through `labels` rather than typed out, because the preview is what a reviewer reads
+             # before approving a row's shape: a scripted sentence the engine could not produce reviews a
+             # fiction. The count is the record's own length so the two cannot disagree.
+             "text": labels.step_line(False, "model_reasoning", count=len(REASONING_SAMPLE),
+                                      detail=REASONING_SAMPLE),
+             "step": {"id": "st-r", "action": "model_reasoning",
+                      "fields": {"count": len(REASONING_SAMPLE), "detail": REASONING_SAMPLE},
+                      "detail": labels.step_has_detail("model_reasoning", {"detail": "x"})}},
             {"role": "tool", "author": "Steps",
              "text": "\u270d\ufe0f Proposed changes for 3 file(s): UserService.java, RegisterController.java, "
                      "DuplicateEmailException.java",
@@ -305,6 +349,9 @@ class FakeController:
             "runInfo": "No command has run yet." if not self.runs else
                        f"{self.runs} run(s). Last: Maven test — passed (exit 0, 41.2s)",
             "runWarning": labels.run_warning(arabic=False),
+            "sandbox": {"on": bool(self.sandbox_on), "image": self.sandbox_image, "available": True,
+                        "note": labels.note(runner.sandbox_state(self.sandbox_on,
+                                                                 self.sandbox_image, True))},
             # The loop's budget, from the same constant the real controller reads it from: a field the
             # preview never sends is a field the window is never drawn with.
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
@@ -327,8 +374,9 @@ class FakeController:
             # The preview is where a card like this gets reviewed, so it has to carry the same shape the
             # real controller sends — including the counts the header prints.
             "setup": {"show": self.setup_open, "rows": self.setup_rows,
-                      "counts": setup.counts(self.setup_rows), "demo": self.setup_demo,
-                      "busy": False},
+                      "counts": setup.counts(self.setup_rows),
+                      "tally": setup.tally(setup.counts(self.setup_rows)),
+                      "demo": self.setup_demo, "busy": False},
             "review": self._review(), "messages": self.messages, "log": self.log,
             "log_dropped": self.log_dropped, "log_note": "", "step_detail": self.step_detail,
             "projects": [{"key": "demo2", "name": "demo2", "initials": "d2",
@@ -553,6 +601,13 @@ class FakeController:
             self.queue_held = False
         elif type == "set_chained":
             self.chained = bool(payload.get("value"))
+        elif type == "sandbox":
+            # Both halves in one action, exactly as the real window sends them: the sentence under the
+            # box is the thing being reviewed, and it changes on the tick and on every keystroke.
+            if "on" in payload:
+                self.sandbox_on = bool(payload.get("on"))
+            if "image" in payload:
+                self.sandbox_image = str(payload.get("image") or "")
         elif type == "set_auto_apply":
             # The pill next to Send and the composer placeholder both key off this, so a preview
             # that ignored the click could not be used to review either of them.
@@ -636,14 +691,16 @@ class FakeController:
                                for item in self.setup_rows]
             self.setup_open = True
             emit({"kind": "state", "data": self.snapshot()})
-        elif type == "setup_show":
-            self.setup_open = True
         elif type == "setup_hide":
             # "Don't show this again" is a decision the preview has to be able to demonstrate, not only
             # the real window: the note under the button promises it stops appearing at launch.
             self.setup_open = False
         elif type == "step_detail":
             self.open_step(str(payload.get("id", "")))
+        elif type == "show_graph":
+            # The one scripted verb that answers with data rather than with an event: the sheet is drawn
+            # from the reply, so the preview has to hand back the same shape the real window does.
+            return self.open_graph()
         elif type in PREVIEW_ONLY:
             emit({"kind": "toast", "text": PREVIEW_ONLY[type]})
         else:
@@ -685,7 +742,15 @@ class FakeController:
                 emit({"kind": "status", "text": text})
             self.pending = "proposing changes…"
             emit({"kind": "status", "text": "Connecting to the model and preparing changes…"})
-            time.sleep(0.9)
+            # The envelope arriving in pieces, into Activity: what a reader watches during a long turn
+            # on a CPU model, and the same sink the real window streams a proposal turn to.
+            for fragment in ('{"action": "propose", "summary": "Guard the duplicate email",',
+                             '"changes": [{"path": "UserService.java"},',
+                             '{"path": "RegisterController.java"}]}'):
+                time.sleep(0.25)
+                emit({"kind": "log_chunk", "ts": _clock(), "text": fragment})
+            time.sleep(0.4)
+
             self.pending = None
             self.busy = self.cancellable = False
             self.state = "WAITING_APPROVAL"
@@ -715,11 +780,22 @@ class FakeController:
         emit({"kind": "message", "message": self.messages[-1]})
         reply = {"role": "assistant", "author": "AI Code Engineer", "time": _clock(),
                  "text": "The duplicate-email guard lives in `UserService.create()`, and it compares "
-                         "strings in two places that disagree about the field name. That is the whole "
-                         "of what I found; the fix would touch `UserService.java` and its test."}
-        self.messages.append(reply)
-        emit({"kind": "message", "message": reply})
-        emit({"kind": "state", "data": self.snapshot()})
+                         "strings in two places that disagree about the field name.\n"
+                         "That is the whole of what I found; the fix would touch `UserService.java` "
+                         "and its test."}
+        # Streamed the way the real window streams: whole lines, one at a time, into the bubble the
+        # client draws from whatever has arrived. This is the only place an answer landing piece by
+        # piece can be reviewed at the pace a person reads at. No `busy` claim — Read-only starts no
+        # job, and the preview has always had to show that.
+        def work():
+            for line in reply["text"].split("\n"):
+                time.sleep(0.35)
+                emit({"kind": "token", "ts": _clock(), "text": line})
+            self.messages.append(reply)
+            emit({"kind": "message", "message": reply})
+            emit({"kind": "state", "data": self.snapshot()})
+
+        threading.Thread(target=work, name="ui-fake-answer", daemon=True).start()
 
     def _confirm_then(self, type: str, emit) -> None:
         answer = self._ask("confirm", {"title": "Apply changes",
@@ -790,6 +866,18 @@ class FakeController:
         self.log.append(row)
         emit({"kind": "log", **row})
 
+    def open_graph(self) -> dict:
+        """The preview's copy of `controller.open_graph` — same shape, scripted contents.
+
+        The caption is written by `labels` here exactly as the real window writes it, so the sentence
+        under a reviewed graph is the sentence a real project gets.
+        """
+        return {"nodes": list(GRAPH_NODES), "edges": list(GRAPH_EDGES),
+                "columns": GRAPH_COLUMNS, "cyclic": True, "hidden": GRAPH_HIDDEN,
+                "caption": labels.graph_caption(
+                    False, nodes=len(GRAPH_NODES), edges=len(GRAPH_EDGES), cyclic=True,
+                    hidden=GRAPH_HIDDEN)}
+
     def open_step(self, step_id: str) -> None:
         """The preview's copy of `controller.open_step` — same block shape, scripted contents.
 
@@ -797,6 +885,10 @@ class FakeController:
         is reviewed in: a row that cannot be opened in the preview is a row nobody has ever seen open.
         """
         self.step_detail = None
+        if not step_id:
+            # The client's close is a fetch for the empty id, and the real window answers it by showing
+            # nothing. Answering it with "this step is not in the task" would review a different window.
+            return
         row = next(((m.get("step") or {}) for m in self.messages
                     if (m.get("step") or {}).get("id") == step_id), None)
         if not row:
@@ -826,6 +918,9 @@ class FakeController:
         elif action == "list_files":
             block["sections"] = [[labels.detail_section(False, "files"),
                                   ["%d file(s) in the folder" % int(fields.get("count") or 0)]]]
+        elif action == "model_reasoning":
+            block["sections"] = [[labels.detail_section(False, "reasoning"),
+                                  str(fields.get("detail") or "").splitlines()]]
         elif action == "read_file":
             block["sections"] = [[labels.detail_section(False, "read"),
                                   [str(fields.get("path", "")), "sha256 8f2a5c31"]]]

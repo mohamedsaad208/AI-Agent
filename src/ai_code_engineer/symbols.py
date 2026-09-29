@@ -480,6 +480,311 @@ def suffix_of(path: str) -> str:
     return "." + parts[-1] if len(parts) == 2 else ""
 
 
+# The files that say what a project *is* and how it runs. Not source, and not everything that is not
+# source: a map that listed every YAML file would be a file listing again. This is the short set a
+# model needs in order to know a reactor's modules, a service's port and a package's dependencies
+# without spending three of its twelve turns reading them.
+CONFIG_NAMES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+                "settings.gradle.kts", "package.json", "go.mod", "cargo.toml", "pyproject.toml"}
+CONFIG_PREFIXES = ("application", "bootstrap")
+CONFIG_SUFFIXES = {".yml", ".yaml", ".properties"}
+MAX_FACTS = 6
+MAX_FACT_CHARS = 160
+# A key's *name* decides whether its value may be shown. `server.port` is what a starting order needs;
+# `spring.datasource.password` is not, and a map that carried it would also carry it into
+# `agent export-session`, which is the one artefact that leaves the machine.
+# `user` is here because a leaf key can be allow-listed while the path above it is a credential store:
+# `spring.security.user.name` and `spring.security.user.password` both sit under a login.
+CREDENTIAL_KEY = re.compile(r"(?i)(pass(word|wd)?|secret|token|key|credential|cert(ificate)?|user)")
+# Matched against the whole dotted path, so a key only means what its owner says it means. A bare
+# `name` under `logging.file` is a log file, not the application, and a map that said otherwise would
+# be a wrong fact the model has no way to doubt.
+KEY_FACTS = {"port": "port", "server.port": "port", "management.server.port": "management port",
+             "name": "name", "application.name": "name", "spring.application.name": "name",
+             "artifactid": "artifact"}
+# The three leaves that say the same thing whoever owns them, so the flat `spring.datasource.url=…`
+# spelling of a properties file reads the same as the nested YAML one.
+LEAF_FACTS = {"port": "port", "defaultzone": "registry", "url": "host"}
+# A URL's authority, with the user and the password taken off the front of it. The leading group is
+# repeatable because JDBC nests its own scheme -- `jdbc:postgresql://user:pw@host:5432/db` is one of the
+# most common lines in a Spring project, and a single-scheme pattern read it as no host at all.
+URL_HOST = re.compile(r"^(?:[\w+.\-]+:)*//(?:[^@/]+@)?([\w.\-]+(?::\d+)?)")
+# The same authority with no scheme in front of it (`localhost:8761/eureka`). It cannot carry a user and
+# a password, because those need a scheme to sit after.
+BARE_HOST = re.compile(r"^([\w.\-]+(?::\d+)?)(?:[/?].*)?$")
+
+
+def noteworthy(path: str) -> bool:
+    """Whether this file's *facts* belong in the map, even though it is not code."""
+    name = str(path).rsplit("/", 1)[-1]
+    if name.casefold() in CONFIG_NAMES:
+        return True
+    folded = name.casefold()
+    suffix = "." + folded.rsplit(".", 1)[-1] if "." in folded else ""
+    return folded.startswith(CONFIG_PREFIXES) and suffix in CONFIG_SUFFIXES
+
+
+def _shorten(label: str, value: str) -> tuple[str, str] | None:
+    value = re.sub(r"\s+", " ", str(value)).strip()
+    if not value or CREDENTIAL_KEY.search(label):
+        return None
+    if len(value) > MAX_FACT_CHARS:
+        # A dependency list cut mid-token leaves a name the repository does not contain, and the model
+        # goes looking for it. Prefer the last whole entry, and say that the list continues. The marker
+        # is inside the cap, not after it: `render()` prints these verbatim, and a fact that ran four
+        # characters long would be the one thing in the map to exceed its own limit.
+        room = MAX_FACT_CHARS - 5
+        if (cut := value.rfind(", ", 0, room)) > 0:
+            return (label, value[:cut] + ", ...")
+        return (label, value[:room].rstrip() + " ...")
+    return (label, value)
+
+
+def _pom(source: str) -> list[tuple[str, str]]:
+    """Maven's own answers: what this module is, what it builds, and what it needs.
+
+    A `<!DOCTYPE` is refused outright rather than parsed. Python's ElementTree resolves no external
+    entities, but it still expands an internal DTD, and this file comes from a repository the tool was
+    asked to read, not from a build system it trusts — a few kilobytes of nested entities would cost
+    the whole task. Real POMs carry no DOCTYPE, so nothing is lost by the rule; `engine` refuses the
+    same shape when it checks a POM it is about to write.
+    """
+    import xml.etree.ElementTree as ET
+
+    if re.search(r"<!\s*DOCTYPE", source, re.I):
+        return []
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError:
+        return []
+    # Namespaces are removed from the parsed tree instead of from the text. Stripping the `xmlns…=`
+    # attributes with a regex was the first attempt and it failed on every real POM: a POM binds
+    # `xmlns:xsi` only to declare `xsi:schemaLocation`, so deleting the declaration leaves the
+    # attribute's prefix unbound and the parse dies before it starts.
+    for node in root.iter():
+        if isinstance(node.tag, str) and "}" in node.tag:
+            node.tag = node.tag.rsplit("}", 1)[-1]
+
+    def text(tag: str, node=None):
+        node = root if node is None else node
+        found = node.find(tag)
+        return found.text if found is not None and found.text else ""
+
+    facts = []
+    if (owner := root.find("parent")) is not None:
+        if named := _shorten("parent", text("artifactId", owner)):
+            facts.append(named)
+    if named := _shorten("artifact", text("artifactId")):
+        facts.append(named)
+    modules = [str(item.text).strip() for item in root.findall("modules/module")
+               if item.text and str(item.text).strip()]
+    if modules:
+        facts.append(("modules", ", ".join(modules[:12])))
+    deps = sorted({str(item.text).strip() for item in root.findall("dependencies/dependency/artifactId")
+                   if item.text and str(item.text).strip()})
+    if deps:
+        facts.append(("needs", ", ".join(deps[:12])))
+    return [fact for fact in (_shorten(label, value) for label, value in facts) if fact][:MAX_FACTS]
+
+
+GRADLE_DEP = re.compile(r"""(?:implementation|api|testImplementation|compileOnly|runtimeOnly|kapt|
+                             annotationProcessor|classpath)\s*\(?\s*["']([\w.\-]+:[\w.\-]+)""", re.X)
+GRADLE_INCLUDE = re.compile(r"""include\s+[\s,]*(['"]([\w.\-:]+)['"](?:\s*,\s*['"]([\w.\-:]+)['"])*)""")
+# A module's own siblings. `implementation project(':common-lib')` is the internal edge the map exists
+# to show, and it is spelled with no group and no version, so the coordinate pattern above cannot see it.
+GRADLE_PROJECT = re.compile(r"""project\s*\(\s*['"]:?([\w.\-]+)['"]""")
+PACKAGE_NAME = re.compile(r"""^\s*(?:(?:const|let|var)\s+)?rootProject\.name\s*=\s*['"]([\w.\-]+)""",
+                          re.M)
+
+
+def _gradle(source: str) -> list[tuple[str, str]]:
+    facts = []
+    if named := PACKAGE_NAME.search(source):
+        facts.append(("artifact", named.group(1)))
+    includes = set()
+    for match in GRADLE_INCLUDE.finditer(source):
+        for group in match.groups():
+            for piece in (group or "").split(","):
+                piece = piece.strip().strip("'\"").strip(":")
+                if piece:
+                    includes.add(piece)
+    if includes:
+        facts.append(("modules", ", ".join(sorted(includes)[:12])))
+    deps = sorted({match.group(1).split(":")[-2] if match.group(1).count(":") >= 2
+                   else match.group(1).split(":")[-1] for match in GRADLE_DEP.finditer(source)}
+                  | {match.group(1) for match in GRADLE_PROJECT.finditer(source)})
+    if deps:
+        facts.append(("needs", ", ".join(deps[:12])))
+    return [fact for fact in (_shorten(label, value) for label, value in facts) if fact][:MAX_FACTS]
+
+
+def _package_json(source: str) -> list[tuple[str, str]]:
+    import json
+
+    try:
+        data = json.loads(source)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    facts = []
+    if isinstance(data.get("name"), str):
+        facts.append(("artifact", data["name"]))
+    scripts = [key for key in ("build", "test", "start", "lint") if key in (data.get("scripts") or {})]
+    if scripts:
+        facts.append(("scripts", ", ".join(scripts)))
+    for bucket in ("dependencies", "devDependencies"):
+        keys = data.get(bucket)
+        if isinstance(keys, dict) and keys:
+            facts.append((("needs" if bucket == "dependencies" else "dev-needs"),
+                          ", ".join(sorted(keys)[:12])))
+    return [fact for fact in (_shorten(label, value) for label, value in facts) if fact][:MAX_FACTS]
+
+
+GO_MODULE = re.compile(r"^\s*module\s+(\S+)", re.M)
+GO_REQUIRE = re.compile(r"^\s*(?:require|use)\s+(\S+)")
+GO_BLOCK_ITEM = re.compile(r"^\s*(\S+)\s+\S")
+
+
+def _go_mod(source: str) -> list[tuple[str, str]]:
+    """The module this is and the modules it needs, in both of go.mod's two spellings.
+
+    A `require x v1` line and a `require ( x v1 )` block are the same statement written two ways, and
+    the block is the usual way for anything with more than a couple of dependencies -- reading only the
+    line form left a real project's manifest claiming it needed nothing.
+    """
+    facts = []
+    if named := GO_MODULE.search(source):
+        facts.append(("artifact", named.group(1)))
+    needs, block = set(), False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if block:
+            if stripped.startswith(")"):
+                block = False
+                continue
+            if (item := GO_BLOCK_ITEM.match(stripped)):
+                needs.add(item.group(1))
+            continue
+        match = GO_REQUIRE.match(line)
+        if not match:
+            continue
+        if match.group(1) == "(":
+            block = True
+            continue
+        needs.add(match.group(1))
+    keep = sorted(item for item in needs if "." in item)      # a host in front of the path, not stdlib
+    if keep:
+        facts.append(("needs", ", ".join(keep[:12])))
+    return [fact for fact in (_shorten(label, value) for label, value in facts) if fact][:MAX_FACTS]
+
+
+def _toml(source: str) -> list[tuple[str, str]]:
+    """Both TOML manifests this tool meets: PEP 621's `[project]` and Cargo's `[package]`.
+
+    They disagree in shape as well as in section name -- Python lists dependencies, Rust keys them --
+    so each half is read if it is there and the file simply has fewer facts if it is not.
+    """
+    import tomllib
+
+    try:
+        data = tomllib.loads(source)
+    except (ValueError, tomllib.TOMLDecodeError):
+        return []
+    tables = [data.get(key) for key in ("project", "package")
+              if isinstance(data.get(key), dict)]
+    facts = []
+    named = next((str(table["name"]) for table in tables if isinstance(table.get("name"), str)), "")
+    if named:
+        facts.append(("artifact", named))
+    needs: list[str] = []
+    for table in tables:
+        found = table.get("dependencies")
+        if isinstance(found, dict):
+            needs.extend(found.keys())
+        elif isinstance(found, list):
+            needs.extend(str(item) for item in found)
+    if isinstance(data.get("dependencies"), dict):
+        needs.extend(data["dependencies"].keys())
+    if needs:
+        names = sorted({str(item).split(";")[0].strip().split("[")[0].split("=")[0].split(">")[0]
+                        .split("<")[0].split("!")[0].strip() for item in needs if str(item).strip()})
+        names = [item for item in names if item]
+        if names:
+            facts.append(("needs", ", ".join(names[:12])))
+    return [fact for fact in (_shorten(label, value) for label, value in facts) if fact][:MAX_FACTS]
+
+
+# The separator is required and the value is not, because a parent line (`application:`) carries
+# nothing and still owns the keys under it -- without it in the stack every child resolves against the
+# last *valued* key, and `spring.application.name` arrives as `port.name`. `=` is accepted too: a
+# `.properties` file writes `server.port=8080`, its keys are already dotted and all sit at indent zero,
+# so one scan reads both dialects.
+YAML_PAIR = re.compile(r"^\s*([A-Za-z][\w.\-]*)\s*[=:](?:\s*(\S.*?))?\s*$")
+
+
+def _runtime_yml(source: str) -> list[tuple[str, str]]:
+    """A port, an application name, and the host a service registers with.
+
+    Line-oriented on purpose: YAML has no stdlib parser here, and the keys worth showing are the ones
+    that appear on their own line in every Spring Boot file this tool has been pointed at. A value is
+    only kept when its whole dotted key is on the allow-list, and a URL is reduced to its authority,
+    so the credential that fits inside the connection string never reaches the map.
+    """
+    facts = {}
+    stack: list[tuple[int, str]] = []
+    for line in source.splitlines():
+        match = YAML_PAIR.match(line)
+        if not match:
+            continue
+        key = match.group(1)
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, key))
+        # An inline comment is not part of the value; YAML only starts one after a space, so a `#` inside
+        # a URL fragment survives.
+        value = re.sub(r"\s+#.*$", "", (match.group(2) or "")).strip().strip("'\"")
+        if not value:
+            continue
+        path = ".".join(part for _, part in stack).casefold()
+        label = KEY_FACTS.get(path) or LEAF_FACTS.get(path.rsplit(".", 1)[-1])
+        if not label or CREDENTIAL_KEY.search(path):
+            continue
+        if label in ("registry", "host"):
+            host, plain = URL_HOST.match(value), BARE_HOST.match(value)
+            kept = (host or plain).group(1) if (host or plain) else ""
+            if kept:
+                facts.setdefault(label, kept)
+        elif len(value) <= 60:
+            facts.setdefault(label, value)
+    return [(label, value) for label, value in facts.items()][:MAX_FACTS]
+
+
+def config_facts(path: str, source: str) -> list[tuple[str, str]]:
+    """What a configuration file says about the project, with nothing secret in it.
+
+    Failures are silent by design: an unparseable pom is a map without that line, not a task that
+    cannot start. The values that survive are names and numbers — module, artifact, port, dependency —
+    and any key whose *name* looks like a credential is dropped before it is considered, because the
+    repository's own redaction cannot see a value that was never supposed to be in the prompt.
+    """
+    name = str(path).rsplit("/", 1)[-1].casefold()
+    if name == "pom.xml":
+        return _pom(source)
+    if name.startswith("build.gradle") or name.startswith("settings.gradle"):
+        return _gradle(source)
+    if name == "package.json":
+        return _package_json(source)
+    if name == "go.mod":
+        return _go_mod(source)
+    if name in ("cargo.toml", "pyproject.toml"):
+        return _toml(source)
+    return _runtime_yml(source)
+
+
 def indexable(path: str) -> bool:
     """Whether this file is worth reading at all for the map — checked before the read."""
     return suffix_of(path) in INDEXABLE
@@ -599,19 +904,353 @@ def spread(files: list[str]) -> list[str]:
     return ordered
 
 
-def render(rows: list[dict], files: list[str], limit: int = 12000, spread_files: bool = False) -> str:
-    """The repository map: every visible file, with its declarations under it."""
+MAX_GRAPH_NODES = 24        # modules on screen at once
+MAX_GRAPH_EDGES = 80        # lines between them
+MAX_GRAPH_DEPTH = 8         # columns; a cycle is clamped here rather than followed forever
+
+
+def graph(rows: list[dict]) -> dict:
+    """The project as modules and the dependencies between them, in columns by build order.
+
+    Files are the wrong unit for a picture: a reactor of a thousand files drawn as a thousand nodes is
+    a picture of nothing, and `module_of()` already names the folders a person thinks in. Edges carry a
+    count so a thick line is visibly a heavier dependency, and a node's column is the longest chain that
+    must be built before it -- the same order the run command starts the projects in.
+
+    A cycle has no longest path. The layering peels what it can, breaks the remainder at one named node,
+    and says `cyclic` in the result: a diagram that quietly re-ordered itself would be a diagram of a
+    project that does not exist, and a real cycle between two Maven modules is exactly the thing a
+    reader looks at a graph to find.
+    """
+    files: dict[str, int] = {}
+    for row in rows or []:
+        if row.get("kind") == "config":
+            continue                      # a pom is a fact about a module, not a dependency of one
+        name = module_of(row["path"])
+        files[name] = files.get(name, 0) + 1
+
+    counts: dict[tuple[str, str], int] = {}
+    for origin, targets in dependencies(rows or []).items():
+        source = module_of(origin)
+        for target in targets:
+            dest = module_of(target)
+            if dest != source:
+                counts[(source, dest)] = counts.get((source, dest), 0) + 1
+
+    # The heaviest modules are drawn; the rest are counted. A cap that dropped nodes in silence would
+    # turn a missing box into a claim that the module depends on nothing.
+    keep = sorted(files, key=lambda name: (-files[name], name))[:MAX_GRAPH_NODES]
+    live = set(keep)
+    edges = sorted(((pair, count) for pair, count in counts.items()
+                    if pair[0] in live and pair[1] in live),
+                   key=lambda item: (-item[1], item[0]))[:MAX_GRAPH_EDGES]
+    hidden = len(files) - len(live)
+
+    depends: dict[str, list[str]] = {}
+    names: set[str] = set(live)
+    for (source, dest), _count in edges:
+        depends.setdefault(source, []).append(dest)
+        names.update((source, dest))
+
+    # A node's column is one past the deepest thing it needs, so the columns read as a build order.
+    # Nodes are placed by peeling: everything with no unplaced dependency is at the front, and a graph
+    # where nothing is ready is a cycle -- broken at a fixed node, named in the result, because a
+    # diagram that silently re-ordered itself is a diagram of a project that does not exist.
+    placed: dict[str, int] = {}
+    remaining = set(names)
+    cyclic = False
+    while remaining:
+        ready = sorted(name for name in remaining
+                       if not set(depends.get(name, [])) & remaining)
+        if not ready:
+            cyclic = True
+            ready = [sorted(remaining, key=lambda item: (
+                -len(set(depends.get(item, [])) - remaining), item))[0]]
+        for name in ready:
+            # Only dependencies already placed count. Peeling guarantees that in an acyclic graph, and it
+            # is what makes the layering a build order; in the node chosen to break a cycle the unplaced
+            # dependency is the loop itself, and counting it would shift every column right by one to
+            # draw an empty first one.
+            deepest = max((placed[dep] for dep in depends.get(name, []) if dep in placed), default=-1)
+            placed[name] = min(MAX_GRAPH_DEPTH, deepest + 1)
+            remaining.discard(name)
+
+    return {"nodes": [{"name": name, "files": files.get(name, 0), "column": placed.get(name, 0)}
+                      for name in sorted(names, key=lambda item: (placed.get(item, 0), item))],
+            "edges": [{"from": source, "to": dest, "count": count}
+                      for (source, dest), count in edges],
+            "columns": max(placed.values(), default=0) + 1,
+            "cyclic": cyclic,
+            "hidden": max(0, hidden)}
+
+
+MAX_HITS = 40               # reference sites or symbol matches one query may return
+MAX_SITE_TEXT = 200         # characters of the line itself
+PER_FILE_LIMIT = 6          # sites from one file, so a 40-hit answer is not one file's grep
+
+# The line kinds a reference can be. The distinction is the whole value of the verb: `search_code`
+# already tells a model that a name appears 30 times, and what it cannot tell is which of those 30 is
+# the declaration, which is an import, and which is somebody calling it.
+IMPORT_LINE = re.compile(r"^\s*(?:from\s+[\w.]+\s+)?import\b|^\s*(?:use|using)\s|#include|^\s*require\s*\(",
+                         re.I)
+DECLARE_LINE = re.compile(
+    r"^\s*(?:@[\w.]+\s+)*(?:public|private|protected|internal|static|final|abstract|override|open|"
+    r"sealed|class|interface|enum|record|annotation|def|func|fn|type|impl|export|async|const|let|var|"
+    r"pub|local|friend|virtual|override)\b", re.I)
+
+
+def _member_name(signature: str) -> str:
+    """`login(String email)` out of a members list, which stores signatures not names."""
+    return signature.split("(", 1)[0].strip()
+
+
+def find_symbol(rows: list[dict], name: str, limit: int = MAX_HITS) -> list[dict]:
+    """Every declaration in the index whose name is this one.
+
+    Types come with the line the index recorded; functions and members do not, because the parsers keep
+    signatures and not one line number per member — a hit without a `line` is honest about that, and
+    `read_file` on the path is the next step rather than a guessed one.
+    """
+    needle = str(name or "").strip()
+    if not needle:
+        return []
+    folded = needle.casefold()
+    exact: list[dict] = []
+    partial: list[dict] = []
+
+    def collect(entry: dict, whole: bool) -> None:
+        (exact if whole else partial).append(entry)
+
+    for row in rows:
+        for item in row["types"]:
+            last = item["name"].rsplit(".", 1)[-1]
+            if folded not in last.casefold():
+                continue
+            entry = {"name": item["name"], "kind": item["kind"], "path": row["path"],
+                     "package": row["package"], "line": item["line"]}
+            if item.get("extends"):
+                entry["extends"] = ", ".join(item["extends"])
+            collect(entry, last.casefold() == folded)
+        for signature in row["functions"]:
+            member = _member_name(signature)
+            if folded not in member.casefold():
+                continue
+            collect({"name": member, "kind": "function", "path": row["path"],
+                     "package": row["package"], "signature": signature}, member.casefold() == folded)
+        for item in row["types"]:
+            for signature in item["members"]:
+                member = _member_name(signature)
+                if folded not in member.casefold():
+                    continue
+                collect({"name": member, "kind": "member", "path": row["path"],
+                         "package": row["package"], "in": item["name"], "signature": signature},
+                        member.casefold() == folded)
+    hits = exact + partial
+    return hits[:limit]
+
+
+def find_references(name: str, sources, rows: list[dict] | None = None,
+                    limit: int = MAX_HITS, per_file: int = PER_FILE_LIMIT) -> list[dict]:
+    """Where a name is used, and in what role — the reverse of the forward-only `dependencies()`.
+
+    `sources` is any iterable of `(path, text)` pairs, so the caller decides what to pay for: reading
+    the workspace is the same cost as a search, and `symbols` stays free of a workspace import that
+    would close a cycle. Text is matched in `blank()`ed source, which keeps every line where it was and
+    removes comments and string contents — without it a log message naming a class is reported as a
+    use of it, which is the exact mistake the parsers already had to be taught not to make.
+
+    The role is the answer, not the count: `declaration` (the index says this line declares it, or the
+    line opens with a keyword that only a declaration uses), then `import`, then `call`, then
+    `mention`. There is no type inference here and the verb does not claim otherwise — an overloaded
+    method returns every site of that name, and `read_file` on the two that matter is still cheaper
+    than a model guessing which file to open.
+    """
+    needle = str(name or "").strip()
+    if not needle:
+        return []
+    declared = {(hit["path"], hit.get("line")) for hit in find_symbol(rows or [], needle, limit=500)}
+    site = re.compile(r"(?<!\w)" + re.escape(needle) + r"(?!\w)")
+    call = re.compile(r"(?<!\w)" + re.escape(needle) + r"\s*\(")
+    out: list[dict] = []
+    for path, text in sources:
+        if len(out) >= limit:
+            break
+        clean = blank(text, backticks=path.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")))
+        counted = 0
+        for number, (raw, bare) in enumerate(zip(text.splitlines(), clean.splitlines()), 1):
+            if not site.search(bare):
+                continue
+            if (path, number) in declared:
+                kind = "declaration"
+            elif IMPORT_LINE.match(bare):
+                kind = "import"
+            elif DECLARE_LINE.match(bare) and site.search(bare):
+                kind = "declaration"
+            elif call.search(bare):
+                kind = "call"
+            else:
+                kind = "mention"
+            out.append({"path": path, "line": number, "kind": kind,
+                        "text": raw.strip()[:MAX_SITE_TEXT]})
+            counted += 1
+            if counted >= per_file or len(out) >= limit:
+                break
+    return out
+
+
+# Words a task says that name nothing. Deliberately tiny: this is not a search engine, and a list that
+# grows past the pronouns starts hiding the noun somebody meant. `add` was in here once and should not
+# have been -- it is one of the most common names in code (`add(a, b)`), so a task that says "fix add"
+# and means the function got nothing.
+STOP_WORDS = {"the", "and", "for", "with", "that", "this", "from", "into", "your", "please", "make",
+              "change", "fix", "file", "files", "code", "class", "method", "function", "test",
+              "tests", "when", "then", "them", "it", "to", "of", "in", "on", "is", "are", "do", "so",
+              "java", "py", "xml", "yml", "yaml", "json", "sql", "md", "gradle", "pom"}
+WORD = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]{2,}")
+CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]+|[a-z0-9]+")
+
+
+def task_words(task: str) -> set[str]:
+    """The names inside a sentence, including the parts of a camel-case or snake-case name.
+
+    "Wire the token provider into the login flow" has to reach `JwtTokenProvider.login`. The whole word
+    and each of its parts are both offered because a person writes one and the source is spelled the
+    other, and neither alone finds the pair.
+    """
+    words: set[str] = set()
+    for raw in WORD.findall(str(task or "")):
+        folded = raw.casefold()
+        if folded in STOP_WORDS:
+            continue
+        words.add(folded)
+        for piece in CAMEL.findall(raw):
+            piece = piece.casefold()
+            if len(piece) > 2 and piece not in STOP_WORDS:
+                words.add(piece)
+    return words
+
+
+def _name_parts(name: str) -> list[str]:
+    return [piece.casefold() for piece in CAMEL.findall(re.split(r"[(\s]", name)[0])]
+
+
+def rank(rows: list[dict], task: str, limit: int = 6) -> list[dict]:
+    """Which files the task is about, and the one-line reason each was picked.
+
+    The rule before this function was "keep a file whose exact name appears in the sentence", which
+    works when a person types `JwtTokenProvider.java` and does nothing when they describe the bug. This
+    scores the index instead: a declared name the task says, a part of such a name, the folder the task
+    names, and one hop along an import from any of those. It is still not understanding — it is a ranked
+    guess — which is why every entry carries the reason and the window prints it: an unexplained context
+    block is a claim the tool cannot defend when the wrong file turns up in the diff.
+    """
+    words = task_words(task)
+    if not words:
+        return []
+    edges = dependencies(rows)
+    reverse: dict[str, list[str]] = {}
+    for importer, imported in edges.items():
+        for target in imported:
+            reverse.setdefault(target, []).append(importer)
+    scores: dict[str, dict] = {}
+
+    def offer(path: str, score: int, why: str, symbol: str = "") -> None:
+        best = scores.get(path)
+        if best is None or score > best["score"]:
+            scores[path] = {"path": path, "score": score, "why": why, "symbol": symbol}
+        elif score == best["score"] and not best["symbol"] and symbol:
+            best["symbol"] = symbol
+
+    for row in rows:
+        path = row["path"]
+        # Rows carry forward-slash relative paths, which is what `module_of` splits on too, so the
+        # basename is a string operation here rather than a pathlib import this module never needed.
+        basename = path.rsplit("/", 1)[-1]
+        # The boundary test is the old rule kept verbatim: `app.py` in the sentence names `app.py`, and
+        # one written inside a longer word does not. Weakening it here would spend context on a file
+        # nobody asked for, which is the one thing this function is allowed to cost.
+        if re.search(r"(?<![\w.])" + re.escape(basename) + r"(?![\w.])", str(task or ""), re.I):
+            offer(path, 10, "names", basename)
+        for item in row["types"]:
+            name = item["name"].rsplit(".", 1)[-1]
+            whole = name.casefold()
+            parts = _name_parts(name)
+            if whole in words:
+                offer(path, 8, "declares", name)
+            elif (hit := next((word for word in parts if word in words), "")):
+                offer(path, 4, "declares", name)
+            for signature in item["members"]:
+                member = _member_name(signature)
+                if member.casefold() in words:
+                    offer(path, 7, "declares", member)
+                elif (hit := next((part for part in _name_parts(member) if part in words), "")):
+                    offer(path, 3, "defines", member)
+        for signature in row["functions"]:
+            member = _member_name(signature)
+            if member.casefold() in words:
+                offer(path, 7, "defines", member)
+            elif (hit := next((part for part in _name_parts(member) if part in words), "")):
+                offer(path, 3, "defines", member)
+        folder = module_of(path)
+        # A module folder is a name, spelled the way a class is: the task says "auth-service" and
+        # `task_words` splits it in two exactly as it splits a camel-case class. Comparing only the
+        # whole folder meant that every hyphenated module -- which is how a Spring reactor writes
+        # itself -- ranked nothing at all.
+        if folder != "." and (hit := next((word for word in [folder.casefold()] + _name_parts(folder)
+                                           if word in words), "")):
+            offer(path, 4, "module", hit)
+
+    for path, entry in list(scores.items()):
+        if entry["score"] < 4:
+            continue
+        for other in reverse.get(path, []):
+            offer(other, min(5, entry["score"] - 2), "imports",
+                  entry["symbol"] or path.rsplit("/", 1)[-1])
+
+    ordered = sorted(scores.values(), key=lambda entry: (-entry["score"], entry["path"]))
+    return ordered[:limit]
+
+
+def config_row(path: str, source: str) -> dict | None:
+    """The map's entry for a configuration file: facts, not declarations.
+
+    It is a row so `render()` prints it in the same block position as a source file, and it is a row
+    with no types and no functions so every name-based query in this module passes over it. A model
+    that learns `modules: auth-service, product-service` from a pom must not then be told the pom
+    "declares" auth-service — that is the confusion this split keeps out.
+    """
+    facts = config_facts(path, source)
+    if not facts:
+        return None
+    return {"path": path, "kind": "config", "package": "", "imports": [], "types": [],
+            "functions": [], "facts": facts}
+
+
+def render(rows: list[dict], files: list[str], limit: int = 12000, spread_files: bool = False,
+           note: str = "") -> str:
+    """The repository map: every visible file, with its declarations under it.
+
+    `note` goes on the first line, not the last: it says what the map does *not* contain, and a sentence
+    about missing files that is itself truncated off the bottom would be a worse answer than none.
+    """
     indexed = {row["path"]: row for row in rows}
     edges = dependencies(rows)
     if spread_files:
         files = spread(files)
     out: list[str] = []
-    used = 0
+    if note:
+        out.append(note)
+    used = len(note) + 1 if note else 0
     shown = 0
     for name in files:
         row = indexed.get(name)
         block = [name]
         if row:
+            # A configuration file's own lines: what it is, what it builds, what it needs. Printed under
+            # the path like a package line, because that is the position the model already reads
+            # structure from — a fact in prose elsewhere in the prompt is a fact it has to re-find.
+            for label, value in row.get("facts") or []:
+                block.append("  " + label + ": " + value)
             if row["package"]:
                 block.append("  package " + row["package"])
             for item in row["types"]:

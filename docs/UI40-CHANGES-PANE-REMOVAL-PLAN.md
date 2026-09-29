@@ -99,6 +99,9 @@ sets `.rail { display: none }`.
 move there means building a PanedWindow sidebar first. Recommendation: web-only this round, Tk as its own
 item, because the request came from the web window the user has been reading history in.
 
+*(That item, #28, is shipped — see "As built — the Tk twin" at the end of this file. It is not a rail and
+not a PanedWindow: Tk has no overlay, so the sheet's twin is a second window.)*
+
 ---
 
 ## Open decisions
@@ -135,3 +138,51 @@ Live check, read-only, on the real folder: history session opened, chip → shee
 `mvn -B test` verdict, `Apply off / Check syntax on / Roll back on` for a change already on disk, and
 `state.view` never left `task`. Closing the sheet had to be fixed to repaint the rail, or the dismissed
 preview stayed in the hidden rail's DOM and reappeared when the window widened.
+
+---
+
+## As built — the Tk twin (#28)
+
+Written while the desktop window still had three views. It shipped later, and the premise in the paragraph
+above — "the same move there means building a PanedWindow sidebar first" — was wrong in both directions:
+the window already has a fixed-width right-hand column (`sources`, the artifact card), so there **was** a
+rail to hang the entry on, and the viewer needed no layout work at all, because a sheet that has to be a
+second window does not care how the first one is divided. What the desktop version is:
+
+- **One `Toplevel`, built once and withdrawn.** `_review_page` packs the same widgets into
+  `self.review_window` instead of into a tab. Built once, not on demand: `display_session`, `clear_review`,
+  `show_change` and `update_buttons` all address those widgets whether or not anyone is looking at them, so
+  a viewer that existed only while open would turn every one of those writers into a `TclError` the first
+  time someone dismissed it.
+- **Closing is a withdraw, not a destroy.** `close_review()` is wired to both the title-bar X and Escape,
+  which is the web sheet's own exit (`modal()` binds Escape). Destroying the window would take the diff
+  views with it, and the next task would have nowhere to paint.
+- **Not `transient()`** — unlike a modal dialog, and unlike what I first wrote here. Measured on this
+  machine: a transient child of a withdrawn master cannot be mapped at all (`deiconify()` leaves
+  `state() == "withdrawn"`), and on a live desktop an owned window disappears when the main window is
+  minimised. A proposal you keep open while reading the pom beside it has to stay put, so it is a plain
+  top-level like the settings and checks windows.
+- **The title is the taskbar's only sentence.** A hidden window is not retitled when the state moves on
+  (`winfo_viewable()` gates the trace) and `open_review()` writes the live state on the way in, so the
+  window never comes back claiming a state it lost an hour ago.
+- **Two views left:** `("Activity", "details")` and `("Chat", "task")`. The word *Changes* survives where
+  it was always a sentence — the author label on the approval line — which is decision 5 of this spec,
+  unchanged.
+- **The chat says where Apply went**, in the web sheet's own words: `NOTE_TEMPLATES["review_here"]` is
+  shared by both windows now, so the line under a proposal names the viewer rather than a tab.
+
+`display_session`'s `select_tab=` keyword became `select=`, matching the controller's spelling: the keyword
+never selected a tab, it attached the session to the window.
+
+**6 new cases in `tests/test_gui.py`**: the page stack lost its third frame, a proposal raises the viewer
+and leaves the conversation on `task_tab`, closing hides without losing the session or the enabled Apply, a
+hidden viewer is not retitled, the approval line quotes the shared note, and the artifact card's button
+opens the viewer. The Tk suite drives a real interpreter with a withdrawn root, so `winfo_viewable()` is a
+measurement rather than a mock — which is also how the `transient()` trap was found. 1373 → 1379 tests,
+suite green.
+
+Looked at on the desktop as well: a scripted two-file proposal raised the viewer over the main window with
+`Modified / Added` in the file list and the bar reading `Roll back off / Check syntax off / Apply changes
+on` — the enablement the tab used to own, now on a window that can be moved beside the conversation instead
+of replacing it. (The diff text itself is asserted by `test_plan_review_approve_verify_and_rollback`, which
+reads the same widget; the capture had the new Setup-checks dialog sitting on half of it.)

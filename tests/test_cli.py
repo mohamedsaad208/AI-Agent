@@ -21,7 +21,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer.cli import doctor, main
+from ai_code_engineer import catalog, setup
+from ai_code_engineer.cli import doctor, main, parser, run_setup
 from ai_code_engineer.errors import AgentError
 from doubles import CALCULATOR_BAD, CALCULATOR_GOOD
 from helpers import sandbox_repo
@@ -39,7 +40,7 @@ api_key_env = "GROQ_API_KEY"
 [limits]
 max_turns = 4
 timeout_seconds = 30
-context_chars = 4000
+context_chars = 6000
 output_tokens = 1000
 """
 
@@ -134,7 +135,7 @@ class Commands(unittest.TestCase):
     # ------------------------------ doctor ------------------------------
     def test_doctor_reports_the_environment_it_found(self):
         models = [{"id": "qwen2.5-coder:1.5b", "cloud": False}, {"id": "deepseek-r1:70b", "cloud": True}]
-        with patch("ai_code_engineer.cli.ollama_models", return_value=models):
+        with patch("ai_code_engineer.catalog.models_for", return_value=(models, "live")):
             result = doctor()
         self.assertEqual(result["ollama"], "reachable")
         self.assertEqual(result["local_models"], ["qwen2.5-coder:1.5b"],
@@ -142,17 +143,33 @@ class Commands(unittest.TestCase):
         self.assertEqual(result["runtime_dependencies"], "standard library only")
 
     def test_doctor_survives_an_unreachable_ollama(self):
-        with patch("ai_code_engineer.cli.ollama_models", side_effect=AgentError("no service")):
+        with patch("ai_code_engineer.catalog.models_for", side_effect=AgentError("no service")):
             code, text = self.run_command(["doctor"])
         self.assertEqual(code, 0)
         self.assertIn('"ollama": "unreachable"', text)
 
     def test_doctor_never_prints_a_key_it_found(self):
-        with patch("ai_code_engineer.cli.ollama_models", side_effect=AgentError("no service")), \
+        with patch("ai_code_engineer.catalog.models_for", side_effect=AgentError("no service")), \
              patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-proj-a-real-looking-key-0123456789"}):
             _code, text = self.run_command(["doctor"])
         self.assertIn("openrouter_key_present", text)
         self.assertNotIn("sk-proj", text)
+
+    def test_doctor_and_the_first_run_audit_ask_the_provider_once_each(self):
+        """They read the same probe. Two reachability checks that can disagree is the whole bug."""
+        from ai_code_engineer import setup
+        calls = []
+
+        def counted(kind, endpoint="", api_key=None):
+            calls.append(kind.key)
+            return [{"id": "qwen2.5-coder:1.5b", "cloud": False}], "live"
+
+        with patch("ai_code_engineer.catalog.models_for", side_effect=counted):
+            result = doctor()
+            rows = setup.audit(provider="ollama", probe=True)
+        self.assertEqual(result["ollama"], "reachable")
+        self.assertEqual(setup.counts(rows)["bad"], 0)
+        self.assertEqual(calls, ["ollama", "ollama"], "each entry point asked, once")
 
     # ------------------------------ the demo ------------------------------
     def test_the_demo_command_runs_and_reports_zero(self):
@@ -273,6 +290,167 @@ class Commands(unittest.TestCase):
     def test_an_unknown_format_is_a_usage_error_not_a_default(self):
         code, text = self.usage_error(["export-session", "abc", "--format", "pdf"])
         self.assertEqual(code, 2)
+
+
+class FirstRunWizard(unittest.TestCase):
+    """`agent setup` driven from a script instead of a keyboard.
+
+    The wizard is the one command whose product is a set of questions, so the behaviour worth pinning
+    is what it does when nobody answers: a pipe gets a no and a line saying so, Ctrl-D is an empty
+    answer rather than a traceback, and `--yes` cannot invent a folder path. The provider is patched in
+    `setUp` because an audit that reached a real Ollama would make the exit code depend on whether this
+    machine happens to be running one.
+    """
+
+    LOCAL = {"id": "qwen2.5-coder:1.5b", "cloud": False}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.repo = sandbox_repo(self.temp.name)
+        self.reach = patch("ai_code_engineer.setup.reach",
+                           return_value=([self.LOCAL], catalog.LIVE, ""))
+        self.reach.start()
+        self.addCleanup(self.reach.stop)
+
+    def wizard(self, argv, answers=(), interactive=True):
+        args = parser().parse_args(["setup"] + argv)
+        left = list(answers)
+        asked = []
+
+        def ask(prompt):
+            asked.append(prompt)
+            if not left:
+                return ""
+            value = left.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = run_setup(args, ask=ask, interactive=interactive)
+        return code, out.getvalue(), asked
+
+    def patch_proof(self, result=None):
+        patcher = patch("ai_code_engineer.setup.run_demo",
+                        return_value=result or {"proposal_apply_rollback": "passed", "note": ""})
+        proof = patcher.start()
+        self.addCleanup(patcher.stop)
+        return proof
+
+    def test_the_wizard_is_a_command_and_not_a_fallthrough(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = main(["setup", "--repo", str(self.repo), "--yes", "--no-demo"])
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("blocking.", text)
+
+    def test_a_pipe_gets_a_no_and_a_line_saying_why(self):
+        """A wizard that waited on `input()` in a CI job is `apply` blocking on a pipe with a friendlier
+        name, so the refusal is printed and the run finishes."""
+        self.patch_proof()
+        code, text, asked = self.wizard(["--repo", str(self.repo)], interactive=False)
+        self.assertIsInstance(code, int)
+        self.assertIn("not an interactive terminal", text)
+        self.assertEqual(asked, [], "nothing was asked of a machine that cannot answer")
+
+    def test_yes_answers_every_offer_but_cannot_name_a_folder(self):
+        """The folder is the one question a yes is meaningless for, so the run says it checked nothing
+        against one rather than reporting a green project row it never read."""
+        self.patch_proof()
+        code, text, _ = self.wizard(["--yes"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("No folder named with --repo", text)
+        self.assertNotIn(f"{self.repo.name}:", text)
+
+    def test_the_proof_is_run_for_a_yes_and_never_for_no_demo(self):
+        proof = self.patch_proof()
+        self.wizard(["--repo", str(self.repo), "--yes"])
+        proof.assert_called_once()
+        proof.reset_mock()
+        self.wizard(["--repo", str(self.repo), "--yes", "--no-demo"])
+        proof.assert_not_called()
+
+    def test_declining_the_proof_leaves_the_demo_row_unrun(self):
+        proof = self.patch_proof()
+        code, text, _ = self.wizard(["--repo", str(self.repo)], answers=["n"])
+        proof.assert_not_called()
+        self.assertIn("The offline proof has not been run yet", text)
+        self.assertIsInstance(code, int)
+
+    def test_a_folder_typed_at_the_prompt_is_checked_against_the_command_it_answers_to(self):
+        _code, text, asked = self.wizard([], answers=["y", str(self.repo), "n", "n"])
+        self.assertIn("Project folder: ", asked)
+        self.assertIn(f"{self.repo.name}:", text, "the project row reprinted after the folder was named")
+
+    def test_an_empty_answer_to_the_folder_question_checks_nothing(self):
+        _code, text, asked = self.wizard([], answers=["y", "", "n", "n"])
+        self.assertIn("Project folder: ", asked)
+        self.assertIn("No folder named, so nothing was checked", text)
+
+    def test_a_folder_that_does_not_exist_blocks_the_run(self):
+        _code, text, _ = self.wizard([], answers=["y", str(Path(self.temp.name) / "gone"), "n", "n"])
+        self.assertIn("[x] ", text)
+
+    def test_the_promises_print_before_the_question_about_them(self):
+        """Asking someone to accept five lines they cannot see is a rubber stamp, so the order is the
+        contract. Checked by capturing what stdout held at the moment each question was asked."""
+        out = io.StringIO()
+        seen = []
+
+        def ask(prompt):
+            seen.append((prompt, out.getvalue()))
+            return "n"
+
+        args = parser().parse_args(["setup", "--repo", str(self.repo), "--no-demo"])
+        with redirect_stdout(out):
+            run_setup(args, ask=ask, interactive=True)
+        accept = [text for prompt, text in seen if prompt.startswith("Accept")]
+        self.assertTrue(accept, [prompt for prompt, _ in seen])
+        self.assertIn("(5)", accept[0], "the fifth promise had not printed when the run asked")
+        self.assertIn("(1) Nothing is written until you approve", out.getvalue())
+        self.assertLess(out.getvalue().index("(1)"), out.getvalue().index("Next, in the window"))
+
+    def test_declining_the_policy_still_runs_but_says_the_write_is_not_blessed(self):
+        self.patch_proof()
+        _code, text, _ = self.wizard(["--repo", str(self.repo), "--no-demo"], answers=["n"])
+        self.assertIn("The policy was not accepted", text)
+
+    def test_accepting_the_policy_prints_where_the_three_positions_are_set(self):
+        _code, text, _ = self.wizard(["--repo", str(self.repo), "--yes", "--no-demo"])
+        self.assertIn("Read-only", text)
+        self.assertIn("Auto-Apply is the switch on top of Change", text)
+        self.assertNotIn("The policy was not accepted", text)
+
+    def test_a_control_d_is_an_empty_answer_not_a_traceback(self):
+        self.patch_proof()
+        code, text, _ = self.wizard([], answers=[EOFError(), EOFError()])
+        self.assertIsInstance(code, int)
+        self.assertIn("No folder named", text)
+
+    def test_a_provider_that_does_not_answer_exits_nonzero(self):
+        """The exit code is the point a script can read: a red line is not a success that printed
+        nicely. `ollama serve` is the advice that has to reach the same stdout."""
+        with patch("ai_code_engineer.setup.reach", return_value=([], "", "connection refused")):
+            code, text, _ = self.wizard(["--repo", str(self.repo), "--yes", "--no-demo"])
+        self.assertEqual(code, 1)
+        self.assertIn("ollama serve", text)
+        self.assertIn("[x] ", text)
+
+    def test_arabic_rows_reach_the_terminal_as_arabic(self):
+        """Verified by code point, not by eye: a mangled literal looks like correct Arabic in a
+        terminal, and cp1252 replacement turns the whole run into question marks."""
+        self.patch_proof()
+        _code, text, _ = self.wizard(["--repo", str(self.repo), "--arabic", "--yes", "--no-demo"])
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in text), text[:200])
+        self.assertNotIn("\ufffd", text)
+        self.assertNotIn("The offline proof", text)
+        for char in text:
+            if ord(char) >= 128:
+                self.assertFalse(0x3040 <= ord(char) <= 0x30ff or 0x4e00 <= ord(char) <= 0x9fff,
+                                 f"U+{ord(char):04X} leaked into the Arabic run")
 
 
 if __name__ == "__main__":

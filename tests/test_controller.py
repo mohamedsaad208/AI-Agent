@@ -17,10 +17,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import git_integration, intent, memory, repair, runner
+from ai_code_engineer import git_integration, intent, labels, memory, repair, runner, setup
+from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
-from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController
+from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController, LineFeed
 from doubles import (CALCULATOR_BAD, CALCULATOR_GOOD, ChatModel, FREE_ENTRY, OLLAMA_ENTRY,
                      PROOF, ProposalModel, run_result)
 
@@ -170,7 +171,8 @@ class ControllerTests(unittest.TestCase):
         events = []
         self.controller._emit = events.append
 
-        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target=".",
+                     sandbox=""):
             progress("compiling AuthService.java")
             progress('password = "hunter2-secret-value"')
             progress("   ")
@@ -464,7 +466,8 @@ class ControllerTests(unittest.TestCase):
         self.controller.set_auto_apply(True)
         calls = []
 
-        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target=".",
+                     sandbox=""):
             calls.append(recipe)
             return run_result(proof=PROOF)
 
@@ -508,6 +511,73 @@ class ControllerTests(unittest.TestCase):
         return self.controller
 
     FAILING = run_result(status="failed", failures=["AssertionError: 3 != 4"])
+
+    # ------------------------------ the container switch ------------------------------
+    PINNED = "python@sha256:" + "a" * 64
+
+    def sandbox_row(self):
+        return self.controller.snapshot()["sandbox"]
+
+    def test_the_card_says_the_machine_has_no_docker_before_anything_is_asked(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=False):
+            row = self.sandbox_row()
+        self.assertFalse(row["available"])
+        self.assertFalse(row["on"])
+        self.assertEqual(row["note"], labels.NOTE_TEMPLATES["sandbox_missing"][0])
+
+    def test_a_tick_without_a_digest_is_answered_rather_than_run(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True):
+            self.controller.action("sandbox", {"on": True}, lambda _event: None)
+            self.assertEqual(self.sandbox_row()["note"], labels.NOTE_TEMPLATES["sandbox_unpinned"][0])
+            self.controller.action("sandbox", {"image": self.PINNED}, lambda _event: None)
+            row = self.sandbox_row()
+        self.assertEqual(row["note"], labels.NOTE_TEMPLATES["sandbox_on"][0])
+        self.assertEqual(row["image"], self.PINNED)
+
+    def test_the_image_reaches_the_command_only_while_the_switch_is_on(self):
+        seen = []
+
+        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target=".",
+                     sandbox=""):
+            seen.append(sandbox)
+            return run_result(proof=PROOF, sandbox={"image": sandbox, "container": "ai-agent-1"}
+                              if sandbox else None)
+
+        self.controller.session = {"root": str(self.repo), "state": "APPLIED_UNVERIFIED"}
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True), \
+                patch("ai_code_engineer.runner.run", side_effect=fake_run):
+            self.controller.action("sandbox", {"on": True, "image": self.PINNED},
+                                   lambda _event: None)
+            self.controller.run_tests(False)
+            self.controller.join()
+            self.assertEqual(seen, [self.PINNED])
+            self.assertIn("Docker", self.controller.snapshot()["status"],
+                          "the running line says where the build is happening")
+            self.controller.sandbox_on = False
+            self.controller.run_tests(False)
+            self.controller.join()
+        self.assertEqual(seen, [self.PINNED, ""], "unticking the box has to stop the container run")
+
+    def test_the_container_choice_survives_a_restart(self):
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True):
+            self.controller.action("sandbox", {"on": True, "image": self.PINNED},
+                                   lambda _event: None)
+        reopened = self.build()
+        self.assertTrue(reopened.sandbox_on)
+        self.assertEqual(reopened.sandbox_image, self.PINNED)
+
+    def test_the_record_keeps_the_image_the_green_came_from(self):
+        self.controller.session = {"root": str(self.repo), "state": "APPLIED_UNVERIFIED"}
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True), \
+                patch("ai_code_engineer.runner.run",
+                      return_value=run_result("passed", proof=PROOF,
+                                              sandbox={"image": self.PINNED,
+                                                       "container": "ai-agent-1"})):
+            self.controller.action("sandbox", {"on": True, "image": self.PINNED},
+                                   lambda _event: None)
+            self.controller.run_tests(False)
+            self.controller.join()
+        self.assertIn("in Docker", self.controller.snapshot()["runInfo"])
 
     def test_a_failed_run_asks_before_spending_a_fix_round(self):
         controller = self.applied_controller()
@@ -682,7 +752,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.snapshot()["target"], "product-service")
         seen = {}
 
-        def record(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+        def record(repo, recipe, timeout=60, progress=lambda _line: None, target=".",
+                   sandbox=""):
             seen["target"] = target
             return run_result()
 
@@ -702,7 +773,8 @@ class ControllerTests(unittest.TestCase):
         controller.session = {"root": str(self.repo), "state": "APPLIED_UNVERIFIED"}
         seen = {}
 
-        def record(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+        def record(repo, recipe, timeout=60, progress=lambda _line: None, target=".",
+                   sandbox=""):
             seen["target"] = target
             seen["repo"] = repo
             return run_result()
@@ -2123,6 +2195,20 @@ class ReadOnlyModeTests(unittest.TestCase):
                          "the question names the exact command it is asking about")
         self.assertIn(intent.run_declined(), self.controller.snapshot()["status"])
 
+    def test_the_question_about_a_command_says_it_will_run_in_the_container(self):
+        """The read-only mode asks once per command and names it. Naming the command but not its
+        environment would be answering a different question than the one being asked."""
+        self.read()
+        with patch("ai_code_engineer.runner.sandbox_available", return_value=True):
+            self.controller.action("sandbox", {"on": True, "image": "python@sha256:" + "a" * 64},
+                                   lambda _event: None)
+        self.controller.answers["confirm"] = False
+        with patch("ai_code_engineer.runner.run", return_value=run_result()) as ran:
+            self.controller.run_tests(False)
+            self.controller.join()
+        self.assertEqual(ran.call_count, 0)
+        self.assertIn("in Docker", self.controller.asked[-1]["message"])
+
     def test_a_command_the_operator_approved_runs_and_writes_nothing(self):
         window = Scripted(self.app_dir, {"confirm": True})
         window.catalogs["Ollama"] = [OLLAMA_ENTRY]
@@ -2148,6 +2234,169 @@ class ReadOnlyModeTests(unittest.TestCase):
         second.set_repo(str(self.repo))
         self.assertEqual(second.composer, "read")
         self.assertFalse(second.auto_apply, "and the write switch is still off with it")
+
+
+class TheFirstRunCard(unittest.TestCase):
+    """Phase-3 item 7: the first-run checks as a card in the web window.
+
+    The rows come from `setup`, so these tests hold the surface's own two promises and one bug the
+    design invites. Opening the window must not ask anything over the network — the card is built with
+    `probe=False`, and only the Check button probes. And "Don't show this again" has to outlive the
+    next save of anything else, which it would not have: `_save_state` rebuilds its preference dict
+    from named keys, so a flag nobody lists there is erased by the next unrelated write.
+    """
+
+    LOCAL = {"id": "qwen2.5-coder:1.5b", "cloud": False}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name)
+        self.repo = sandbox_repo(self.app_dir)
+        patcher = patched_catalog()
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.events = []
+        self.made = []
+        self.addCleanup(self._drain)
+        self.reach = patch("ai_code_engineer.setup.reach",
+                           side_effect=AssertionError("a snapshot probed the provider"))
+        self.reach.start()
+        self.addCleanup(self.reach.stop)
+        self.controller = self.build()
+
+    def build(self):
+        controller = Scripted(self.app_dir)
+        controller._emit = self.events.append
+        self.made.append(controller)
+        return controller
+
+    def _drain(self):
+        for controller in self.made:
+            controller.cancel_event.set()
+            controller.join(timeout=10)
+
+    def card(self, controller=None):
+        return (controller or self.controller).snapshot()["setup"]
+
+    def rows(self, controller=None):
+        return {row["id"]: row for row in self.card(controller)["rows"]}
+
+    def action(self, type, **payload):
+        self.controller.action(type, payload, self.events.append)
+        self.controller.join()
+        return self.card()
+
+    def said(self, controller=None):
+        """The sentence the server wrote last. `say()` lands on the status line, not in the chat, so a
+        card sentence is read here rather than from `messages`."""
+        return (controller or self.controller).status
+
+    # ------------------------------- whether it shows -------------------------------
+    def test_a_machine_that_has_never_granted_a_folder_opens_with_the_card(self):
+        self.assertTrue(self.card()["show"])
+        self.assertEqual([row["id"] for row in self.card()["rows"]],
+                         ["runtime", "toolchain", "provider", "model", "project", "demo", "policy",
+                          "position"])
+
+    def test_a_machine_that_has_a_granted_folder_does_not_show_it(self):
+        self.controller.set_repo(str(self.repo))
+        self.controller.close()
+        second = self.build()
+        self.assertFalse(second.snapshot()["setup"]["show"],
+                         "a person with projects listed does not want a wizard")
+
+    def test_a_machine_that_already_dismissed_it_does_not_show_it_again(self):
+        self.action("setup_hide")
+        self.controller.close()
+        self.assertFalse(self.build().snapshot()["setup"]["show"])
+
+    # ------------------------------- what it costs to open -------------------------------
+    def test_opening_the_window_asks_nothing_over_the_network(self):
+        """`setUp`'s `reach` raises on purpose: the proof of this test is that the card still builds."""
+        for _ in range(3):
+            self.card()
+        self.assertEqual(self.rows()["provider"]["status"], "info")
+        self.assertEqual(self.rows()["model"]["status"], "info")
+        self.assertEqual(self.rows()["demo"]["status"], "info")
+
+    def test_the_rows_are_computed_once_and_a_snapshot_does_not_rebuild_them(self):
+        with patch("ai_code_engineer.setup.audit", wraps=setup.audit) as counted:
+            for _ in range(4):
+                self.card()
+        self.assertEqual(counted.call_count, 1, "the card re-ran its own audit per snapshot")
+
+    def test_the_check_button_is_the_one_click_that_asks_the_provider(self):
+        with patch("ai_code_engineer.setup.reach",
+                   return_value=([self.LOCAL], "live", "")) as probed:
+            card = self.action("setup_check")
+        self.assertEqual(probed.call_count, 1)
+        by_id = {row["id"]: row for row in card["rows"]}
+        self.assertEqual(by_id["provider"]["status"], "ok")
+        self.assertEqual(by_id["model"]["status"], "ok")
+        self.assertTrue(card["show"], "the checks reopen the card they just refreshed")
+
+    def test_a_blocked_check_reports_the_tally_rather_than_a_colour(self):
+        patcher = patch("ai_code_engineer.setup.reach", return_value=([], "live", "connection refused"))
+        with patcher:
+            self.action("setup_check")
+        self.assertIn("blocking", self.said())
+        self.assertEqual(self.rows()["provider"]["status"], "bad")
+
+    def test_the_card_never_carries_the_key_it_was_handed(self):
+        self.controller.key = "sk-synthetic-secret-for-tests"
+        patcher = patch("ai_code_engineer.setup.reach", return_value=([self.LOCAL], "live", ""))
+        with patcher:
+            self.action("setup_check")
+        self.assertNotIn("sk-synthetic-secret", json.dumps(self.controller.snapshot()))
+
+    # ------------------------------- the proof -------------------------------
+    def test_the_offline_proof_replaces_only_the_row_it_proves(self):
+        result = {"proposal_apply_rollback": "passed", "note": "", "llm_used": False}
+        with patch("ai_code_engineer.setup.run_demo", return_value=result):
+            card = self.action("setup_demo")
+        by_id = {row["id"]: row for row in card["rows"]}
+        self.assertEqual(by_id["demo"]["status"], "ok")
+        self.assertEqual(by_id["provider"]["status"], "info", "the proof is not a re-check")
+        self.assertEqual(card["demo"], result)
+        self.assertIn("proof held", self.said())
+
+    def test_a_proof_that_did_not_complete_is_said_as_one(self):
+        with patch("ai_code_engineer.setup.run_demo",
+                   return_value={"proposal_apply_rollback": "failed", "note": "rollback did not hold"}):
+            self.action("setup_demo")
+        self.assertEqual(self.rows()["demo"]["status"], "bad")
+        self.assertIn("rollback did not hold", self.said())
+
+    # ------------------------------- dismissing it -------------------------------
+    def test_hiding_the_card_survives_the_next_unrelated_save(self):
+        self.action("setup_hide")
+        self.controller.set_pref("theme", "dark")
+        self.controller.close()
+        second = self.build()
+        self.assertFalse(second.snapshot()["setup"]["show"])
+        registry = json.loads((self.app_dir / ".agent-projects.json").read_text(encoding="utf-8"))
+        self.assertTrue(registry["ui"]["setup_seen"])
+
+    def test_the_way_back_is_the_click_that_rechecks(self):
+        """There is no bare "show it again": the only route back to the card is the Settings entry that
+        says it will ask this machine, so re-opening and re-checking are one honest click."""
+        self.action("setup_hide")
+        self.assertFalse(self.card()["show"])
+        with patch("ai_code_engineer.setup.reach", return_value=([self.LOCAL], "live", "")):
+            card = self.action("setup_check")
+        self.assertTrue(card["show"])
+        self.assertEqual(len(card["rows"]), 8)
+        self.assertEqual({row["id"]: row["status"] for row in card["rows"]}["provider"], "ok")
+
+    def test_a_hidden_card_still_answers_the_shape_the_front_end_reads(self):
+        """The client reads `setup.rows` and `setup.counts` on every snapshot, so the keys have to be
+        there even when the card is off — a missing key is a blank dock, not a hidden one."""
+        self.action("setup_hide")
+        card = self.card()
+        self.assertEqual(set(card), {"show", "rows", "counts", "tally", "demo", "busy"})
+        self.assertFalse(card["show"])
+        self.assertEqual(sum(card["counts"].values()), len(card["rows"]))
 
 
 class BlockApplyTests(unittest.TestCase):
@@ -2648,6 +2897,7 @@ class TheActivityFeed(unittest.TestCase):
         self.controller.start_plan("Fix add in calculator.py")
         self.controller.join()
         self.assertEqual(self.steps(), [
+            "\U0001f3af Chose 1 file(s) for this task: calculator.py (the task names this file)",
             "\U0001f4d6 Reading file: calculator.py",
             "\U0001f50d Searching code: def add",
             "\u270d\ufe0f Proposed changes for 1 file(s): calculator.py"],
@@ -2658,7 +2908,7 @@ class TheActivityFeed(unittest.TestCase):
         self.controller.join()
         said = self.steps()
         self.assertTrue(said, "the Arabic task announced nothing")
-        self.assertIn("قراءة الملف", said[0])
+        self.assertIn("قراءة الملف", " ".join(said))
         self.assertNotIn("Reading file", " ".join(said))
 
     def test_the_snapshot_carries_the_activity_line_and_the_outcome_replaces_it(self):
@@ -2799,11 +3049,16 @@ class TheStepRows(unittest.TestCase):
         self.controller.start_plan("Fix add in calculator.py")
         self.controller.join()
         rows = self.step_rows()
-        self.assertEqual([row["action"] for row in rows], ["read_file", "search_code", "propose"])
+        self.assertEqual([row["action"] for row in rows],
+                         ["context_files", "read_file", "search_code", "propose"])
         self.assertEqual(len({row["id"] for row in rows}), len(rows), "two rows share a handle")
         self.assertTrue(all("detail" in row for row in rows))
-        self.assertTrue(rows[0]["detail"], "the read row knows which version of the file it saw")
-        self.assertTrue(rows[2]["detail"], "a proposal always has its file list behind it")
+        by_action = {row["action"]: row for row in rows}
+        self.assertTrue(by_action["read_file"]["detail"],
+                        "the read row knows which version of the file it saw")
+        self.assertTrue(by_action["propose"]["detail"], "a proposal always has its file list behind it")
+        self.assertFalse(by_action["context_files"]["detail"],
+                         "the choice line is the tool's own sentence, with nothing stored behind it")
 
     def test_a_step_is_recorded_so_the_row_survives_reopening_the_task(self):
         self.controller.start_plan("Fix add in calculator.py")
@@ -2898,6 +3153,274 @@ class TheStepRows(unittest.TestCase):
         self.assertLessEqual(len(state["log"]), MAX_LOG_ENTRIES)
         self.assertGreater(state["log_dropped"], 0)
         self.assertTrue(state["log_note"])
+
+
+class ThinkingModel(SteppingModel):
+    """The same four turns, plus the deliberation a reasoning model returns beside its answer."""
+
+    THOUGHTS = ("", "It adds two numbers, so the bug is in the operator.\nNot in the return type.",
+                "", "A search before the second read would have saved a turn.")
+
+    def __init__(self):
+        super().__init__()
+        self.reasoning = ""
+
+    def generate(self, messages, json_mode=True):
+        self.reasoning = self.THOUGHTS[min(self.turn, len(self.THOUGHTS) - 1)]
+        return super().generate(messages, json_mode=json_mode)
+
+
+class TheLineFeedThatWaitsForAKey(unittest.TestCase):
+    """The buffer between a model's fragments and the browser: whole lines out, or nothing.
+
+    Redaction reads a line. A key that arrives as ``sk-`` and then ``abcdefgh`` is a key that neither
+    piece shows to the pattern, so the fragments are reassembled before anything is scrubbed — which
+    is the one way a stream cannot leak what the buffered reply already could not.
+    """
+
+    def collected(self, cap=500):
+        said = []
+        return said, LineFeed(said.append, cap=cap)
+
+    def test_a_line_is_handed_on_when_it_ends_and_not_before(self):
+        said, feed = self.collected()
+        feed.feed("two ")
+        feed.feed("numbers, ")
+        self.assertEqual(said, [], "a partial line is not yet something the redactor can read")
+        feed.feed("added.")
+        feed.close()
+        self.assertEqual(said, ["two numbers, added."])
+
+    def test_the_pieces_are_joined_into_the_line_the_sink_will_read(self):
+        """Redaction belongs to the sink and reassembly belongs here, and this is why the order matters.
+
+        A key that arrives as two fragments is invisible to the pattern in either of them. The buffer's
+        job is to make the whole line exist before anything looks at it; `controller._token`'s job is
+        then to scrub and cap exactly that line — which is what the window test above proves.
+        """
+        said, feed = self.collected()
+        feed.feed("call it with sk-or-vl-")
+        feed.feed("abcdefghijklmnopqrstuvwxyz1234")
+        feed.feed(" done")
+        feed.close()
+        self.assertEqual(said, ["call it with sk-or-vl-abcdefghijklmnopqrstuvwxyz1234 done"])
+
+    def test_a_model_that_never_breaks_a_line_is_flushed_whole_rather_than_cut(self):
+        """The overflow exists so a wall of text still arrives, but it is not allowed to slice a line
+        in half on the way: half a credential is one the sink's redactor cannot see, so the whole
+        buffer goes at once and the sink's own cap is what trims it for display."""
+        said, feed = self.collected(cap=40)
+        feed.feed("x" * 120)
+        self.assertEqual(said, ["x" * 120])
+        feed.feed("y" * 50)
+        feed.close()
+        self.assertEqual(said, ["x" * 120, "y" * 50])
+
+    def test_an_empty_answer_says_nothing(self):
+        said, feed = self.collected()
+        feed.feed("")
+        feed.close()
+        self.assertEqual(said, [])
+
+
+class StreamingModel:
+    """A model that answers in pieces and says so, the way both real providers do."""
+
+    model = "test-local"
+    supports_stream = True
+
+    def __init__(self, pieces=("The guard ", "lives in create().", ""), envelope=None):
+        self.pieces, self.envelope = list(pieces), envelope or {
+            "action": "propose", "summary": "Fix add", "checks": ["unit tests"],
+            "changes": [{"path": "calculator.py", "content": CALCULATOR_GOOD}]}
+        self.asked = []
+
+    def generate(self, messages, json_mode=True, on_token=None):
+        self.asked.append(on_token is not None)
+        for piece in self.pieces:
+            if on_token is not None:
+                on_token(piece)
+        if not json_mode:
+            return "".join(self.pieces)
+        return json.dumps(self.envelope)
+
+
+class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
+    """Phase 3 on the surface: the reply is streamed for the reader, and stored from the provider.
+
+    Three separate guarantees, and each one is a way a stream could be worse than the blocking call
+    it replaces: the browser must not see a half-line the redactor could not read, the transcript must
+    hold the assembled answer rather than whatever arrived, and a model that cannot stream must not be
+    asked to.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name)
+        self.repo = sandbox_repo(self.app_dir)
+        self.events = []
+
+    def wire(self, provider):
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=provider),
+                        patched_catalog()):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        controller = Scripted(self.app_dir)
+        controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        controller.model = "test-local"
+        controller.set_repo(str(self.repo))
+        controller._emit = self.events.append
+        self.addCleanup(controller.close)
+        return controller
+
+    def tokens(self):
+        return [event["text"] for event in self.events if event["kind"] == "token"]
+
+    def test_the_answer_reaches_the_browser_line_by_line_before_it_is_stored(self):
+        controller = self.wire(StreamingModel())
+        controller.start_chat("what does the guard do?", Settings(), False, False, None)
+        controller.join()
+        self.assertEqual(self.tokens(), ["The guard lives in create()."])
+        said = [message["text"] for message in controller.snapshot()["messages"]
+                if message["role"] == "assistant"]
+        self.assertEqual(said[-1], "The guard lives in create().",
+                         "the stored reply is the assembled one, not the frames")
+
+    def test_a_credential_split_across_frames_is_scrubbed_before_either_is_shown(self):
+        """The channel is scrubbed and the transcript is not, and the two are meant to differ.
+
+        Every fragment flies over an SSE connection a browser extension can read, so the ephemeral
+        copy is redacted line by line. The finished answer is stored as the model wrote it, because a
+        chat is the product: scrubbing the text the user asked for would answer a different question.
+        """
+        controller = self.wire(StreamingModel(pieces=("password = hunt", "er2hunter2 ok", "")))
+        controller.start_chat("q", Settings(), False, False, None)
+        controller.join()
+        self.assertEqual(self.tokens(), ["password = [redacted] ok"])
+        streamed = json.dumps([event for event in self.events if event["kind"] == "token"])
+        self.assertNotIn("hunter2hunter2", streamed)
+
+    def test_a_model_that_cannot_stream_is_asked_in_the_way_it_answers(self):
+        plain = ChatModel()
+        self.assertFalse(getattr(plain, "supports_stream", False), "the double must stay unstreamable")
+        controller = self.wire(plain)
+        controller.start_chat("q", Settings(), False, False, None)
+        controller.join()
+        self.assertEqual(self.tokens(), [], "no listener was built for a model that cannot feed one")
+        self.assertTrue([message for message in controller.snapshot()["messages"]
+                         if message["role"] == "assistant"], "and the answer still landed")
+
+    def test_a_proposal_turn_streams_into_activity_and_still_lands_a_proposal(self):
+        controller = self.wire(StreamingModel(pieces=('{"action": "pro', 'pose", ...}', ""),
+                                             envelope={"action": "list_files"}))
+        controller.start_plan("Fix add in calculator.py")
+        controller.join()
+        chunks = [event["text"] for event in self.events if event["kind"] == "log_chunk"]
+        self.assertIn('{"action": "pro', "".join(chunks),
+                      "the model's own writing is what the reader is watching for")
+
+    def test_a_cancelled_job_stops_streaming_but_keeps_the_promise(self):
+        """The answer may be half-shown; the transcript is only ever written when the model finished."""
+        controller = self.wire(StreamingModel())
+        controller.start_chat("q", Settings(), False, False, None)
+        controller.join()
+        self.assertTrue(controller.snapshot()["messages"])
+
+
+class TheThoughtRowInAWindow(unittest.TestCase):
+    """UI 4.2 phase 2, on the surface: the thinking arrives as a row the reader can open.
+
+    The window is where this either pays or costs. A row that dumps 1 200 characters of chain of
+    thought into the thread is the cost, so the line carries one previewed sentence and the whole text
+    stays behind the chevron, fetched like every other detail. A turn that thought nothing adds no
+    row — the thread is read for what happened.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name)
+        self.repo = sandbox_repo(self.app_dir)
+        self.model = ThinkingModel()
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
+                        patched_catalog()):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(self.app_dir)
+        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        self.controller.model = "test-local"
+        self.controller.set_repo(str(self.repo))
+        self.addCleanup(self.controller.close)
+        self.events: list[dict] = []
+
+    def step_rows(self):
+        return [(message.get("step") or {}) for message in self.controller.snapshot()["messages"]
+                if message.get("step")]
+
+    def send(self, task="Fix add in calculator.py"):
+        self.controller.start_plan(task)
+        self.controller.join()
+
+    def test_only_the_turns_that_thought_get_a_row(self):
+        self.send()
+        rows = [row for row in self.step_rows() if row["action"] == "model_reasoning"]
+        self.assertEqual(len(rows), 2, "two of the four replies carried a thought")
+        self.assertTrue(all(row["detail"] for row in rows), "each has something behind it")
+
+    def test_the_line_previews_one_sentence_and_the_row_holds_both(self):
+        self.send()
+        rows = [row for row in self.step_rows() if row["action"] == "model_reasoning"]
+        lines = [message["text"] for message in self.controller.snapshot()["messages"]
+                 if (message.get("step") or {}).get("id") == rows[0]["id"]]
+        self.assertIn("It adds two numbers, so the bug is in the operator.", lines[0])
+        self.assertNotIn("return type", lines[0], "the second sentence belongs to the opened row")
+        self.controller.action("step_detail", {"id": rows[0]["id"]}, self.events.append)
+        detail = self.controller.snapshot()["step_detail"]
+        self.assertEqual(detail["sections"],
+                         [["What it thought first",
+                           ["It adds two numbers, so the bug is in the operator.",
+                            "Not in the return type."]]])
+
+    def test_the_stored_record_is_the_whole_thought_not_the_preview(self):
+        self.send()
+        stored = [item for item in self.controller.session["events"]
+                  if item.get("action") == "model_reasoning"]
+        self.assertEqual([item["detail"] for item in stored],
+                         [ThinkingModel.THOUGHTS[1], ThinkingModel.THOUGHTS[3]])
+        self.assertEqual([item["count"] for item in stored],
+                         [len(ThinkingModel.THOUGHTS[1]), len(ThinkingModel.THOUGHTS[3])])
+
+    def test_a_reopened_task_reshows_the_row_and_still_opens_it(self):
+        """`display_session` rebuilds a row by filtering the record through `STEP_FIELDS`, so a field
+        left out of that tuple gives back a row that says less than the live one did."""
+        self.send()
+        before = [(row["id"], row["action"], row["detail"]) for row in self.step_rows()
+                  if row["action"] == "model_reasoning"]
+        self.controller.display_session(self.controller.session_path, select=True)
+        after = [(row["id"], row["action"], row["detail"]) for row in self.step_rows()
+                 if row["action"] == "model_reasoning"]
+        self.assertEqual(after, before)
+        self.controller.action("step_detail", {"id": after[0][0]}, self.events.append)
+        self.assertEqual(len(self.controller.snapshot()["step_detail"]["sections"][0][1]), 2,
+                         "history has to give back both sentences, not just the previewed one")
+
+    def test_the_thought_is_said_in_the_language_the_task_was_asked_in(self):
+        self.send("عدّل دالة الجمع في calculator.py")
+        rows = [row for row in self.step_rows() if row["action"] == "model_reasoning"]
+        line = next(message["text"] for message in self.controller.snapshot()["messages"]
+                    if (message.get("step") or {}).get("id") == rows[0]["id"])
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in line), line)
+        self.assertNotIn("Thought for", line)
+
+    def test_the_thinking_never_replaces_the_answer_it_came_with(self):
+        """The envelope is the only thing the loop acts on; a thought is a record, not a result."""
+        self.send()
+        self.assertEqual(self.controller.session["state"], "WAITING_APPROVAL")
+        self.assertEqual([change["path"] for change in self.controller.session["changes"]],
+                         ["calculator.py"])
+        self.assertNotIn("It adds two numbers", json.dumps(self.model.prompts[-1]),
+                         "the deliberation is not sent back as history")
 
 
 class WithdrawnQuestionTests(unittest.TestCase):
@@ -3159,6 +3682,101 @@ class TheStateUnderTwoThreads(unittest.TestCase):
                          [message["text"] for message in before["messages"]])
         self.assertNotIn("injected", json.dumps(fresh, ensure_ascii=False))
         self.assertEqual(len(fresh["log"]), len(before["log"]))
+
+
+class TheModuleGraph(unittest.TestCase):
+    """Item 11's picture: the Sources card asks for the module graph, and the click is answered.
+
+    Three rules this window has already paid for are pinned here. The graph is *fetched* — it is not a
+    snapshot field, because a snapshot goes out on every streamed log line and building this walks the
+    tree. The answer is data the caller can draw, never a bare event. And a click that cannot draw
+    anything answers in words, because an empty sheet reads as a project with no structure.
+    """
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.app_dir = Path(temp.name)
+        self.repo = self.app_dir / "reactor"
+        for folder, name, imports in (("core", "Registry", []),
+                                      ("auth", "Jwt", ["core.Registry"]),
+                                      ("web", "Endpoint", ["auth.Jwt", "core.Registry"])):
+            where = self.repo / folder / "src/main/java/com/acme"
+            where.mkdir(parents=True)
+            (where / (name + ".java")).write_text(
+                "package com.acme.%s;\n" % folder
+                + "".join("import %s;\n" % item for item in imports)
+                + "public class %s {\n}\n" % name, encoding="utf-8", newline="\n")
+        for patcher in (patched_catalog(),):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(self.app_dir)
+        self.controller.set_repo(str(self.repo))
+        self.addCleanup(self.controller.close)
+        self.events: list[dict] = []
+
+    def graph(self):
+        return self.controller.action("show_graph", {}, self.events.append)
+
+    def test_the_click_answers_with_modules_and_the_edges_between_them(self):
+        got = self.graph()
+        self.assertEqual(sorted(node["name"] for node in got["nodes"]), ["auth", "core", "web"])
+        self.assertEqual([(edge["from"], edge["to"]) for edge in got["edges"]],
+                         [("auth", "core"), ("web", "auth"), ("web", "core")])
+        self.assertEqual({node["name"]: node["column"] for node in got["nodes"]},
+                         {"core": 0, "auth": 1, "web": 2})
+
+    def test_the_sentence_under_the_picture_is_written_by_the_server(self):
+        """One surface, one caption: the JS draws what it is told rather than assembling counts into
+        English, which is how the Tk window and the web window drifted apart in the first place."""
+        got = self.graph()
+        self.assertIn("3 modules, 3 dependencies", got["caption"])
+
+    def test_the_caption_follows_the_language_of_the_window(self):
+        """The caption is a sentence the tool writes, so it follows the task's language like every other
+        one. Arabic arrives from code points so the file stays ASCII on the way to the shell."""
+        self.controller.session = {"task": "".join(map(chr, [0x0644, 0x064a, 0x0647, 0x0645, 0x0648]))}
+        text = self.graph()["caption"]
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in text), text)
+        self.assertNotIn("modules", text)
+
+    def test_the_graph_is_never_shipped_with_the_snapshot(self):
+        state = self.controller.snapshot()
+        self.assertNotIn("graph", state, "a fetched field became a shipped one")
+        self.graph()
+        self.assertNotIn("graph", self.controller.snapshot())
+
+    def test_a_click_that_reached_no_module_answers_in_words(self):
+        """A standalone chat has no folder to walk, and a sheet that opened blank would be a claim about
+        the project rather than about the window."""
+        self.controller.set_repo("")
+        got = self.graph()
+        self.assertEqual(got["nodes"], [])
+        self.assertTrue(got["note"], "the dead click answered with nothing at all")
+
+    def test_an_empty_folder_answers_in_words_too(self):
+        blank = self.app_dir / "empty"
+        blank.mkdir()
+        self.controller.set_repo(str(blank))
+        got = self.graph()
+        self.assertEqual(got["nodes"], [])
+        self.assertTrue(got["note"])
+
+    def test_a_cycle_in_the_project_is_said_rather_than_drawn_quietly(self):
+        left = self.repo / "core/src/main/java/com/acme"
+        (left / "Loop.java").write_text("package com.acme.core;\nimport com.acme.web.Endpoint;\n"
+                                        "public class Loop {\n}\n", encoding="utf-8", newline="\n")
+        got = self.graph()
+        self.assertTrue(got["cyclic"])
+        self.assertIn("cycle", got["caption"], "the layout is approximate and the reader must know")
+
+    def test_the_click_changes_nothing_in_the_project(self):
+        """Reading a folder is what this is: no event reaches the thread, and no file is touched."""
+        before = sorted(str(path.relative_to(self.repo)) for path in self.repo.rglob("*.java"))
+        self.graph()
+        self.assertEqual(self.events, [])
+        self.assertEqual(sorted(str(path.relative_to(self.repo)) for path in self.repo.rglob("*.java")),
+                         before)
 
 
 if __name__ == "__main__":

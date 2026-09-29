@@ -501,9 +501,14 @@ class ControllerSurfaceTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] /
                   "src/ai_code_engineer/webapp/static/app.js").read_text(encoding="utf-8")
         sent = set(re.findall(r"send(?:Quiet)?\(\s*'([a-z_]+)'", source))
+        # A sheet that needs the reply's payload posts through `api()` directly, because `send()` drops
+        # `result` on the floor. Both forms are the client posting an action, so both are collected --
+        # a gate that only reads one of them stops covering the newest verb the day it is added.
+        sent |= set(re.findall(r"api\(\s*'/api/action'\s*,\s*\{\s*type:\s*'([a-z_]+)'", source))
         # choose() builds its action from the kind: send('set_' + kind, ...).
         sent |= {"set_model", "set_mode", "set_recipe"}
         sent.discard("set_")
+        self.assertIn("show_graph", sent, "the graph button stopped posting its action")
         self.assertGreater(len(sent), 20, "the client stopped sending actions?")
         return sent
 
@@ -829,6 +834,78 @@ class TheChangesPaneIsGone(unittest.TestCase):
             for block in (real.snapshot()["review"], FakeController().snapshot()["review"]):
                 self.assertEqual(sorted(needed - set(block)), [])
                 self.assertEqual(sorted(block["view"]), ["after", "before", "checks", "diff"])
+
+
+class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
+    """Phase 3 on the page: the reply is painted from the fragments, and the two windows agree on it.
+
+    `case 'token'` sat dead in the client for four rounds — the stub existed, no Python file ever sent
+    the event. So the guard here is not only that the page draws a stream, but that every kind it
+    listens for is one a server can actually emit, which is the class of lie a source-string test on
+    one side alone cannot catch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.flat = " ".join(cls.js.split())
+        package = Path(__file__).resolve().parents[1] / "src/ai_code_engineer"
+        cls.servers = "".join((package / name).read_text(encoding="utf-8") for name in
+                              ("host.py", "webapp/controller.py", "webapp/fake.py", "webapp/server.py"))
+
+    def test_every_event_kind_the_page_listens_for_is_one_a_server_can_send(self):
+        import re
+        heard = set(re.findall(r"case '([a-z_]+)':", self.js))
+        sent = set(re.findall(r"\"kind\": \"([a-z_]+)\"", self.servers))
+        # Three of these kinds are written once and passed as a variable, so a regex on the literal
+        # alone would call them dead: the shared stream sink, and the ask helper that blocks on them.
+        sent |= set(re.findall(r"self\._stream\([^)]*\"([a-z_]+)\"", self.servers))
+        sent |= set(re.findall(r"_ask\(\"([a-z_]+)\"", self.servers))
+        self.assertEqual(sorted(heard - sent), [],
+                         "the page handles an event nothing emits, which is a silent feature")
+
+    def test_the_stream_is_painted_from_a_buffer_of_its_own(self):
+        """Not from DATA.messages: a snapshot goes out on other events, and a half-answer held only in
+        the message list would be wiped mid-sentence by a push that knows nothing about it."""
+        self.assertIn("let STREAM = ''", self.js)
+        self.assertNotIn("last.text += text", self.js,
+                         "the reply was appended to a message that the next snapshot would replace")
+        self.assertIn("STREAM || DATA.pending", self.flat)
+
+    def test_an_arriving_line_is_escaped_and_the_first_one_makes_its_own_bubble(self):
+        body = self.js.split("function appendToken(")[1].split("\n}\n")[0]
+        self.assertIn("renderThread();", body, "the first chunk arrives before the bubble exists")
+        self.assertIn("$('scroller').scrollTop", body)
+        self.assertIn('<span class="typing-line">${esc(STREAM || DATA.pending)}</span>', self.js)
+
+    def test_the_buffer_is_cleared_at_both_ends_of_a_job(self):
+        # a stale stream would reappear under the next question, and the finished answer must not
+        # be shown twice: once as arrived text and once as the stored message
+        self.assertIn("if ((msg.message || {}).role === 'assistant') STREAM = '';", self.js)
+        self.assertIn("if (busy && (LIVE.length || STREAM)) { LIVE.length = 0; STREAM = '';", self.js)
+
+    def test_the_preview_streams_its_read_only_answer(self):
+        controller = FakeController()
+        events = []
+        controller.action("set_composer", {"value": "read"}, events.append)
+        controller.action("send", {"text": "where is the duplicate guard?"}, events.append)
+        answer = "The duplicate-email guard lives in `UserService.create()`"
+        deadline = time.time() + 8
+        while time.time() < deadline and not any(message["text"].startswith(answer[:40])
+                                                 for message in controller.messages):
+            time.sleep(0.05)
+        kinds = [event["kind"] for event in events]
+        self.assertIn("token", kinds, kinds)
+        self.assertGreater(sum(1 for kind in kinds if kind == "token"), 1,
+                           "one chunk is not a stream")
+        self.assertFalse(controller.busy, "the preview claims no job for an answer that streams")
+        first = next(index for index, event in enumerate(events) if event["kind"] == "token")
+        self.assertTrue(all(event["text"] and event["ts"] for event in events[first:first + 2]))
+        self.assertLess(first, len(events) - 1, "the answer lands after the pieces of it")
+        self.assertTrue(any(message["text"].startswith(answer[:40]) and
+                            message["role"] == "assistant" for message in controller.messages),
+                        "the streamed answer has to land as the message it was cut from")
 
 
 class TheStepRowsInTheThread(unittest.TestCase):
@@ -1428,6 +1505,130 @@ class WithdrawnAskWindowTests(unittest.TestCase):
         body = self.js.split("function retractAsk(id)")[1].split("\n}\n")[0]
         self.assertIn("$('modal-root').children", body)
         self.assertNotIn("querySelector(", body)
+
+
+class TheThoughtRowInPreview(unittest.TestCase):
+    """The preview window has to carry the reasoning row the real window carries.
+
+    A reviewer decides what a row looks like from this page, so the scripted sentence is built by the
+    same function the engine calls: a preview that types out its own version reviews a fiction, and a
+    count that does not match the text behind it reviews arithmetic nobody checks.
+    """
+
+    def rows(self):
+        return [(message.get("step") or {}) for message in FakeController().snapshot()["messages"]
+                if message.get("step")]
+
+    def test_the_preview_scripts_one_row_with_a_thought_behind_it(self):
+        thought = [row for row in self.rows() if row["action"] == "model_reasoning"]
+        self.assertEqual(len(thought), 1, thought)
+        self.assertTrue(thought[0]["detail"], "the chevron is the server's answer, not a guess")
+
+    def test_the_sentence_is_the_ones_the_engine_would_write(self):
+        from ai_code_engineer import labels
+        from ai_code_engineer.webapp.fake import REASONING_SAMPLE
+        message = next(message for message in FakeController().snapshot()["messages"]
+                       if (message.get("step") or {}).get("id") == "st-r")
+        self.assertEqual(message["text"],
+                         labels.step_line(False, "model_reasoning", count=len(REASONING_SAMPLE),
+                                          detail=REASONING_SAMPLE))
+        self.assertIn(str(len(REASONING_SAMPLE)), message["text"],
+                      "the row counts the characters it actually stores")
+
+    def test_the_row_opens_to_the_whole_deliberation_under_its_own_title(self):
+        from ai_code_engineer import labels
+        from ai_code_engineer.webapp.fake import REASONING_SAMPLE
+        controller = FakeController()
+        controller.action("step_detail", {"id": "st-r"}, lambda event: None)
+        block = controller.snapshot()["step_detail"]
+        self.assertEqual(block["id"], "st-r")
+        self.assertEqual(block["note"], "")
+        title, lines = block["sections"][0]
+        self.assertEqual(title, labels.detail_section(False, "reasoning"))
+        self.assertEqual(lines, REASONING_SAMPLE.splitlines())
+
+    def test_closing_the_row_asks_for_nothing(self):
+        controller = FakeController()
+        controller.action("step_detail", {"id": "st-r"}, lambda event: None)
+        controller.action("step_detail", {"id": ""}, lambda event: None)
+        self.assertIsNone(controller.snapshot()["step_detail"])
+
+
+class TheGraphSheet(unittest.TestCase):
+    """The client half of the module graph: a button, a fetch, and a drawing made only of server data.
+
+    No Python test runs a DOM, so what gets pinned is the clauses that carry the decisions — that the
+    picture is asked for rather than already in the page, that every string reaching the SVG came from
+    the filesystem and is escaped on the way in, and that a click with nothing to draw says so.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.flat = " ".join(cls.js.split())
+        cls.svg = cls.js.split("function graphSvg(")[1].split("\n}\n")[0]
+        cls.sheet_body = cls.js.split("async function graphSheet()")[1].split("\n}\n")[0]
+        cls.card = cls.js.split("function renderRail()")[1].split("\n}\n")[0]
+
+    def test_the_button_posts_the_action_itself_rather_than_reusing_a_send(self):
+        """`send()` drops the reply's payload, and the sheet is drawn from that payload — which is why
+        this one calls the endpoint directly, and why the parity gate reads both forms."""
+        self.assertIn("api('/api/action', { type: 'show_graph' })", self.flat)
+        self.assertIn("graph.onclick = () => graphSheet();", self.card)
+
+    def test_it_only_appears_when_there_is_a_project_to_draw(self):
+        """The Sources card is the whole right panel; a graph entry with no folder behind it is a button
+        that can only ever answer "nothing to draw yet"."""
+        self.assertIn("if ((DATA.branch || {}).key) {", self.card)
+        self.assertLess(self.card.index("if ((DATA.branch || {}).key) {"),
+                        self.card.index("graph.onclick"), "the graph button escaped the project gate")
+
+    def test_the_sheet_says_it_is_measuring_before_the_answer_lands(self):
+        """A walk of a real repository takes seconds on a slow disk, and a sheet that appears blank first
+        reads as an empty project rather than as work in progress."""
+        self.assertIn("body.appendChild(el('div', 'quiet', 'Mapping this folder…'));", self.sheet_body)
+        self.assertLess(self.sheet_body.index("Mapping this folder"), self.sheet_body.index("await api("))
+
+    def test_the_svg_escapes_every_string_that_came_off_the_disk(self):
+        """A folder name is data the operator's repository controls. It reaches a `<title>` and a
+        `<text>` node, so an unescaped interpolation is the injection the rest of the window avoids."""
+        for piece in ("esc(node.name)", "esc(String(node.name))", "esc(edge.from)", "esc(edge.to)",
+                      "esc(data.caption"):
+            self.assertIn(piece, self.svg + self.sheet_body, piece)
+        self.assertNotIn(">${node.name}", self.svg, "a raw name interpolated into the drawing")
+        self.assertNotIn(">${edge.from}", self.svg)
+
+    def test_the_drawing_adds_no_opinion_of_its_own(self):
+        """The columns, the counts and the caveat are the server's claims. A second copy of that maths in
+        JS is the drift this project keeps paying for."""
+        self.assertIn("const columns = {};", self.svg)
+        for banned in ("modules,", "dependencies,", "cycle"):
+            self.assertNotIn(banned, self.svg, "the client started writing the server's sentence")
+
+    def test_an_answer_with_nothing_to_draw_shows_the_servers_words(self):
+        self.assertIn("esc((data || {}).note", self.sheet_body)
+        self.assertLess(self.sheet_body.index("(data || {}).note"), self.sheet_body.index("graphSvg(data)"),
+                        "an empty sheet was drawn before the note could replace it")
+
+    def test_the_graph_is_rendered_from_the_reply_not_from_the_snapshot(self):
+        """Fetched, not shipped: if the picture ever rode a snapshot it would be rebuilt on every
+        streamed log line, and the walk would happen in the wrong thread."""
+        self.assertNotIn("DATA.graph", self.js)
+
+    def test_the_classes_the_drawing_names_have_rules(self):
+        for selector in (".graph .gnode rect", ".graph .gedge", ".graph .ghead", ".gscroll", ".gmods"):
+            self.assertIn(selector + " {", self.css, selector)
+
+    def test_the_paint_layer_still_carries_no_literal_colours(self):
+        """`app.css` reads tokens only; an SVG that needs its own hex is where that rule would die."""
+        block = self.css.split("/* -------------------------------- module graph")[1] \
+            .split("/* -------------------------------- project drawer")[0]
+        self.assertTrue(block.strip(), "the graph rules were not found where they live")
+        self.assertNotIn("#", block, "a hard-coded colour in the graph rules")
+        self.assertNotIn("rgb(", block)
+        self.assertIn("var(--", block, "and still painted from tokens")
 
 
 if __name__ == "__main__":

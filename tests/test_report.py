@@ -159,6 +159,21 @@ class WhatThePageSays(unittest.TestCase):
         self.assertEqual(summary(session())["runs"][0]["folder"], "",
                          "a single-project folder gains no module column")
 
+    def test_a_run_inside_a_container_says_which_image_it_ran_in(self):
+        """A passing build inside a pinned image is a claim about that image's toolchain. An audit read
+        a year later cannot tell it from a host build unless the name is on the row."""
+        inside = {"recipe": "maven-test", "label": "Maven test", "command": "mvn -B test",
+                  "status": "passed", "exit_code": 0, "seconds": 41.0,
+                  "sandbox": {"image": "maven@sha256:" + "b" * 64, "container": "ai-agent-7"},
+                  "proof": {"tests": 12, "failures": 0, "errors": 0, "source": "surefire XML"},
+                  "failures": [], "tail": "BUILD SUCCESS"}
+        page = self.render(runs=[inside])
+        self.assertIn("`Maven test` inside `maven@sha256:" + "b" * 64 + "` · passed", page)
+        self.assertEqual(summary(session(runs=[inside]))["runs"][0]["sandbox"],
+                         "maven@sha256:" + "b" * 64)
+        self.assertEqual(summary(session())["runs"][0]["sandbox"], "",
+                         "a host run gains no image column")
+
     def test_the_request_is_verbatim_and_in_a_block_of_its_own(self):
         task = "Fix add.\n\nThen run:\n  mvn -B test"
         page = self.render(task=task)

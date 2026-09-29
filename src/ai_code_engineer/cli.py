@@ -156,10 +156,11 @@ def run_setup(args, ask=input, interactive=None) -> int:
         safe_print("Running it…")
         safe_print(setup.render([setup.demo_row(setup.run_demo(), arabic=args.arabic)]))
 
+    # The promises are in the audit already; printing them again here put the same paragraph on the
+    # screen twice three lines apart. The question points at the copy the operator has just read.
     safe_print("")
-    safe_print(setup.render([setup.policy_row(arabic=args.arabic)]))
-    accepted = wants("Accept those five lines before the window offers you a write? (y/n): ",
-                     args, ask, interactive)
+    accepted = wants("Accept the five promises printed above, before the window offers you a write? "
+                     "(y/n): ", args, ask, interactive)
 
     counts = setup.counts(rows)
     safe_print("")
@@ -182,7 +183,7 @@ def run_setup(args, ask=input, interactive=None) -> int:
             lines.insert(0, "The policy was not accepted. The tool still runs, but no write should be "
                             "approved until you have read those lines.")
     safe_print("\n".join(lines))
-    safe_print(f"\n{counts['ok']} ok · {counts['warn']} to watch · {counts['bad']} blocking.")
+    safe_print("\n" + setup.tally(counts, arabic=args.arabic) + ".")
     return 1 if counts["bad"] else 0
 
 

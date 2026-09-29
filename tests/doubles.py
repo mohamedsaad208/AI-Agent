@@ -37,11 +37,14 @@ PLAN = ("# Build it\n\n## 1. Foundation\nCreate the package.\n\n"
         "## 2. Register\nReject duplicate emails.\n")
 
 
-def run_result(status="passed", proof=None, observed=True, failures=None, target="."):
+def run_result(status="passed", proof=None, observed=True, failures=None, target=".", sandbox=None):
     """The shape `runner.run()` answers with, without running anything."""
     return {"recipe": "python-unittest", "label": "Python unittest", "command": "python -m unittest",
             "target": target,
-            "status": status, "exit_code": 0 if status == "passed" else 1, "seconds": 1.4,
+            # The real runner always answers this key — a run either happened in a container or it did
+            # not — and the summary line reads it, so a double that omitted it would hide a branch.
+            "sandbox": sandbox, "status": status, "exit_code": 0 if status == "passed" else 1,
+            "seconds": 1.4,
             "tests_observed": observed, "proof": proof, "truncated": False, "timed_out": False,
             "output": "Ran 4 tests\nOK\n", "tail": "Ran 4 tests\nOK\n",
             "failures": failures or []}

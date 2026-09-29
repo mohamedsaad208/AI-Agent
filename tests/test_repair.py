@@ -623,5 +623,99 @@ class TheMapOfAMultiProjectFolder(unittest.TestCase):
         self.assertIn("alpha/src/A0.java", spread)
 
 
+class TheSameErrorAcrossTasks(unittest.TestCase):
+    """D42: a build failure carries an identity, and the project's history can be asked about it.
+
+    `stalled()` answers whether *this* conversation's last round helped. This answers a question that
+    conversation cannot ask: has this repository already failed with these exact words, under another
+    task, in another chat? Two runs of one error must collide, and two errors must not.
+    """
+
+    def run_of(self, *lines, status="failed", label="Maven test", folder="", at="2026-09-01T10:00"):
+        return {"status": status, "label": label, "target": folder, "at": at,
+                "failures": list(lines), "tail": "\n".join(lines)}
+
+    def session(self, sid, *runs, chat=""):
+        return {"id": sid, "created": "2026-09-01T10:00", "state": "BLOCKED", "runs": list(runs),
+                **({"chat_id": chat} if chat else {})}
+
+    def test_the_same_error_with_different_line_numbers_is_one_error(self):
+        first = self.run_of("ERROR] OrderService.java:[45,12] cannot find symbol method total()")
+        second = self.run_of("[ERROR] /src/main/java/com/acme/OrderService.java:[99,4] cannot "
+                             "find symbol method total()")
+        self.assertEqual(repair.error_fingerprint(first), repair.error_fingerprint(second))
+
+    def test_a_count_and_an_absolute_path_cost_nothing_but_a_fingerprint(self):
+        """Two pytest summaries of one broken test differ only in how many and where — the paths move
+        between machines, the timings move between runs, and the error is the same both times."""
+        one = self.run_of("FAILED tests/test_cart.py::test_total - AssertionError: 3 != 4",
+                          label="pytest", at="2026-09-01T10:00")
+        two = self.run_of("FAILED tests/test_cart.py::test_total - AssertionError: 5 != 6",
+                          label="pytest", at="2026-09-02T10:00")
+        self.assertEqual(repair.error_fingerprint(one), repair.error_fingerprint(two))
+
+    def test_two_different_failures_do_not_collide(self):
+        a = self.run_of("cannot find symbol method total()")
+        b = self.run_of("package com.acme.ghost does not exist")
+        self.assertNotEqual(repair.error_fingerprint(a), repair.error_fingerprint(b))
+
+    def test_a_passing_run_carries_no_error_at_all(self):
+        self.assertEqual(repair.error_fingerprint(self.run_of("BUILD SUCCESS", status="passed")), "")
+        self.assertEqual(repair.error_identity({}), "")
+
+    def test_a_run_that_reported_nothing_is_not_fingerprinted_from_its_noise(self):
+        """An empty fingerprint means "unknown", and unknown must never match unknown — two unrelated
+        silent failures counted as one would report a repeat that never happened."""
+        self.assertEqual(repair.error_fingerprint({"status": "failed", "failures": [], "tail": ""}), "")
+
+    def test_a_failure_in_a_module_of_its_own_is_counted_there(self):
+        run = self.run_of("cannot find symbol", folder="auth-service")
+        self.assertEqual(repair.unresolved([self.session("s1", run)])[0]["folder"], "auth-service")
+
+    def test_a_failing_task_in_another_chat_is_still_open(self):
+        history = [self.session("s1", self.run_of("port 8080 was already in use"), chat="chat-a"),
+                   self.session("s2", self.run_of("port 8080 was already in use"), chat="chat-b")]
+        got = repair.unresolved([item for item in history], exclude_chat="chat-c")
+        self.assertEqual(len(got), 1, "one error seen twice should be one row")
+        self.assertEqual(got[0]["count"], 2)
+        self.assertEqual(got[0]["tasks"], 2, "two conversations, so the repeat crosses tasks")
+
+    def test_the_same_error_settled_by_a_later_passing_run_stops_being_reported(self):
+        mark = self.run_of("could not resolve com.acme:shared:1.0", at="2026-09-01T10:00")
+        fixed = self.run_of("BUILD SUCCESS", status="passed", at="2026-09-03T10:00")
+        self.assertEqual(repair.unresolved([self.session("s1", mark, fixed)]), [])
+
+    def test_a_pass_in_another_module_does_not_settle_this_one(self):
+        """A reactor where auth-service builds says nothing about orders-service still failing — the
+        same rule `stalled()` already holds itself to, applied to a whole project's history."""
+        mark = self.run_of("could not resolve com.acme:shared:1.0", folder="orders-service",
+                           at="2026-09-01T10:00")
+        elsewhere = self.run_of("BUILD SUCCESS", status="passed", folder="auth-service",
+                                at="2026-09-03T10:00")
+        got = repair.unresolved([self.session("s1", mark, elsewhere)])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["folder"], "orders-service")
+
+    def test_the_chat_being_planned_now_is_not_its_own_history(self):
+        """The live conversation's own rounds belong to `stalled()`, which speaks about them every
+        round; repeating them here would say the same thing twice under two different names."""
+        history = [self.session("s1", self.run_of("no such column: total"), chat="chat-a")]
+        self.assertEqual(repair.unresolved(history, exclude_chat="chat-a"), [])
+        self.assertEqual(len(repair.unresolved(history, exclude_chat="chat-b")), 1)
+
+    def test_the_worst_open_error_is_first_and_the_sample_survives_redaction(self):
+        history = [self.session("s1", self.run_of("password=hunter2 in jdbc:postgresql://db/x",
+                                                  at="2026-09-01T10:00")),
+                   self.session("s2", self.run_of("cannot find symbol", at="2026-09-02T10:00"),
+                                self.run_of("cannot find symbol", at="2026-09-03T10:00"))]
+        got = repair.unresolved(history)
+        self.assertEqual(got[0]["count"], 2, "the twice-seen error leads")
+        self.assertNotIn("hunter2", got[0]["sample"], "a credential inside a failure line stays out")
+
+    def test_an_history_of_nothing_answers_with_nothing(self):
+        self.assertEqual(repair.unresolved([]), [])
+        self.assertEqual(repair.unresolved([{}, None]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

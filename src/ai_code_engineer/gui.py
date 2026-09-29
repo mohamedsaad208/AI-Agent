@@ -18,7 +18,8 @@ from .catalog import LIVE, models_for
 from .chat import create_chat, context_block, load_chat, respond, title_for
 from . import config
 from .config import Settings
-from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, load_session, plan,
+from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
+                     load_session, plan,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
@@ -196,6 +197,12 @@ class AgentWindow:
         # even the proposal. It does not persist per folder the way the web window's does; see
         # `_save_state`, where it is stored with the rest of this window's own settings.
         self.read_only = tk.BooleanVar(value=bool(self._saved_ui.get("read_only")))
+        # The sandbox is a machine preference, never a project one: a repository must not get to name
+        # the image the tool builds that repository inside. Both windows keep it, and both grey it out
+        # when `runner.sandbox_available()` says there is no Docker to ask.
+        self.sandbox_on = tk.BooleanVar(value=bool(self._saved_ui.get("sandbox_on")))
+        self.sandbox_image = tk.StringVar(value=str(self._saved_ui.get("sandbox_image") or ""))
+        self.sandbox_info = tk.StringVar(value="")
         # The first-run rows, computed once and stored: building them asks a provider over the network,
         # and a window refresh should never be the reason a request left the machine.
         self._setup_rows: list[dict] = []
@@ -281,6 +288,10 @@ class AgentWindow:
                 self.status.set("Ready — ask directly, or choose a project to work on its files")
         self._schedule(80, self.poll)
         self._schedule(150, self.check_setup)
+        # A machine that has never granted a folder gets the checks offered, once — and `setup_seen` is
+        # the operator's own answer to that offer, honoured here exactly as the web window honours it.
+        if setup.first_run(self.app_dir) and not bool(self._saved_ui.get("setup_seen")):
+            self._schedule(600, self.show_setup)
 
     def _style(self):
         self.root.option_add("*Font", "{Segoe UI} 10")
@@ -391,7 +402,7 @@ class AgentWindow:
         self.title = tk.StringVar(value="New chat")
         ttk.Label(header, textvariable=self.title, font=("Segoe UI Semibold", 13)).pack(side="left")
         self.view_buttons = {}
-        for label, key, first in (("Activity", "details", True), ("Changes", "review", False), ("Chat", "task", False)):
+        for label, key, first in (("Activity", "details", True), ("Chat", "task", False)):
             view_button = self.button(header, label, lambda key=key: self.select_view(key), track=False)
             view_button.pack(side="right", padx=(0, 6) if not first else 0)
             self.view_buttons[key] = view_button
@@ -415,7 +426,7 @@ class AgentWindow:
                   wraplength=212, justify="left").pack(anchor="w")
         ttk.Label(card.inner, textvariable=self.artifact_detail, foreground=MUTED, font=("Segoe UI", 9),
                   wraplength=212, justify="left").pack(anchor="w", pady=(2, 8))
-        self.button(card.inner, "Review proposed files  ↗", lambda: self.select_view("review"), track=False).pack(anchor="w")
+        self.button(card.inner, "Review proposed files  ↗", lambda: self.open_review(), track=False).pack(anchor="w")
         tk.Frame(card.inner, bg=LINE, height=1).pack(fill="x", pady=14)
         # Checks: run the project's own build/test command, then optionally ask for a fix.
         self.checks_frame = ttk.Frame(card.inner)
@@ -432,6 +443,25 @@ class AgentWindow:
                                        state="readonly", width=24)
         self.recipe_box.pack(anchor="w", pady=(3, 6))
         Tooltip(self.recipe_box, "Command detected in this project folder")
+        # The container choice sits with the command it wraps rather than in Settings: the question is
+        # asked at the moment of pressing Run, and the answer changes what a green will mean.
+        self.sandbox_row = ttk.Frame(self.checks_frame)
+        self.sandbox_box = ttk.Checkbutton(self.sandbox_row, text="Run in Docker",
+                                           variable=self.sandbox_on, command=self.sandbox_changed)
+        self.sandbox_box.pack(side="left")
+        self.sandbox_entry = ttk.Entry(self.sandbox_row, textvariable=self.sandbox_image, width=22)
+        self.sandbox_entry.pack(side="left", padx=(6, 0))
+        # A keystroke repaints the sentence under the box; leaving the field is what saves it. The
+        # digest either matches the pattern or it does not, and a preference written per character is
+        # a disk write for every half-typed name.
+        self.sandbox_entry.bind("<KeyRelease>", lambda *_: self.sandbox_info_line())
+        self.sandbox_entry.bind("<FocusOut>", self.sandbox_changed)
+        self.sandbox_entry.bind("<Return>", self.sandbox_changed)
+        self.sandbox_row.pack(anchor="w", pady=(0, 2))
+        Tooltip(self.sandbox_box,
+                "A copy of the project, no network, nothing written back to your files")
+        ttk.Label(self.checks_frame, textvariable=self.sandbox_info, foreground=MUTED,
+                  font=("Segoe UI", 9), wraplength=212, justify="left").pack(anchor="w", pady=(0, 6))
         run_row = ttk.Frame(self.checks_frame)
         run_row.pack(fill="x")
         self.run_button = self.button(run_row, "▶  Run", lambda: self.run_tests(False), track=False,
@@ -461,10 +491,8 @@ class AgentWindow:
         self.tabs = ViewStack(center)
         self.tabs.pack(fill="both", expand=True)
         self.task_tab = ttk.Frame(self.tabs, padding=(14, 12, 14, 0))
-        self.review_tab = ttk.Frame(self.tabs, padding=14)
         self.details_tab = ttk.Frame(self.tabs, padding=14)
         self.tabs.add(self.task_tab, text="Conversation")
-        self.tabs.add(self.review_tab, text="Changes")
         self.tabs.add(self.details_tab, text="Activity")
         self.select_view("task")
         self._task_page()
@@ -482,6 +510,7 @@ class AgentWindow:
         self.repo.trace_add("write", self._sync_project_chip)
         self.plan_file.trace_add("write", lambda *_: self.refresh_plan_status())
         self._sync_project_chip()
+        self.sandbox_info_line()
         self.reset_conversation()
 
     def _sync_project_chip(self, *_):
@@ -498,6 +527,25 @@ class AgentWindow:
             widget.configure(bg=widget.base_bg, fg=TEAL if active else INK)
         return page
 
+    def open_review(self):
+        """Bring the proposal viewer forward, and put in its title what it is holding.
+
+        The web window's sheet is an overlay inside one page; here the same thing is a second window, so
+        the taskbar has to say which of the two windows a proposal belongs to once a chat has moved on.
+        """
+        window = self.review_window
+        window.title("Proposed changes — " + self.state_label.get())
+        window.deiconify()
+        window.lift()
+
+    def close_review(self):
+        """Hide the viewer, never destroy it: every writer to a proposal addresses these widgets.
+
+        Escape is the web sheet's way out, and this window's title-bar X is wired to the same door so
+        the two answers cannot drift into "closing here loses the diff, closing there does not".
+        """
+        self.review_window.withdraw()
+
     def source_action(self):
         self.view_plan() if self.plan_file.get() else self.browse_plan()
 
@@ -506,13 +554,20 @@ class AgentWindow:
         self.settings_window.lift()
 
     # ------------------------------ first run ------------------------------
+    def setup_values(self) -> dict:
+        """What the window is pointed at, read on the UI thread.
+
+        A worker thread touching a `StringVar` raises `main thread is not in main loop`, and the audit
+        is built from four of them. The keys are `setup.audit`'s own parameters so a check can read
+        them here and hand the same dict to the thread.
+        """
+        return {"repo": self.repo.get().strip(), "provider": self.active_kind().key,
+                "endpoint": self.endpoint_for(), "api_key": self.key.get().strip() or None,
+                "model": self.model.get().strip(), "arabic": self.arabic, "demo": self._setup_demo}
+
     def setup_rows(self, probe: bool = False) -> list[dict]:
         """The audit for the folder and provider this window is pointed at, in its own language."""
-        kind = self.active_kind()
-        return setup.audit(repo=self.repo.get().strip(), provider=kind.key,
-                           endpoint=self.endpoint_for(), api_key=self.key.get().strip() or None,
-                           model=self.model.get().strip(), arabic=self.arabic,
-                           demo=self._setup_demo, probe=probe)
+        return setup.audit(probe=probe, **self.setup_values())
 
     def show_setup(self):
         """The first-run checks in this window: the same rows the card and the terminal print.
@@ -556,8 +611,7 @@ class AgentWindow:
         if not self._setup_rows:
             self._setup_rows = self.setup_rows()
         counts = setup.counts(self._setup_rows)
-        win.title("Setup checks — {} ok · {} to watch · {} blocking".format(
-            counts["ok"], counts["warn"], counts["bad"]))
+        win.title("Setup checks — " + setup.tally(counts, arabic=self.arabic))
         body.configure(state="normal")
         body.delete("1.0", "end")
         body.insert("end", setup.render(self._setup_rows) + "\n")
@@ -567,14 +621,16 @@ class AgentWindow:
         """One click that asks the provider. Nothing in this window probes it by itself."""
         if self.busy:
             return
-        probe = lambda: self.setup_rows(probe=True)     # noqa: E731 - the job body, on a worker thread
+        # Read on this thread, used on the worker: the job body may not reach for a Tk variable.
+        values = self.setup_values()
+
+        def probe():
+            return setup.audit(probe=True, **values)
 
         def done(rows):
             self._setup_rows = rows
             self._paint_setup()
-            counts = setup.counts(rows)
-            self.say("Checks done: {} ok, {} to watch, {} blocking.".format(
-                counts["ok"], counts["warn"], counts["bad"]))
+            self.say(setup.checks_done(setup.counts(rows), arabic=self.arabic))
 
         self.run_job(probe, done, "Checking this machine…")
 
@@ -588,10 +644,8 @@ class AgentWindow:
                                 for item in (self._setup_rows or [])] or [setup.demo_row(
                                     result, arabic=self.arabic)]
             self._paint_setup()
-            passed = result.get("proposal_apply_rollback") == "passed"
-            self.say("The proof held: a proposal was applied, checked and rolled back in a temporary "
-                     "folder." if passed else "The proof did not complete: "
-                     + str(result.get("note", ""))[:120])
+            self.say(setup.proof_done(result.get("proposal_apply_rollback") == "passed",
+                                      result.get("note", ""), arabic=self.arabic))
 
         self.run_job(setup.run_demo, done, "Running the offline proof…")
 
@@ -877,7 +931,10 @@ class AgentWindow:
         self.root.bind("<MouseWheel>", scroll_sources, add=True)
         ttk.Label(parent, text="Project & sources", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 18))
         ttk.Label(parent, text="Outputs", foreground=MUTED).pack(anchor="w", pady=(0, 6))
-        self.button(parent, "Review proposed files", lambda: self.select_view("review")).pack(fill="x")
+        self.button(parent, "Review proposed files", lambda: self.open_review()).pack(fill="x")
+        # The way back after "Don't show this again": the note on that button promises the checks stay
+        # reachable, so the promise needs a button on this surface too.
+        self.button(parent, "Setup checks", self.show_setup, track=False).pack(fill="x", pady=(6, 0))
         ttk.Separator(parent).pack(fill="x", pady=18)
         ttk.Label(parent, text="Project folder", anchor="w").pack(fill="x", pady=(0, 6))
         row = ttk.Frame(parent)
@@ -984,7 +1041,27 @@ class AgentWindow:
         self.hint.pack(fill="x", pady=(12, 0))
 
     def _review_page(self):
-        parent = self.review_tab
+        """The proposal viewer: its own window, withdrawn until something is worth reviewing.
+
+        UI 4.0 took the web window off its Changes pane and onto rail + sheet; this is the same
+        decision on the desktop, where a sheet has to be a Toplevel because Tk has no overlay. It is
+        built once and hidden, so every writer — `display_session`, `clear_review`, `show_change`,
+        `update_buttons` — keeps addressing the same widgets whether or not anyone is looking at them.
+
+        It is not `transient()`, unlike a modal dialog: measured on this machine, a transient child of a
+        withdrawn master cannot be mapped at all, and on a live desktop an owned window disappears when
+        the main window is minimised. A proposal you keep open while reading the pom next to it has to
+        stay put.
+        """
+        window = self.review_window = tk.Toplevel(self.root)
+        window.title("Proposed changes")
+        window.geometry("860x620")
+        window.configure(bg=BG)
+        window.protocol("WM_DELETE_WINDOW", self.close_review)
+        window.bind("<Escape>", lambda *_: self.close_review())
+        window.withdraw()
+        parent = ttk.Frame(window, padding=14)
+        parent.pack(fill="both", expand=True)
         self.headline = ttk.Label(parent, textvariable=self.state_label,
                                   font=("Segoe UI", 13, "bold"), anchor="w")
         self.headline.pack(fill="x", pady=(0, 8))
@@ -993,6 +1070,11 @@ class AgentWindow:
         # headline follows the language of the sentence that is currently in it.
         self.state_label.trace_add("write", lambda *_: self.headline.configure(
             anchor="e" if is_arabic(self.state_label.get()) else "w"))
+        # The viewer is a separate window, so the state has to be written on it as well as in it:
+        # a taskbar entry saying "Proposed changes" over a task that was applied an hour ago is a lie
+        # the reader only finds out by clicking.
+        self.state_label.trace_add("write", lambda *_: self.review_window.title(
+            "Proposed changes — " + self.state_label.get()) if self.review_window.winfo_viewable() else None)
         self.summary = ScrolledText(parent, height=3, wrap="word", relief="flat", font=("Segoe UI", 10), padx=8, pady=6, state="disabled")
         self.summary.pack(fill="x", pady=(0, 8))
         self.files = ttk.Treeview(parent, columns=("kind",), show="tree headings", height=3, selectmode="browse")
@@ -1044,6 +1126,22 @@ class AgentWindow:
             self.say(intent.unchecked(arabic=self.arabic))
         self._save_state()
 
+    def sandbox_info_line(self):
+        """The same four answers the web card gives, decided in one place."""
+        self.sandbox_info.set(shared_note(
+            runner.sandbox_state(self.sandbox_on.get(), self.sandbox_image.get(),
+                                 runner.sandbox_available()), arabic=self.arabic))
+
+    def sandbox_changed(self, *_):
+        """The container switch says what it just promised, in the card it sits in.
+
+        Four answers, and the image field is only enabled when the box is ticked: an unusable text box
+        next to an unchecked box invites a typed digest that nothing will read.
+        """
+        self.sandbox_info_line()
+        self.update_buttons()
+        self._save_state()
+
     @property
     def reading_only(self):
         """The one question every write gate and every run gate asks.
@@ -1054,10 +1152,22 @@ class AgentWindow:
         """
         return bool(self.read_only.get())
 
+    def sandbox_state(self):
+        """The container switch, and the image box that only means something beside a ticked one.
+
+        `update_buttons` runs on every state change, so the machine's answer about Docker is read here
+        rather than cached: a window left open across an install should stop refusing.
+        """
+        docker, busy = runner.sandbox_available(), self.busy
+        self.sandbox_box.configure(state="disabled" if busy or not docker else "normal")
+        self.sandbox_entry.configure(
+            state="normal" if docker and self.sandbox_on.get() and not busy else "readonly")
+
     def update_buttons(self):
         for widget, enabled in self.job_controls:
             widget.configure(state="disabled" if self.busy else enabled)
         self.task.configure(state="disabled" if self.busy else "normal")
+        self.sandbox_state()
         state = self.session.get("state") if self.session else None
         # A control that is greyed out is a promise the window keeps before the click, not an
         # invitation to press something that will answer with a refusal.
@@ -1158,7 +1268,7 @@ class AgentWindow:
                     # A partially applied mutation must update available recovery actions.
                     if self.session_path:
                         try:
-                            self.display_session(self.session_path, select_tab=False)
+                            self.display_session(self.session_path, select=False)
                         except (AgentError, OSError):
                             pass
                 self.refresh_recent()
@@ -1180,7 +1290,13 @@ class AgentWindow:
         ui = {"mode": self.mode.get(), "last_project": self.repo.get().strip(),
               "last_chat": self.chat_id, "request_timeout": self.request_timeout_seconds(),
               "endpoints": dict(self.endpoints), "profile": self.profile,
-              "plan_chained": bool(self.chained.get()), "read_only": bool(self.read_only.get())}
+              "plan_chained": bool(self.chained.get()), "read_only": bool(self.read_only.get()),
+              "setup_seen": bool(self._saved_ui.get("setup_seen")),
+              # Named here or they are not kept: this rebuilds the block from a list of keys rather
+              # than writing back whatever was in it, so a new preference is invisible until it is
+              # added to this line.
+              "sandbox_on": bool(self.sandbox_on.get()),
+              "sandbox_image": self.sandbox_image.get().strip()}
         model = self.model.get() or self._pending_model
         if model:
             ui["model"] = model
@@ -1637,7 +1753,7 @@ class AgentWindow:
                     self.chat_message("Tool", "The plan ledger was not updated: " + friendly_error(exc))
             self.display_session(path)
             if self.session and self.session.get("changes"):
-                self.select_view("review")
+                self.open_review()
                 self.status.set(status_text("proposal_ready", arabic=self.arabic))
             else:
                 self.status.set(status_text("no_proposal", arabic=self.arabic))
@@ -1868,7 +1984,7 @@ class AgentWindow:
         for widget in self.code_views.values():
             text_set(widget, "")
 
-    def display_session(self, path: Path, *, select_tab=True):
+    def display_session(self, path: Path, *, select=True):
         session = load_session(path)
         self.session, self.session_path = session, path
         self.state_label.set(state_label(session["state"], arabic=self.arabic))
@@ -1913,7 +2029,7 @@ class AgentWindow:
         else:
             for key in ("diff", "before", "after"):
                 text_set(self.code_views[key], "No changes.")
-        if select_tab:
+        if select:
             self.title.set(session.get("task", "Saved task").replace("\n", " ")[:45])
             self.chat_id = session.get("chat_id", session["id"])
             self._loading_session = True
@@ -1945,9 +2061,9 @@ class AgentWindow:
                                       "\n\n" + body))
             self.render_messages()
             if session.get("changes"):
-                self.chat_message("Changes", self.removal_notice(session)
+                self.chat_message("Changes", self.approval_notice(session)
                                   + "\n".join(change["path"] for change in session["changes"])
-                                  + "\n\nOpen the Changes tab to review and approve.")
+                                  + "\n\n" + shared_note("review_here", arabic=asked_in_arabic))
             self.task.configure(state="normal")
             self.task.delete("1.0", "end")
             self.select_view("task")
@@ -1972,9 +2088,13 @@ class AgentWindow:
             if tag:
                 view.tag_add(tag, f"{line}.0", f"{line}.end")
 
-    def removal_notice(self, session: dict | None = None) -> str:
-        """The one sentence both windows show; the copy lives in ``repair``."""
-        return repair.removal_notice(session if session is not None else self.session)
+    def approval_notice(self, session: dict | None = None) -> str:
+        """Everything to read before approving — the removals and the files nobody asked for.
+
+        The copy lives in `engine`/`repair`, not here: the web window shows the same dialog, and two
+        hand-written sentences drift the moment one of them is edited.
+        """
+        return repair.approval_advisories(session if session is not None else self.session)
 
     def apply(self):
         if self.busy or not self.session or self.session.get("state") != "WAITING_APPROVAL":
@@ -1994,7 +2114,7 @@ class AgentWindow:
         # dropped the `warning` the builder returned, so a proposal that emptied or deleted a file
         # warned about it in the web window only. Both halves are the verb's job now.
         prior = self.unverified_prior_task(self.chat_id, self.repo.get().strip())
-        prompt = host.apply_prompt(self.session, notice=self.removal_notice(),
+        prompt = host.apply_prompt(self.session, notice=self.approval_notice(),
                                    reason=repair.must_ask(self.session, prior), again=again)
         if not self.ask(prompt["title"], prompt["message"], prompt["warning"], prompt["ok_label"]):
             return
@@ -2191,17 +2311,19 @@ class AgentWindow:
         target = self.target if str(Path(repo).resolve()) == self._targets_root else "."
         label = runner.RECIPES[recipe]["label"]
         where = Path(repo).name if target in ("", ".") else PurePosixPath(target).name
+        # Read at the click, not stored on the window: an image typed and then unticked must not run.
+        sandbox = self.sandbox_image.get().strip() if self.sandbox_on.get() else ""
 
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
                                 progress=lambda line: self.events.put(("progress", line)),
-                                target=target)
+                                target=target, sandbox=sandbox)
             return repair.record_run(path, result), result
 
         def done(pair):
             self.display_session(path)
             self.report_run(pair[1])
-        self.run_job(work, done, f"Running {label} in {where}…")
+        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
 
     def report_run(self, result):
         # `summarize()` interpolates the recipe's own `reason` when the tool is missing, and a
@@ -2305,7 +2427,7 @@ class AgentWindow:
                         planbook.record_session(pair[0], pair[1], step_id, path.parent.name)
                 except (AgentError, OSError) as exc:
                     self.chat_message("Tool", "The plan ledger was not updated: " + friendly_error(exc))
-            self.select_view("review")
+            self.open_review()
             self.status.set(status_text("fix_ready", arabic=self.arabic))
         self.run_job(work, done, status, cancellable=True)
 

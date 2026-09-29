@@ -94,7 +94,7 @@ class WhatTheDoublesAnswer(unittest.TestCase):
         self.assertEqual(set(run_result(proof=PROOF)),
                          {"recipe", "label", "command", "status", "exit_code", "seconds",
                           "tests_observed", "proof", "truncated", "timed_out", "output",
-                          "tail", "failures", "target"})
+                          "tail", "failures", "target", "sandbox"})
 
     def test_the_status_of_a_failed_run_is_the_one_the_caller_branches_on(self):
         self.assertEqual(run_result(status="failed")["exit_code"], 1)

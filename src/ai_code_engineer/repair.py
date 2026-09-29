@@ -10,7 +10,8 @@ import hashlib
 import re
 from pathlib import Path
 
-from .engine import atomic_json, chat_sessions, event, load_session, shrink_warning
+from .engine import (atomic_json, chat_sessions, event, load_session, shrink_warning,
+                     unexpected_notice)
 from .errors import AgentError, PolicyError
 from .labels import INTERRUPTED_STATES
 from .redaction import redact
@@ -126,6 +127,17 @@ def removal_notice(session: dict | None) -> str:
         return ""
     return ("Removes most of an existing file:\n"
             + "\n".join("• " + note[:180] for note in notes[:3]) + "\n\n")
+
+
+def approval_advisories(session: dict | None) -> str:
+    """Everything the operator should read before approving, in one string, from one owner.
+
+    Both windows call this instead of the two halves: the removal warning lived alone in the dialog until
+    the unexpected-file flag was added, and a sentence that reaches one window's confirm box is the drift
+    this project keeps recording. The order is the reading order — what a change destroys, then which
+    changes nobody asked for.
+    """
+    return removal_notice(session) + unexpected_notice(session)
 
 
 def must_ask(session: dict | None, prior: dict | None = None) -> str:
@@ -424,6 +436,105 @@ def stalled(sessions: list) -> str:
             return ("no progress: " + str(latest["failures"]) + " failing of "
                     + str(latest["tests"]) + " tests, " + word + " the round before")
     return ""
+
+
+# What makes two recorded failures the same error. A stack line number, a test count, an absolute path
+# and a `[ERROR]` prefix all move when nothing about the problem moved, so a fingerprint that kept them
+# would call the same broken build a new one every round — and the whole point is to notice the repeat.
+ERROR_PREFIX = re.compile(r"^(?:\s*(?:\[?\s*(?:ERROR|WARNING|INFO|SEVERE)\]?|ERROR:\s*|FAILED\b|FAIL\b)"
+                          r"\s*[:\[\]]*\s*)+", re.I)
+# The position a compiler hangs on a filename (`Foo.java:12`, `Foo.java:[45,12]`) is stripped with the
+# file. What comes *after* a filename is kept: `::test_total` and `.method()` are the part of a pytest or
+# Maven line that says which test broke, and a token that gobbled them would fingerprint a whole suite as
+# one anonymous failure and hide which case is still open.
+FILE_TOKEN = re.compile(r"(?:[A-Za-z]:[\\/])?[^\s|]*\.(?:java|kt|kts|py|go|rs|js|jsx|ts|tsx|xml|gradle|"
+                        r"json|ya?ml|properties|mod|toml|c|cpp|h)\b(?:[:/]\[?\d+(?:,\s*\d+)?\]?)?",
+                        re.I)
+COORDINATES = re.compile(r"\b(?:at|line)\s+~?\d+\b|\b:\d+(?::\d+)?\b|\bL\d+:\d+\b", re.I)
+COUNTERS = re.compile(r"\b\d+(?:\.\d+)*\b")
+ERROR_LINES_KEPT = 6
+ERROR_LINE_CHARS = 160
+
+
+def error_identity(run: dict) -> str:
+    """The failure's own words, with its coordinates taken out and its secrets taken out with them.
+
+    This text is written into a model prompt and into the thread, so redaction is not optional here:
+    a Maven or pytest failure line routinely quotes the connection string that broke, and the repository
+    redactor cannot help a value that never looked like a key.
+    """
+    if not isinstance(run, dict) or run.get("status") == "passed":
+        return ""
+    lines = [str(row) for row in (run.get("failures") or []) if str(row).strip()]
+    if not lines:
+        # No parsed failures means the command failed before it reported any — a missing tool, an
+        # unresolvable artifact, a syntax error Maven never reached. The tail's last lines are where
+        # those say what happened.
+        lines = [line for line in str(run.get("tail", "")).splitlines() if line.strip()]
+    cleaned = []
+    for line in lines[-ERROR_LINES_KEPT:] if not run.get("failures") else lines[:ERROR_LINES_KEPT]:
+        text = ERROR_PREFIX.sub("", str(line))
+        text = FILE_TOKEN.sub("<file>", text)
+        text = COORDINATES.sub("", text)
+        text = COUNTERS.sub("N", " ".join(text.split()).casefold())
+        text = redact(text)[:ERROR_LINE_CHARS]
+        if text.strip(" .,:;-"):
+            cleaned.append(text)
+    return "\n".join(cleaned)
+
+
+def error_fingerprint(run: dict) -> str:
+    """A short, stable id for one error — the identity above, hashed so it is cheap to carry."""
+    identity = error_identity(run)
+    if not identity:
+        return ""
+    return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def unresolved(sessions: list, exclude_chat: str = "") -> list[dict]:
+    """Build errors this project has hit and never saw pass, whoever hit them.
+
+    `stalled()` answers "did this round help"; this answers the question a person asks when they start a
+    second chat for a build the first one could not fix — has this exact failure already been fought? An
+    error is settled when a run of the *same command in the same folder* passed after its last
+    occurrence; anything else is still open, and a task that walks into it is told before it spends a
+    round discovering it again.
+    """
+    failures, passes = [], []
+    for item in sessions or []:
+        if not isinstance(item, dict):
+            continue
+        # A session with no chat identity is its own, the same way `chat_sessions` treats one, so the
+        # task being planned now cannot mistake a bare run for somebody else's conversation.
+        owner = str(item.get("chat_id", "") or item.get("id", ""))
+        if exclude_chat and owner == exclude_chat:
+            continue
+        created = str(item.get("created", ""))
+        for run in (item.get("runs") or []):
+            stamp = str(run.get("at") or created)
+            where = {"at": stamp, "label": str(run.get("label", "")),
+                     "folder": runner.run_folder(run), "status": str(run.get("status", ""))}
+            if where["status"] == "passed":
+                passes.append(where)
+                continue
+            mark = error_fingerprint(run)
+            if mark:
+                failures.append({**where, "fingerprint": mark, "session": str(item.get("id", "")),
+                                 "sample": (error_identity(run).splitlines() or [""])[0]})
+
+    out = []
+    for mark in dict.fromkeys(row["fingerprint"] for row in failures):
+        seen = sorted((row for row in failures if row["fingerprint"] == mark), key=lambda row: row["at"])
+        last = seen[-1]
+        settled = any(row["status"] == "passed" and row["at"] > last["at"]
+                      and (row["label"], row["folder"]) == (last["label"], last["folder"])
+                      for row in passes)
+        if settled:
+            continue
+        out.append({"fingerprint": mark, "count": len(seen), "since": seen[0]["at"],
+                    "last": last["at"], "label": last["label"], "folder": last["folder"],
+                    "sample": last["sample"], "tasks": len({row["session"] for row in seen})})
+    return sorted(out, key=lambda row: (-row["count"], row["last"]))
 
 
 def should_stop(sessions: list, round_number: int, limit: int = MAX_FIX_ROUNDS) -> tuple[bool, str]:

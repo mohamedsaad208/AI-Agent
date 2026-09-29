@@ -2,7 +2,9 @@
 
 Commands are constant argv lists resolved with shutil.which; no shell, no model or
 user text reaches the command line. This reduces blast radius but is not a sandbox:
-OS-level isolation (verification.docker_check) stays the stronger boundary.
+the sandbox is here too (`sandbox_argv`, the `sandbox=` argument), and it is the only
+place in the codebase that starts a container — `verification.docker_check` asks it for
+its flags rather than keeping a second copy that can drift.
 """
 from __future__ import annotations
 
@@ -18,9 +20,11 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from collections import deque
 
+from . import ignore
 from .errors import PolicyError
 
 MAX_OUTPUT_CHARS = 200_000
@@ -163,6 +167,28 @@ def available() -> list[str]:
     return found
 
 
+def sandbox_available() -> bool:
+    """Whether this machine can start the container at all — the one question the switch asks.
+
+    Both windows grey the choice out from here rather than calling `which` themselves, so there is one
+    seam for a test to answer and one answer on a machine with and without a daemon.
+    """
+    return bool(shutil.which("docker"))
+
+
+def sandbox_state(on, image: str, available: bool) -> str:
+    """Which of the four sentences a sandbox choice deserves.
+
+    A name, not a sentence: the words belong to `labels`, and the preview window has to be able to say
+    the same four things without a daemon to ask.
+    """
+    if not available:
+        return "sandbox_missing"
+    if not on:
+        return "sandbox_off"
+    return "sandbox_on" if SANDBOX_IMAGE.fullmatch(str(image or "").strip()) else "sandbox_unpinned"
+
+
 def detect(repo: Path, installed: list[str] | None = None) -> list[str]:
     """Recipes matching the project's build files, in RECIPES order.
 
@@ -188,16 +214,86 @@ def child_env() -> dict:
             if (value := os.environ.get(key)) is not None}
 
 
+# ---------------------------------------------------------------- the sandbox
+
+SANDBOX_IMAGE = re.compile(r"[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}")
+# Where the copied project lives inside the container. A POSIX path either way: the string is passed
+# to Docker, not to this OS, and a Windows source is normalised to forward slashes below.
+WORKDIR = "/work"
+# The interpreter a recipe names once it is inside an image. `sys.executable` is this machine's
+# `python.exe` under a user profile, and no image has that path.
+IMAGE_PYTHON = "python3"
+SANDBOX_FILES = 2000
+SANDBOX_BYTES = 20_000_000
+# Not part of what a clean build needs, and each one is bigger than the sources it sits beside. A
+# project whose build genuinely depends on `node_modules` needs an image that carries it: the
+# container has no network, so nothing can be installed into it.
+SANDBOX_SKIP = (".git", ".svn", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache",
+                ".gradle", ".venv", "venv")
+
+
+def copy_for_sandbox(root: Path, target: Path) -> dict:
+    """The project, on the host side of the mount, minus what a clean build does not need.
+
+    The copy is the isolation: the user's tree is never mounted, so nothing the build writes can land
+    in it, and the reports the build *does* write are readable here afterwards. Size is capped because
+    a container that cannot start in reasonable time is not a safer answer than a host run — it is just
+    a slower refusal, so it is refused as a policy instead.
+    """
+    files = total = 0
+    for path in root.rglob("*"):
+        if any(part in SANDBOX_SKIP for part in path.relative_to(root).parts[:-1]):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        files += 1
+        total += size
+        if files > SANDBOX_FILES:
+            raise PolicyError("The project is too large to copy into a sandbox (%d files)." % files)
+        if total > SANDBOX_BYTES:
+            raise PolicyError("The project is too large to copy into a sandbox (20 MB).")
+    shutil.copytree(root, target, ignore=shutil.ignore_patterns(*SANDBOX_SKIP), symlinks=False,
+                    dirs_exist_ok=True)
+    # The container runs as an unprivileged uid; on a POSIX host a temp directory owned by this user
+    # is not writable by it. Windows maps its own permissions and ignores the mode.
+    os.chmod(target, 0o1777)
+    return {"files": files, "bytes": total}
+
+
+def sandbox_argv(docker: str, source: Path, image: str, name: str, command: list[str],
+                 workdir: str = WORKDIR) -> list[str]:
+    """The one container this tool knows how to start, and the only place its flags are written.
+
+    No network, no capabilities, no new privileges, an unprivileged uid, a read-only root filesystem
+    with the copied project as the single writable mount, and a pinned image — a tag can be retagged
+    at any time, a digest cannot. `--rm` cleans the container up; the caller's `docker rm -f` covers
+    the case where it never got to exit.
+
+    `command` is argv inside the container: no shell, and nothing here interpolates model or user text.
+    """
+    if not SANDBOX_IMAGE.fullmatch(image):
+        raise PolicyError("Choose a preloaded image pinned by sha256 digest.")
+    return [docker, "run", "--name", name, "--rm", "--pull=never", "--network=none",
+            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--user=65534:65534", "--pids-limit=128", "--memory=1g", "--cpus=1",
+            "--mount", "type=bind,source=%s,target=%s" % (source.as_posix(), workdir),
+            "--tmpfs", "/tmp:rw,nosuid,size=128m",
+            "--workdir", workdir, "--env", "HOME=/tmp", image, *command]
+
+
 # Folders that hold a build of their own. This is the whole of what a "project" is here: the tool
 # does not guess from the file tree, it reads the file a build tool would have to have. Lowercased,
 # because the comparison is by folded name on a case-insensitive filesystem.
 PROJECT_FILES = ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
                  "package.json", "pyproject.toml", "go.mod", "cargo.toml", "makefile")
 # Walked past, never into: a vendored dependency and a build output both contain build files that
-# belong to somebody else, and `mvn` would be happy to answer to any of them.
-PROJECT_SKIP = {"node_modules", "target", "build", "dist", "out", "bin", "obj", "vendor", "venv",
-                ".venv", ".direnv", "__pycache__", ".git", ".gradle", ".mvn", ".idea", ".next",
-                "site-packages", ".tox", ".pytest_cache"}
+# belong to somebody else, and `mvn` would be happy to answer to any of them. The names are
+# `ignore.project_dir` holds those names: the read gate's list plus the output folders that only
+# disqualify a directory as a project root, never as a file somebody asked to read.
 PROJECT_DEPTH = 3
 PROJECT_LIMIT = 40
 
@@ -228,7 +324,7 @@ def projects(repo: Path, max_depth: int = PROJECT_DEPTH,
             except OSError:
                 continue
             for child in entries:
-                if child.name.lower() in PROJECT_SKIP:
+                if ignore.project_dir(child.name):
                     continue
                 if _holds_build_file(child):
                     relative = child.relative_to(root).as_posix()
@@ -586,47 +682,90 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
 
 
 def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
-        progress=lambda _text: None, target: str = "") -> dict:
+        progress=lambda _text: None, target: str = "", sandbox: str = "") -> dict:
     """Execute a fixed recipe in the project folder — or in one module of it, when a target is named.
 
     `target` is a relative folder of `repo`, never a path the caller invented: `project_folder`
     resolves and checks it, and the child's `cwd` is the result. A reactor build runs at the root and
     Maven walks the modules itself; pointing one module at a time is for the monorepo where the
     modules do not share a build file.
+
+    `sandbox` is the pinned image to run inside, or "" for this machine. With one named, the project is
+    copied to the host side of the only writable mount the container sees: the tree the user opened is
+    never mounted, so nothing the build writes can reach it, and the reports the build writes are still
+    readable afterwards — which is the whole reason the copy is a directory and not a tmpfs.
     """
     if recipe not in RECIPES:
         # A PolicyError carries its reason through friendly_error; a bare ValueError would be
         # replaced by "Could not complete the operation." in both windows.
         raise PolicyError("Unknown recipe: " + str(recipe)[:80])
-    command = list(RECIPES[recipe]["command"])
-    program = shutil.which(command[0])
-    if program is None and command[0] != sys.executable:
-        return {"recipe": recipe, "command": shlex.join(command), "status": "unavailable",
-                "reason": command[0] + " is not installed or not on PATH."}
-    command[0] = program or command[0]
+    recipe_entry = RECIPES[recipe]
+    command = list(recipe_entry["command"])
+    sandbox = str(sandbox or "").strip()
+    if sandbox and not SANDBOX_IMAGE.fullmatch(sandbox):
+        # Refused before the copy: a tag can be retagged while the build is running, and a project
+        # tree has already been walked and written to a temp folder by the time argv is assembled.
+        raise PolicyError("Choose a preloaded image pinned by sha256 digest.")
+    docker = ""
+    if sandbox:
+        docker = shutil.which("docker") or ""
+        if not docker:
+            # The rule the request asked for twice: a missing sandbox is a refusal, not a hint to run
+            # the build on the machine the sandbox was chosen to keep the build away from.
+            return {"recipe": recipe, "label": recipe_entry["label"],
+                    "command": display_command(recipe), "status": "blocked",
+                    "reason": "Docker is not installed. The command did not run on the host either.",
+                    "sandbox": {"image": sandbox, "container": ""}}
+    else:
+        program = shutil.which(command[0])
+        if program is None and command[0] != sys.executable:
+            return {"recipe": recipe, "command": shlex.join(command), "status": "unavailable",
+                    "reason": command[0] + " is not installed or not on PATH."}
+        command[0] = program or command[0]
     root = Path(repo).resolve(strict=True)
     where = project_folder(root, target)
     started = time.monotonic()
     started_wall = time.time()
-    recipe_entry = RECIPES[recipe]
     reports = (tempfile.TemporaryDirectory(prefix="agent-report-")
                if recipe_entry.get("junit_arg") else None)
-    junit = None
-    if reports is not None:
-        junit = Path(reports.name) / "junit.xml"
-        command += [recipe_entry["junit_arg"], str(junit)]
-    progress("Running " + shlex.join(recipe_entry["command"]))
-    options = {"cwd": str(where), "env": child_env(), "stdin": subprocess.DEVNULL,
-               "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-    if os.name == "nt":
-        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        options["creationflags"] = new_group | no_window
-    else:
-        options["start_new_session"] = True
+    sandbox_dir = None
+    name = ""
     process = None
     try:
-        process = subprocess.Popen(command, **options)
+        if sandbox:
+            sandbox_dir = tempfile.TemporaryDirectory(prefix="agent-sandbox-")
+            copy = Path(sandbox_dir.name)
+            copy_for_sandbox(root, copy)
+            relative = "" if where == root else where.relative_to(root).as_posix()
+            inside = WORKDIR + ("/" + relative if relative else "")
+            read_from = copy if not relative else copy / where.relative_to(root)
+            # The image resolves its own interpreter; this machine's absolute path means nothing in there.
+            argv = [IMAGE_PYTHON if part == sys.executable else str(part) for part in command]
+            junit = None
+            if reports is not None:
+                junit = read_from / "junit.xml"
+                argv += [recipe_entry["junit_arg"], inside + "/junit.xml"]
+            name = "ai-agent-" + uuid.uuid4().hex
+            argv = sandbox_argv(docker, copy, sandbox, name, argv, workdir=inside)
+            cwd = None
+        else:
+            argv = command
+            read_from, cwd = where, str(where)
+            junit = None
+            if reports is not None:
+                junit = Path(reports.name) / "junit.xml"
+                argv = command + [recipe_entry["junit_arg"], str(junit)]
+        progress("Running " + shlex.join(recipe_entry["command"])
+                 + (" in Docker (" + sandbox.split("@")[0] + ")" if sandbox else ""))
+        options = {"cwd": cwd, "env": child_env(), "stdin": subprocess.DEVNULL,
+                   "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+        if os.name == "nt":
+            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            options["creationflags"] = new_group | no_window
+        else:
+            options["start_new_session"] = True
+        process = subprocess.Popen(argv, **options)
         output, timed_out, dropped = _collect(process, progress, started + timeout)
         seconds = round(time.monotonic() - started, 1)
         truncated = dropped > 0
@@ -634,7 +773,7 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         pattern = recipe_entry["test_counts"]
         counts = re.findall(pattern, output) if pattern else []
         ran = tests_ran(recipe_entry, output, counts)
-        proof = report_counts(fresh_reports(where, recipe_entry.get("reports", ()),
+        proof = report_counts(fresh_reports(read_from, recipe_entry.get("reports", ()),
                                             started_wall, junit))
         if proof is not None:
             proof["source"] = recipe_entry.get("proof_source", "JUnit XML")
@@ -652,6 +791,19 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
                 process.wait(timeout=POST_KILL_GRACE)
             except subprocess.TimeoutExpired:
                 pass
+        if name:
+            # `--rm` removes a container that exits; one that was killed does not get the chance, and a
+            # leftover container holds its mount for the rest of the daemon's life. A failure here is
+            # not the result's business: the run it is cleaning up after is already answered.
+            try:
+                subprocess.run([docker, "rm", "-f", name], capture_output=True, timeout=20,
+                               stdin=subprocess.DEVNULL, env=child_env(),
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                               if os.name == "nt" else 0)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if sandbox_dir is not None:
+            sandbox_dir.cleanup()
         if reports is not None:
             reports.cleanup()
     return {"recipe": recipe, "label": recipe_entry["label"],
@@ -659,6 +811,9 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
             # a reactor's root and one module of it answer to the same recipe name, and a fix round
             # sent to "the build failed" with no folder in it is a guess about which build failed.
             "target": "." if where == root else where.relative_to(root).as_posix(),
+            # Where the command ran is part of what a green means: a passing Maven run inside
+            # `eclipse-temurin@sha256:…` is a claim about that image's JDK, not about this machine's.
+            "sandbox": {"image": sandbox, "container": name} if sandbox else None,
             "command": shlex.join(recipe_entry["command"]), "status": status,
             "exit_code": exit_code, "seconds": seconds,
             "tests_observed": bool(proof and proof["tests"]) or ran,
@@ -685,7 +840,11 @@ def summarize(result: dict) -> str:
     """
     folder = run_folder(result)
     named = result["label"] + (" in " + PurePosixPath(folder).name if folder else "")
-    if result["status"] == "unavailable":
+    # Where a green happened is part of what it claims: a passing build inside an image says nothing
+    # about this machine's JDK, and a reader comparing two runs has to be able to tell them apart.
+    if result.get("sandbox"):
+        named += " in Docker"
+    if result["status"] in ("unavailable", "blocked"):
         return f"{named}: {result['reason']}"
     state = {"passed": "passed", "failed": "FAILED", "timeout": "timed out",
              "unverified": "no tests ran"}[result["status"]]

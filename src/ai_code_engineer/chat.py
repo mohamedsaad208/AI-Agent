@@ -148,7 +148,12 @@ def context_use(chat: dict | None, settings: Settings, context: str = "") -> dic
 
 
 def respond(chat: dict, provider, user_text: str, settings: Settings, store: Path,
-            context: str = "") -> str:
+            context: str = "", on_token=None) -> str:
+    """Answer one question. `on_token`, when given, hears the answer as it arrives.
+
+    The callback is a display consumer: what is stored and returned is the assembled reply the
+    provider hands back, so a browser that lost a frame cannot change the transcript.
+    """
     text = user_text.strip()
     if not text:
         raise AgentError("Type a question first.")
@@ -156,7 +161,12 @@ def respond(chat: dict, provider, user_text: str, settings: Settings, store: Pat
         raise AgentError("Your message is too long; split it into smaller questions.")
     chat["turns"].append({"role": "user", "content": text})
     try:
-        reply = provider.generate(_messages(chat, settings, context), json_mode=False)
+        # Asked, not assumed: a provider that does not advertise `supports_stream` may be a scripted
+        # double whose `generate` has never taken a third argument, and the answer is the same either
+        # way — a stream is something the reader sees, not something the reply depends on.
+        listening = {"on_token": on_token} if (on_token is not None and
+                                               getattr(provider, "supports_stream", False)) else {}
+        reply = provider.generate(_messages(chat, settings, context), json_mode=False, **listening)
     except Exception:
         chat["turns"].pop()  # Do not persist a question the model never answered.
         raise

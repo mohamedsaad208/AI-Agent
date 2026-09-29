@@ -128,7 +128,8 @@ function applyEvent(msg) {
     case 'status': state.status = msg.text; paintStatus(); break;
     case 'log': appendLog(msg.entry || msg); break;
     case 'log_chunk': pushChunk(msg); break;
-    case 'message': state.data.messages.push(msg.message); renderThread(); break;
+    case 'message': if ((msg.message || {}).role === 'assistant') STREAM = '';
+                    state.data.messages.push(msg.message); renderThread(); break;
     case 'token': appendToken(msg.text); break;
     case 'busy': setBusy(msg.value, msg.cancellable); break;
     case 'confirm': drawAsk(msg); break;
@@ -457,6 +458,86 @@ async function projectDrawer(group) {
   body.appendChild(tool);
 }
 
+/* The module graph. The server walks the folder and answers with nodes, edges and a column for each
+   module, and this only draws what it said: no layout maths, no simulation, no library. The columns are
+   build order, so the leftmost box is the first thing that compiles and an arrow points left, at what a
+   module needs — which is why the subtitle says it before the reader has to guess it from the shape. */
+function graphSvg(data) {
+  const COL = 186, ROW = 58, TOP = 26, LEFT = 14, BOX = 150, BOXH = 38;
+  const columns = {};
+  let deepest = 1;
+  (data.nodes || []).forEach((node) => {
+    const key = Number(node.column || 0);
+    (columns[key] = columns[key] || []).push(node);
+    if (key + 1 > deepest) deepest = key + 1;
+  });
+  const rows = Math.max(1, ...Object.values(columns).map((list) => list.length));
+  const place = {};
+  Object.keys(columns).forEach((key) => {
+    columns[key].forEach((node, index) => {
+      place[node.name] = { x: LEFT + Number(key) * COL, y: TOP + index * ROW };
+    });
+  });
+  const width = LEFT + (deepest - 1) * COL + BOX + LEFT;
+  const height = TOP + rows * ROW + 10;
+  const clip = (name) => (name.length > 19 ? name.slice(0, 18) + '…' : name);
+  const lines = (data.edges || []).map((edge) => {
+    const from = place[edge.from], to = place[edge.to];
+    if (!from || !to) return '';
+    const x1 = from.x, y1 = from.y + BOXH / 2, x2 = to.x + BOX, y2 = to.y + BOXH / 2;
+    const lean = Math.max(28, (x1 - x2) / 2);
+    const heavy = Math.min(5, 1 + Number(edge.count || 1) * 0.7);
+    return `<path class="gedge" marker-end="url(#ghead)" stroke-width="${heavy.toFixed(1)}" `
+      + `d="M${x1} ${y1} C${x1 - lean} ${y1}, ${x2 + lean} ${y2}, ${x2} ${y2}"><title>`
+      + `${esc(edge.from)} → ${esc(edge.to)} (${esc(String(edge.count))} files)</title></path>`;
+  }).join('');
+  const boxes = (data.nodes || []).map((node) => {
+    const at = place[node.name];
+    if (!at) return '';
+    return `<g class="gnode"><rect x="${at.x}" y="${at.y}" width="${BOX}" height="${BOXH}" rx="7">`
+      + `<title>${esc(node.name)} — ${esc(String(node.files))} indexed file(s)</title></rect>`
+      + `<text x="${at.x + 9}" y="${at.y + 23}">${esc(clip(String(node.name)))}</text></g>`;
+  }).join('');
+  return `<svg class="graph" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" `
+    + `role="img" aria-label="${esc(data.caption || 'Module dependency graph')}">`
+    + `<defs><marker id="ghead" viewBox="0 0 9 9" refX="8" refY="4.5" markerWidth="7" `
+    + `markerHeight="7" orient="auto-start-reverse"><path class="ghead" d="M0 0 L9 4.5 L0 9 z"/>`
+    + `</marker></defs>${lines}${boxes}</svg>`;
+}
+
+async function graphSheet() {
+  const s = sheet('Dependency graph', 'Left builds first · an arrow points at what a module needs');
+  s.classList.add('wide');
+  const body = el('div', 'content');
+  body.appendChild(el('div', 'quiet', 'Mapping this folder…'));
+  s.appendChild(body);
+  modal(s);
+  let data;
+  try {
+    const reply = await api('/api/action', { type: 'show_graph' });
+    data = reply && reply.result;
+    if (reply && reply.state) render(reply.state);
+  } catch (err) {
+    body.innerHTML = '';
+    body.appendChild(el('div', 'warnbox', esc(String(err.message || err))));
+    return;
+  }
+  body.innerHTML = '';
+  if (!data || !(data.nodes || []).length) {
+    /* The server always answers in words when there is nothing to draw; this is the click that must not
+       open an empty box and leave the reader wondering whether the project has no structure. */
+    body.appendChild(el('div', 'quiet', esc((data || {}).note || 'The window answered with no graph.')));
+    return;
+  }
+  body.appendChild(el('div', 'quiet', esc(data.caption || '')));
+  body.appendChild(el('div', 'gscroll', graphSvg(data)));
+  const list = el('div', 'gmods');
+  (data.nodes || []).forEach((node) => list.appendChild(el('div', 'gmod',
+    `<b>${esc(String(node.name))}</b> <span class="quiet mono">`
+    + `${esc(String(node.files))} file(s) · column ${esc(String(Number(node.column || 0) + 1))}</span>`)));
+  body.appendChild(list);
+}
+
 /* The palette is served by the controller, so a mark the app does not know about cannot be
    painted into the sidebar no matter what the registry file contains. */
 function iconPicker(group) {
@@ -642,9 +723,15 @@ function renderThread() {
     if (m.role !== 'user' && (m.text || '').trim()) body.appendChild(msgActions(i));
     msg.append(pic, body); thread.appendChild(msg);
   });
-  if (DATA.pending) {
+  if (DATA.pending || STREAM) {
     const msg = el('div', 'msg');
-    msg.innerHTML = `<div class="pic">A</div><div class="body"><div class="bub" dir="auto"><span class="typing"><i></i><i></i><i></i> ${esc(DATA.pending)}</span></div></div>`;
+    /* While an answer is arriving it is plain text in here, and markdown appears when the finished
+       message lands: reparsing the whole reply per line would repaint on every one of them. The
+       bubble is drawn from the text that has arrived when there is any, and from the waiting line
+       before there is — which is what lets a stream show an answer without claiming a job is running. */
+    msg.innerHTML = `<div class="pic">A</div><div class="body"><div class="bub" dir="auto">`
+      + `<span class="typing"><i></i><i></i><i></i> `
+      + `<span class="typing-line">${esc(STREAM || DATA.pending)}</span></span></div></div>`;
     thread.appendChild(msg);
   }
   thread.querySelectorAll('[data-copy]').forEach((b) => {
@@ -664,9 +751,20 @@ function renderThread() {
   if (stick) $('scroller').scrollTop = $('scroller').scrollHeight;
 }
 
+/* The answer that is arriving right now, whole lines from the server, kept out of DATA.messages for
+   the same reason LIVE is: a snapshot goes out on every other event, and a half-finished reply must
+   not be stored, hashed or exported as if it were one. Cleared when the next job starts. */
+let STREAM = '';
+const STREAM_MAX = 20000;
 function appendToken(text) {
-  const last = DATA.messages[DATA.messages.length - 1];
-  if (last && last.role === 'assistant') { last.text += text; const bub = $('thread').lastElementChild?.querySelector('.bub'); if (bub) bub.innerHTML = mdToHtml(last.text); }
+  STREAM = (STREAM ? STREAM + '\n' + text : text).slice(-STREAM_MAX);
+  if (!document.querySelector('.typing-line')) {
+    renderThread();                                  // the first chunk has to create its own bubble
+    return;
+  }
+  const line = document.querySelector('.typing-line');
+  line.textContent = STREAM;
+  $('scroller').scrollTop = $('scroller').scrollHeight;
 }
 
 function msgActions(index) {
@@ -1021,7 +1119,6 @@ function renderSetup() {
   const card = DATA.setup || {};
   const rows = card.rows || [];
   if (!card.show || !rows.length) return;
-  const counts = card.counts || {};
   const btn = (label, title, run) => {
     const b = el('button', 'line-btn');
     b.textContent = label; b.title = title; b.onclick = run;
@@ -1030,7 +1127,9 @@ function renderSetup() {
   const head = el('div', 'setup-head');
   const title = el('b'); title.textContent = 'Set up this machine';
   const tally = el('span', 'setup-tally');
-  tally.textContent = `${counts.ok || 0} ok · ${counts.warn || 0} to watch · ${counts.bad || 0} blocking`;
+  // The server writes the tally: the card's rows already arrive as its sentences in its language, and
+  // a count line assembled here would be the one part of the card in a second voice.
+  tally.textContent = card.tally || '';
   head.append(title, tally,
     btn('Run the checks', 'Ask this machine what it can reach: the provider, its model list, and the '
         + 'command the folder answers to.', () => send('setup_check')),
@@ -1166,10 +1265,16 @@ function renderRail() {
        the reactor root and "Maven test" in one module are different questions with different answers.
        With one project there is nothing to choose, and a picker of one is noise. */
     const many = (DATA.targets || []).length > 1;
+    const sb = DATA.sandbox || {};
     const c = el('div', 'card');
     c.innerHTML = `<h5>Checks</h5>
       ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
       <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
+      <label class="switch" style="margin-top:8px"><input type="checkbox" id="sandboxOn"
+        ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker</label>
+      <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
+        ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace">
+      <div class="meta" dir="auto">${esc(sb.note || '')}</div>
       <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
       ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
       <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
@@ -1177,6 +1282,10 @@ function renderRail() {
     c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
     if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
       DATA.targets.map(row => row.label));
+    /* The digest is sent when the field is left, not on every keystroke: it is a name that either
+       matches or does not, and the server writes the preference on each answer. */
+    c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
+    c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
     c.querySelector('#run').onclick = () => send('run', { fix: false });
     c.querySelector('#fix').onclick = () => send('run', { fix: true });
     c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;
@@ -1199,6 +1308,9 @@ function renderRail() {
     const info = el('button', 'link', '📁 Project settings & status <span class="r">›</span>');
     info.onclick = () => projectDrawer(group || { key: DATA.branch.key, name: DATA.project.name, path: DATA.project.path });
     s.insertBefore(info, s.querySelector('.hr'));
+    const graph = el('button', 'link', '🕸️ Dependency graph <span class="r">›</span>');
+    graph.onclick = () => graphSheet();
+    s.insertBefore(graph, s.querySelector('.hr'));
   }
   rail.appendChild(s);
 }
@@ -1481,7 +1593,7 @@ function switchView(view) {
 function setBusy(busy, cancellable) {
   state.busy = busy;
   paintStatus();
-  if (busy && LIVE.length) { LIVE.length = 0; renderLog(); }
+  if (busy && (LIVE.length || STREAM)) { LIVE.length = 0; STREAM = ''; renderLog(); }
   if (DATA) {
     DATA.busy = busy; DATA.cancellable = !!cancellable;
     // The typing line means "a request is in flight". Once the window is not busy it has to go,

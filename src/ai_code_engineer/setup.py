@@ -127,7 +127,7 @@ def provider_rows(kind: config.Kind, endpoint: str, api_key: str | None, model: 
         return [row("provider", BAD, arabic=arabic, en=f"{label}: the endpoint is refused.",
                     ar=f"{label}: العنوان مرفوض.", advice_en=str(exc), advice_ar=str(exc)),
                 row("model", INFO, arabic=arabic, en="No model was checked.",
-                    ar="مفيش موديل اتلقات.")]
+                    ar="مفيش موديل اتفحص.")]
     entries, source, error = reach(kind, checked, api_key)
     if error:
         start = f"Cannot reach {label} at {checked}."
@@ -141,7 +141,7 @@ def provider_rows(kind: config.Kind, endpoint: str, api_key: str | None, model: 
         return [row("provider", BAD, arabic=arabic, en=start, ar=pull_ar,
                     advice_en=advice, advice_ar=advice_ar),
                 row("model", INFO, arabic=arabic, en="No model list to choose from.",
-                    ar="مفيش قائمة موديلات اتلقات منها.")]
+                    ar="مفيش قائمة موديلات اتقريت منها.")]
     live = source == catalog.LIVE
     local = [entry for entry in entries if not entry.get("cloud")]
     rows = [row("provider", OK, arabic=arabic,
@@ -272,7 +272,7 @@ def audit(*, repo: str = "", provider: str = "", endpoint: str = "", api_key: st
     rows.append(demo_row(demo, arabic=arabic) if demo else
                 row("demo", INFO, arabic=arabic,
                     en="The offline proof has not been run yet.",
-                    ar="دليل الشغل من غير نت ما اتلقاش لحد دلوقتي.",
+                    ar="دليل الشغل من غير نت ما اتعملش لحد دلوقتي.",
                     advice_en="Run it from the setup step: it writes only to a temporary folder.",
                     advice_ar="شغّله من خطوة الإعداد: بيكتب في مجلد مؤقت بس."))
     rows.append(policy_row(arabic=arabic))
@@ -348,6 +348,29 @@ def counts(rows: list[dict]) -> dict:
     return out
 
 
+def tally(counts: dict, *, arabic: bool = False) -> str:
+    """`3 ok · 1 to watch · 0 blocking` — the count line both windows print and the card shows."""
+    return say(arabic,
+               en="{} ok · {} to watch · {} blocking".format(counts[OK], counts[WARN], counts[BAD]),
+               ar="{} تمام · {} تحت الملاحظة · {} مانع".format(counts[OK], counts[WARN], counts[BAD]))
+
+
+def checks_done(counts: dict, *, arabic: bool = False) -> str:
+    """The one sentence a finished check produces. Both windows had written it themselves, which left
+    the Tk one saying it in English to a person reading Arabic."""
+    return say(arabic, en="Checks done: " + tally(counts) + ".",
+               ar="الفحوص خلصت: " + tally(counts, arabic=True) + ".")
+
+
+def proof_done(passed: bool, note: str = "", *, arabic: bool = False) -> str:
+    """The verdict of the offline proof, in the same words whichever surface ran it."""
+    return say(arabic,
+               en=("The proof held: a proposal was applied, checked and rolled back in a temporary "
+                   "folder." if passed else "The proof did not complete: " + str(note)[:120]),
+               ar=("الدليل نجح: مقترح اتطبّق واتفحص واتراجع في مجلد مؤقت." if passed else
+                   "الدليل ما كملش: " + str(note)[:120]))
+
+
 def first_run(app_dir: Path) -> bool:
     """Whether this machine has ever granted a folder.
 
@@ -355,14 +378,9 @@ def first_run(app_dir: Path) -> bool:
     wizard, and one who has never named a folder has no way to know where to start.
     """
     try:
-        import json
         data = json.loads((Path(app_dir) / ".agent-projects.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return True
-    return not data.get("projects")
-
-
-def needs_policy(rows: list[dict]) -> bool:
-    """Whether the policy step has to be answered before a remote model may be chosen."""
-    return any(item["id"] == "model" and item["status"] == WARN and "remote" in item["text"]
-               for item in rows)
+    # A file the controller cannot read either — a list where it expects a mapping — counts as no
+    # registry: the wizard is one click to dismiss, and silence is not.
+    return not isinstance(data, dict) or not data.get("projects")

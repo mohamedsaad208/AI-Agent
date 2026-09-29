@@ -72,3 +72,41 @@ and offers the next action**, with three entry points over it:
 6. Tests: `test_setup.py` for the rows and each verdict branch, `test_cli.py` for `agent setup` answers
    driven from a pipe, `test_controller.py`/`test_gui.py` for the surfaces, and a check that the wizard
    never claims a model is installed from a built-in fallback list.
+
+## Shipped
+
+Built as planned above, in that order. `1084 → 1166` tests.
+
+**What the code said that the spec did not.** Recorded in the Premises section, restated here because
+each one changed what was built: `doctor` and `demo` already existed, so `setup.py` sequences them
+instead of replacing them; there are three write positions, not two, so step 8 offers three; "choose a
+workspace" contradicts UI 2.8's no-global-default-folder decision, so the wizard *checks* a folder named
+with `--repo` and points at the sidebar for granting one; and `check_setup()` already runs at every
+launch, so the card had to be built from rows that cost nothing rather than from another probe.
+
+**Two defects the tests caught, both now fixed:**
+
+- `controller._save_state()` rebuilds its preference dict from named keys. `setup_seen` was written by
+  "Don't show this again" and then erased by the next unrelated save — the dismissal lasted until
+  something else changed. The flag is now one of the named keys, and a test writes an unrelated
+  preference between the dismissal and the restart to keep it that way. (`read_only` needs no such fix:
+  it lives per branch in `_composer_pref`, which was already listed.)
+- The Tk window's check ran `setup_rows()` inside the worker thread, and building a row reads four
+  `StringVar`s — off-thread that raises *main thread is not in main loop*, and the click answered with
+  the generic failure line. `setup_values()` now reads them on the UI thread and the job body receives
+  the dict. The web controller already did this correctly by copying the values before `run_job`.
+
+**One thing removed while building:** a `setup_show` action. The only route back to a dismissed card is
+the Settings entry whose own label says it will ask this machine, so re-opening and re-checking are one
+click, and an action that only flipped a flag had no way to be reached.
+
+**Single-sourced along the way.** `setup.tally()`, `setup.checks_done()` and `setup.proof_done()` are now
+the only copies of the count line and the proof verdict; both windows had written them, which left the
+Tk window saying both in English to a person reading Arabic, and the web card's tally was being
+assembled in `app.js` from bare counts. The card now receives the sentence, the way its rows already
+did. `tests/test_setup.py` greps both windows for the old literals, the same guard `test_intent.py` runs
+on the refusals.
+
+**Deliberately not built** (unchanged from the plan): no forced wizard, no installer, no model pull, no
+LLM call inside setup, no second preference store, no reformatting of `doctor`'s JSON keys.
+

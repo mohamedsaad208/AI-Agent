@@ -19,6 +19,29 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _refuse(exc: HTTPError) -> ProviderError:
+    """The one translation of a provider that answered with an error code.
+
+    Never the request, the bearer token or the URL. The response body is a different case: it is the
+    only place Ollama writes *why* it refused, and "model requires more system memory (9.2 GiB) than
+    is available (6.1 GiB)" is the difference between a dead task and a fixable one. So a short,
+    collapsed, redacted excerpt is allowed — capped, not trusted.
+    """
+    detail = ""
+    try:
+        detail = redact(" ".join(exc.read(4096).decode("utf-8", "replace").split()))[:180]
+    except Exception:                                      # noqa: BLE001 - a body that will not
+        detail = ""                                        # read is not worth losing the code for
+    return ProviderError(f"Provider HTTP {exc.code}"
+                         + (f": {detail}" if detail else "")
+                         + "; no automatic retry or fallback.")
+
+
+def _opener():
+    """One opener for both reads, so a streaming body cannot inherit different rules than a buffered one."""
+    return build_opener(ProxyHandler({}), NoRedirect())
+
+
 def request_json(url: str, payload: dict | None = None, *, key: str | None = None,
                  timeout: int = 120, max_bytes: int = 2_000_000) -> dict:
     headers = {"Content-Type": "application/json"}
@@ -27,7 +50,7 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
     request = Request(url, data=json.dumps(payload).encode() if payload is not None else None,
                       headers=headers)
     try:
-        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=timeout) as response:
+        with _opener().open(request, timeout=timeout) as response:
             raw = response.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise ProviderError("Provider response exceeds size limit.")
@@ -36,23 +59,102 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
             raise ProviderError("Provider returned an invalid response.")
         return result
     except HTTPError as exc:
-        # Never show the request, the bearer token or the URL. The response body is a different case:
-        # it is the only place Ollama writes *why* it refused, and "model requires more system memory
-        # (9.2 GiB) than is available (6.1 GiB)" is the difference between a dead task and a fixable
-        # one. So a short, collapsed, redacted excerpt is allowed — capped, not trusted.
-        detail = ""
-        try:
-            detail = redact(" ".join(exc.read(4096).decode("utf-8", "replace").split()))[:180]
-        except Exception:                                      # noqa: BLE001 - a body that will not
-            detail = ""                                        # read is not worth losing the code for
-        raise ProviderError(f"Provider HTTP {exc.code}"
-                            + (f": {detail}" if detail else "")
-                            + "; no automatic retry or fallback.") from None
-    except (URLError, TimeoutError, OSError) as exc:
+        raise _refuse(exc) from None
+    except (URLError, TimeoutError, OSError):
         raise ProviderError("Provider connection failed or timed out. A local model needs a longer "
                        "request timeout for a reply this large.") from None
-    except (ValueError, UnicodeError) as exc:
+    except (ValueError, UnicodeError):
         raise ProviderError("Provider returned invalid JSON.") from None
+
+
+# A streaming body announces no length to trust, so the cap moves to what has been read. The same
+# figure as the buffered read, because a reply that grows past it is not an answer that arrived late.
+MAX_STREAM_BYTES = 2_000_000
+
+
+def ollama_chunk(line: bytes) -> dict | None:
+    """One NDJSON line from `/api/chat`: what was added, to which field, and how it ended."""
+    try:
+        chunk = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(chunk, dict):
+        return None
+    message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
+    return {"content": str(message.get("content") or ""),
+            "thinking": str(message.get("thinking") or message.get("reasoning") or ""),
+            "finish": str(chunk.get("done_reason") or "") or None,
+            "model": "", "done": bool(chunk.get("done"))}
+
+
+def openai_chunk(line: bytes) -> dict | None:
+    """One SSE frame from `/chat/completions`. Blank frames and comment lines carry no text.
+
+    DeepSeek's R1 line and OpenRouter's reasoning models put the deliberation in the delta beside the
+    content, under the same two names they use in the buffered answer, so the same fields are read
+    here — a streaming reply is not a licence to drop half of it.
+    """
+    text = line.decode("utf-8", "replace").strip()
+    if not text.startswith("data:"):
+        return None
+    body = text[5:].strip()
+    if body == "[DONE]":
+        return {"content": "", "thinking": "", "finish": None, "model": "", "done": True}
+    try:
+        chunk = json.loads(body)
+    except ValueError:
+        return None
+    choices = chunk.get("choices") or []
+    first = choices[0] if choices and isinstance(choices[0], dict) else {}
+    delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+    return {"content": str(delta.get("content") or ""),
+            "thinking": str(delta.get("reasoning_content") or delta.get("reasoning") or ""),
+            "finish": first.get("finish_reason") or None,
+            "model": str(chunk.get("model") or ""), "done": False}
+
+
+def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int = 120,
+                on_token=None, chunk=ollama_chunk, max_bytes: int = MAX_STREAM_BYTES) -> dict:
+    """Read a streamed reply in pieces, saying each one as it lands, and return the whole of it.
+
+    The text is assembled here rather than trusted from the client's copy: the caller has to parse an
+    envelope, store a record and hash a proposal out of what arrives, and a browser that lost a frame
+    would otherwise change what the tool decided. `on_token` is a *display* consumer.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    request = Request(url, data=json.dumps(payload).encode(), headers=headers)
+    content, thought, size, model, finish = [], [], 0, "", None
+    try:
+        with _opener().open(request, timeout=timeout) as response:
+            for line in response:
+                size += len(line)
+                if size > max_bytes:
+                    raise ProviderError("Provider response exceeds size limit.")
+                part = chunk(line)
+                if not part:
+                    continue
+                if part.get("model"):
+                    model = part["model"]
+                if part.get("finish"):
+                    finish = part["finish"]
+                if part["content"]:
+                    content.append(part["content"])
+                    if on_token is not None:
+                        on_token(part["content"])
+                thought.append(part["thinking"])
+                if part.get("done"):
+                    break
+    except HTTPError as exc:
+        raise _refuse(exc) from None
+    except (URLError, TimeoutError, OSError):
+        raise ProviderError("Provider connection failed or timed out. A local model needs a longer "
+                       "request timeout for a reply this large.") from None
+    except ValueError:
+        raise ProviderError("Provider returned invalid JSON.") from None
+    return {"content": "".join(content), "thinking": "".join(thought),
+            "finish": finish, "model": model}
 
 
 # Ollama's default context is small enough to cut a real coding prompt in half without saying so.
@@ -82,16 +184,52 @@ def context_window(prompt_chars: int, output_tokens: int) -> int:
 
 
 class ModelProvider(Protocol):
-    model: str
+    """The seam between the loop and a model.
 
-    def generate(self, messages: list[dict], json_mode: bool = True) -> str: ...
+    `supports_stream` is declared rather than defaulted: a caller asks it before it passes
+    `on_token`, which is what lets the scripted providers in the tests keep the two-argument
+    signature they have always had.
+    """
+
+    model: str
+    supports_stream: bool
+
+    def generate(self, messages: list[dict], json_mode: bool = True,
+                 on_token=None) -> str: ...
+
+
+# A reasoning model answers twice: once in a field nobody asked for and once in `content`. The names
+# differ per provider — `reasoning` on Ollama and OpenRouter, `reasoning_content` on DeepSeek's R1 line,
+# `thinking` on Qwen — and all three have been seen carrying the words while `content` carried the JSON.
+REASONING_KEYS = ("reasoning", "reasoning_content", "thinking")
+REASONING_CHARS = 1200
+
+
+def read_reasoning(message) -> str:
+    """What the model thought out loud, capped and redacted — or "" when it kept that to itself.
+
+    This never enters the envelope path: `parse_action` must only ever see what the model was asked to
+    return, and reasoning is precisely the field that contains prose, braces and half-finished thoughts.
+    It is redacted here rather than at the surface because the raw words are also what a report exports,
+    and a chain of thought quoting a connection string is still quoting a connection string.
+    """
+    if not isinstance(message, dict):
+        return ""
+    for key in REASONING_KEYS:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return redact(value.strip())[:REASONING_CHARS]
+    return ""
 
 
 class OllamaProvider:
+    supports_stream = True
+
     def __init__(self, settings: Settings, *, allow_cloud: bool = False):
         self.settings = settings
         self.model = settings.model
         self.supports_thinking = False
+        self.reasoning = ""
         self.allow_cloud = allow_cloud
         # One rule for every provider, in ``config``: this device only, no credentials in the URL.
         # It used to refuse a URL *path* as well, which is how a relocated Ollama became unusable.
@@ -106,10 +244,14 @@ class OllamaProvider:
             raise PolicyError("Cannot establish that this is an installed local model.")
         self.supports_thinking = "thinking" in (info.get("capabilities") or [])
 
-    def generate(self, messages: list[dict], json_mode: bool = True) -> str:
+    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None) -> str:
+        self.reasoning = ""
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages or [])
         payload = {
-            "model": self.model, "messages": messages, "stream": False,
+            "model": self.model, "messages": messages,
+            # Asked for piece by piece only when somebody is listening. A turn that parses an envelope
+            # gains nothing from a stream, and an SSE reader is one more way for a reply to go wrong.
+            "stream": on_token is not None,
             # temperature 0 is greedy decoding, and a weak model that is poor at Arabic
             # tokenisation can sit on one token forever; 1.1 is the smallest penalty that
             # breaks the loop without bending the distribution on English or code.
@@ -120,12 +262,27 @@ class OllamaProvider:
         if json_mode:
             payload["format"] = "json"
         if self.supports_thinking:
-            payload["think"] = False
-        result = request_json(self.endpoint + "/api/chat", payload, timeout=self.settings.timeout_seconds)
-        if result.get("done_reason") == "length":
+            # Measured on the local endpoint (2026-09-29, qwen3:4b): a prose turn with the switch off
+            # puts the deliberation at the *front of `content`* — its closing marker sits inside the
+            # text the reader is meant to call the answer — while the same 136 tokens with it on split
+            # into a 180-character reply and a 522-character field. An envelope keeps it off: under
+            # `format: json` the same request spent its whole budget thinking and answered nothing.
+            payload["think"] = not json_mode
+        if on_token is None:
+            result = request_json(self.endpoint + "/api/chat", payload,
+                                  timeout=self.settings.timeout_seconds)
+            message = result.get("message") if isinstance(result.get("message"), dict) else {}
+            value, thought = message.get("content"), message
+            truncated = result.get("done_reason") == "length"
+        else:
+            streamed = read_stream(self.endpoint + "/api/chat", payload,
+                                   timeout=self.settings.timeout_seconds, on_token=on_token,
+                                   chunk=ollama_chunk)
+            value, thought = streamed["content"], {"thinking": streamed["thinking"]}
+            truncated = streamed["finish"] == "length"
+        self.reasoning = read_reasoning(thought)
+        if truncated:
             raise ProviderError("Model output truncated; reduce the change size.")
-        message = result.get("message")
-        value = message.get("content") if isinstance(message, dict) else None
         if not isinstance(value, str) or not value:
             raise ProviderError("No model content returned.")
         return value
@@ -141,9 +298,12 @@ class OpenAICompatibleProvider:
     upstream model, the free/paid rule) hang off ``Kind`` flags rather than a subclass.
     """
 
+    supports_stream = True
+
     def __init__(self, settings: Settings, api_key: str | None = None, *,
                  allow_paid: bool = False, kind: Kind | None = None):
         self.kind = kind or kind_for(settings.provider) or OPENROUTER
+        self.reasoning = ""
         self.settings = settings
         self.model = settings.model
         if self.kind.free_only and not allow_paid and settings.model != "openrouter/free" \
@@ -157,9 +317,10 @@ class OpenAICompatibleProvider:
         if self.kind.needs_key and not self.key:
             raise ProviderError(f"Set {env_name or 'an API key'} in your environment (never in a file).")
 
-    def generate(self, messages: list[dict], json_mode: bool = True) -> str:
+    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None) -> str:
+        self.reasoning = ""
         body = {
-            "model": self.settings.model, "messages": messages, "stream": False,
+            "model": self.settings.model, "messages": messages, "stream": on_token is not None,
             "temperature": 0, "max_tokens": self.settings.output_tokens,
         }
         if json_mode:
@@ -168,22 +329,31 @@ class OpenAICompatibleProvider:
             # Refuse OpenRouter's own failovers: a silent hop to another upstream means the model
             # that answered is not the one that was reviewed.
             body["provider"] = {"allow_fallbacks": False, "require_parameters": True}
-        result = request_json(self.endpoint + "/chat/completions", body,
-                              key=self.key or None, timeout=self.settings.timeout_seconds)
-        try:
-            choice = result["choices"][0]
-            # Proposals must be complete; chat tolerates a missing finish_reason.
-            finished = choice.get("finish_reason") == "stop" or (not json_mode and choice.get("finish_reason") is None)
-            if not finished:
-                raise ProviderError("Model did not finish normally; output discarded.")
-            value = choice["message"]["content"]
-            if self.kind.routing:
-                self.model = result.get("model", self.model)
-            if not isinstance(value, str) or not value:
-                raise KeyError("content")
-            return value
-        except (KeyError, IndexError, TypeError, AttributeError):
-            raise ProviderError(f"Invalid {self.kind.label} response.") from None
+        if on_token is None:
+            try:
+                result = request_json(self.endpoint + "/chat/completions", body,
+                                      key=self.key or None, timeout=self.settings.timeout_seconds)
+                choice = result["choices"][0]
+                message = choice["message"] if isinstance(choice.get("message"), dict) else {}
+                value, thought = message.get("content"), message
+                finish, echoed = choice.get("finish_reason"), str(result.get("model") or "")
+            except (KeyError, IndexError, TypeError, AttributeError):
+                raise ProviderError(f"Invalid {self.kind.label} response.") from None
+        else:
+            streamed = read_stream(self.endpoint + "/chat/completions", body, key=self.key or None,
+                                   timeout=self.settings.timeout_seconds, on_token=on_token,
+                                   chunk=openai_chunk)
+            value, thought = streamed["content"], {"thinking": streamed["thinking"]}
+            finish, echoed = streamed["finish"], streamed["model"]
+        self.reasoning = read_reasoning(thought)
+        # Proposals must be complete; chat tolerates a missing finish_reason.
+        if not (finish == "stop" or (not json_mode and finish is None)):
+            raise ProviderError("Model did not finish normally; output discarded.")
+        if self.kind.routing and echoed:
+            self.model = echoed
+        if not isinstance(value, str) or not value:
+            raise ProviderError(f"Invalid {self.kind.label} response.")
+        return value
 
 
 def make_provider(settings: Settings, *, allow_cloud: bool, data_class: str,

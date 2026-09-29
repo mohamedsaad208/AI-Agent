@@ -176,6 +176,14 @@ def check_endpoint(kind: Kind, endpoint) -> str:
     return raw.rstrip("/")
 
 
+# The smallest budget a task can start inside. The instruction block, the task line and a repository
+# map are spent before any of the project's own files are read, so a number under this one cannot be
+# fixed by choosing a smaller repository -- every task fails on the first turn. It is refused where it
+# is set, with a range in the message, rather than failing later with a sentence that blames the
+# project. `test_the_smallest_budget_still_starts` keeps the two numbers from drifting apart.
+MIN_CONTEXT_CHARS = 6000
+
+
 @dataclass(frozen=True)
 class Settings:
     provider: str = "ollama"
@@ -232,7 +240,7 @@ def validate(settings: Settings) -> None:
     check_endpoint(kind, settings.endpoint)
     for name, low, high in (
         ("max_turns", 1, 30), ("timeout_seconds", 1, 900),
-        ("context_chars", 2000, 100000), ("output_tokens", 256, 8192),
+        ("context_chars", MIN_CONTEXT_CHARS, 100000), ("output_tokens", 256, 8192),
     ):
         value = getattr(settings, name)
         if type(value) is not int or not low <= value <= high:
