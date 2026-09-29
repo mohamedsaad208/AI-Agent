@@ -29,7 +29,7 @@ from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
 from . import planbook, repair, runner
-from . import host, intent
+from . import host, intent, setup
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
 
@@ -196,6 +196,11 @@ class AgentWindow:
         # even the proposal. It does not persist per folder the way the web window's does; see
         # `_save_state`, where it is stored with the rest of this window's own settings.
         self.read_only = tk.BooleanVar(value=bool(self._saved_ui.get("read_only")))
+        # The first-run rows, computed once and stored: building them asks a provider over the network,
+        # and a window refresh should never be the reason a request left the machine.
+        self._setup_rows: list[dict] = []
+        self._setup_demo: dict | None = None
+        self._setup_window = None
         self.plan_status = tk.StringVar(value="")
         self.memory_info = tk.StringVar(value="Choose a project folder to edit its notes.")
         self.mode = tk.StringVar(value="Ollama")
@@ -499,6 +504,106 @@ class AgentWindow:
     def show_settings(self):
         self.settings_window.deiconify()
         self.settings_window.lift()
+
+    # ------------------------------ first run ------------------------------
+    def setup_rows(self, probe: bool = False) -> list[dict]:
+        """The audit for the folder and provider this window is pointed at, in its own language."""
+        kind = self.active_kind()
+        return setup.audit(repo=self.repo.get().strip(), provider=kind.key,
+                           endpoint=self.endpoint_for(), api_key=self.key.get().strip() or None,
+                           model=self.model.get().strip(), arabic=self.arabic,
+                           demo=self._setup_demo, probe=probe)
+
+    def show_setup(self):
+        """The first-run checks in this window: the same rows the card and the terminal print.
+
+        A text widget rather than a grid of labels, because the row text is a sentence the shared
+        module wrote — restyling it into one label per field would put this window's words on top of
+        the answer. The status reaches the reader as a word (`[ok]`, `[!]`, `[x]`) as well as a line.
+        """
+        win = self._setup_window
+        if win is not None and win.winfo_exists():
+            win.lift()
+            self._paint_setup()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Setup checks")
+        win.configure(bg=BG)
+        win.geometry("680x520")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        self._setup_window = win
+        self.setup_body = tk.Text(win, wrap="word", relief="flat", font=("Segoe UI", 10),
+                                  padx=14, pady=12, bg="white", fg=INK, state="disabled")
+        self.setup_body.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        bar = ttk.Frame(win, padding=(10, 8))
+        bar.pack(fill="x")
+        self.button(bar, "Run the checks", self.run_setup_check, track=False,
+                    tip="Ask this machine what it can reach: the provider, its model list, and the "
+                        "command the selected folder answers to.").pack(side="left")
+        self.button(bar, "Run the offline proof", self.run_setup_demo, track=False,
+                    tip="A proposal applied, checked and rolled back in a temporary folder. No model is "
+                        "asked, and none of your files are touched.").pack(side="left", padx=6)
+        self.button(bar, "Don't show this again", self.hide_setup, track=False,
+                    tip="The card stops appearing at launch. The checks stay one click away here.").pack(side="left")
+        self.button(bar, "Close", win.destroy, track=False).pack(side="right")
+        self._paint_setup()
+
+    def _paint_setup(self):
+        win, body = self._setup_window, getattr(self, "setup_body", None)
+        if win is None or not win.winfo_exists() or body is None:
+            return
+        if not self._setup_rows:
+            self._setup_rows = self.setup_rows()
+        counts = setup.counts(self._setup_rows)
+        win.title("Setup checks — {} ok · {} to watch · {} blocking".format(
+            counts["ok"], counts["warn"], counts["bad"]))
+        body.configure(state="normal")
+        body.delete("1.0", "end")
+        body.insert("end", setup.render(self._setup_rows) + "\n")
+        body.configure(state="disabled")
+
+    def run_setup_check(self):
+        """One click that asks the provider. Nothing in this window probes it by itself."""
+        if self.busy:
+            return
+        probe = lambda: self.setup_rows(probe=True)     # noqa: E731 - the job body, on a worker thread
+
+        def done(rows):
+            self._setup_rows = rows
+            self._paint_setup()
+            counts = setup.counts(rows)
+            self.say("Checks done: {} ok, {} to watch, {} blocking.".format(
+                counts["ok"], counts["warn"], counts["bad"]))
+
+        self.run_job(probe, done, "Checking this machine…")
+
+    def run_setup_demo(self):
+        if self.busy:
+            return
+
+        def done(result):
+            self._setup_demo = result
+            self._setup_rows = [setup.demo_row(result, arabic=self.arabic) if item["id"] == "demo" else item
+                                for item in (self._setup_rows or [])] or [setup.demo_row(
+                                    result, arabic=self.arabic)]
+            self._paint_setup()
+            passed = result.get("proposal_apply_rollback") == "passed"
+            self.say("The proof held: a proposal was applied, checked and rolled back in a temporary "
+                     "folder." if passed else "The proof did not complete: "
+                     + str(result.get("note", ""))[:120])
+
+        self.run_job(setup.run_demo, done, "Running the offline proof…")
+
+    def hide_setup(self):
+        """`Don't show this again` — a preference like the theme, and the only way the card stops."""
+        self._saved_ui["setup_seen"] = True
+        self._save_state()
+        win = self._setup_window
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self._setup_window = None
+        self.say("The setup card will not open at launch. Setup is still in Settings.")
 
     def clear_conversation(self):
         self.messages = []

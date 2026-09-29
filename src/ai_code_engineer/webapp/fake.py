@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, repair
+from .. import config, git_integration, intent, labels, repair, setup
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -237,6 +237,28 @@ class FakeController:
         self._replies: dict[str, threading.Event] = {}
         self._answers: dict[str, dict] = {}
         self._emit = None
+        # The first-run card, built from the real `setup` rows so the preview cannot drift from the
+        # sentences that actually ship. Only the provider and model lines are scripted: they are the
+        # two a machine without Ollama running would otherwise leave blank on a design surface.
+        self.setup_open = True
+        self.setup_rows = self._script_setup()
+        self.setup_demo: dict | None = None
+
+    def _script_setup(self) -> list[dict]:
+        rows = setup.audit(repo="", provider="ollama", endpoint="http://127.0.0.1:11434",
+                           model=self.model, probe=False)
+        out = []
+        for row in rows:
+            if row["id"] == "provider":
+                row = {"id": "provider", "status": "ok", "advice": "",
+                       "text": "Ollama answers at http://127.0.0.1:11434."}
+            elif row["id"] == "model":
+                row = {"id": "model", "status": "ok", "advice": "",
+                       "text": "11 models (10 of them local). Using " + self.model + "."}
+            elif row["id"] == "demo":
+                row = dict(row, text="The offline proof has not been run yet.")
+            out.append(row)
+        return out
 
     # ----------------------------- contract -----------------------------
     @property
@@ -302,6 +324,11 @@ class FakeController:
                                                      "behaviour is untouched.",
                                              written=self.state in labels.MUTABLE_STATES,
                                              has_project=True),
+            # The preview is where a card like this gets reviewed, so it has to carry the same shape the
+            # real controller sends — including the counts the header prints.
+            "setup": {"show": self.setup_open, "rows": self.setup_rows,
+                      "counts": setup.counts(self.setup_rows), "demo": self.setup_demo,
+                      "busy": False},
             "review": self._review(), "messages": self.messages, "log": self.log,
             "log_dropped": self.log_dropped, "log_note": "", "step_detail": self.step_detail,
             "projects": [{"key": "demo2", "name": "demo2", "initials": "d2",
@@ -594,6 +621,27 @@ class FakeController:
             self.state = "WAITING_APPROVAL"
             emit({"kind": "toast", "text": "Proposing %s — review the diff, then Apply"
                   % str(payload.get("path", "that file"))})
+        elif type == "setup_check":
+            self.setup_open = True
+            emit({"kind": "toast", "text": "Checks done — 4 ok, 1 to watch, 0 blocking. "
+                                           "The provider rows are scripted here."})
+        elif type == "setup_demo":
+            # Scripted, and it says so: the preview never writes anywhere, so the proof it shows is the
+            # sentence the real run prints rather than a run of its own.
+            self.setup_demo = {"proposal_apply_rollback": "passed", "llm_used": False,
+                               "static_checks": {"status": "unverified"},
+                               "note": "Scripted in this preview: the real proof runs in a temporary "
+                                       "folder."}
+            self.setup_rows = [setup.demo_row(self.setup_demo, arabic=False) if item["id"] == "demo" else item
+                               for item in self.setup_rows]
+            self.setup_open = True
+            emit({"kind": "state", "data": self.snapshot()})
+        elif type == "setup_show":
+            self.setup_open = True
+        elif type == "setup_hide":
+            # "Don't show this again" is a decision the preview has to be able to demonstrate, not only
+            # the real window: the note under the button promises it stops appearing at launch.
+            self.setup_open = False
         elif type == "step_detail":
             self.open_step(str(payload.get("id", "")))
         elif type in PREVIEW_ONLY:
