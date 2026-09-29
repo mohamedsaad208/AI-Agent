@@ -20,6 +20,101 @@ PASSING = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(sel
 FAILING = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self)\n        self.assertEqual(3, 1 + 1)\n"
 
 
+class MoreThanOneProjectTests(unittest.TestCase):
+    """A folder can be one project, a reactor of nine, or a monorepo with no shared build at all.
+
+    The scan used to look only at the opened folder's own children, so `backend/pom.xml` was
+    invisible and the window said "no command was detected" about a project that builds perfectly.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "monorepo"
+        self.addCleanup(self.temp.cleanup)
+        self.module("backend/auth-service", PASSING)
+        self.module("backend/product-service", FAILING)
+        (self.root / "node_modules" / "left-pad").mkdir(parents=True)
+        (self.root / "node_modules" / "left-pad" / "package.json").write_text("{}", encoding="utf-8")
+        (self.root / "backend" / "auth-service" / "target" / "classes").mkdir(parents=True)
+        (self.root / "backend" / "auth-service" / "target" / "classes"
+         / "package.json").write_text("{}", encoding="utf-8")
+
+    def module(self, relative, test_body):
+        folder = self.root.joinpath(*relative.split("/"))
+        (folder / "tests").mkdir(parents=True)
+        (folder / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        (folder / "tests" / "test_one.py").write_text(test_body, encoding="utf-8")
+        return folder
+
+    def test_each_module_is_found_and_the_opened_folder_stays_first(self):
+        self.assertEqual(runner.projects(self.root),
+                         [".", "backend/auth-service", "backend/product-service"])
+        # `backend/` is a container, not a project: it holds no build file of its own, and offering
+        # it would be a button that can only answer "no command here".
+        self.assertNotIn("backend", runner.projects(self.root))
+
+    def test_a_vendored_dependency_and_a_build_output_are_not_offerings(self):
+        paths = runner.projects(self.root)
+        self.assertFalse(any("node_modules" in path for path in paths), paths)
+        self.assertFalse(any(path.endswith("target") for path in paths), paths)
+
+    def test_a_target_is_a_folder_of_this_project_and_nothing_else(self):
+        self.assertEqual(runner.project_folder(self.root, "backend/auth-service"),
+                         (self.root / "backend" / "auth-service").resolve())
+        self.assertEqual(runner.project_folder(self.root, "."), self.root.resolve())
+        for wanted in ("../elsewhere", "/etc", "C:/Windows", "backend/../..", ""):
+            with self.subTest(wanted=wanted):
+                if wanted == "":
+                    self.assertEqual(runner.project_folder(self.root, ""), self.root.resolve())
+                    continue
+                with self.assertRaises(PolicyError):
+                    runner.project_folder(self.root, wanted)
+
+    def test_a_folder_that_vanished_is_refused_rather_than_raising_a_bare_filenotfound(self):
+        with self.assertRaises(PolicyError):
+            runner.project_folder(self.root, "backend/not-here")
+
+    def test_targets_are_the_modules_with_a_command_and_are_labelled_by_path(self):
+        with patch("ai_code_engineer.runner.available", return_value=["python-unittest"]):
+            rows = runner.targets(self.root)
+        self.assertEqual([row["path"] for row in rows],
+                         ["backend/auth-service", "backend/product-service"])
+        self.assertEqual([row["label"] for row in rows],
+                         ["backend/auth-service", "backend/product-service"])
+        self.assertEqual(rows[0]["recipes"], ["python-unittest"])
+
+    def test_two_modules_of_one_project_are_two_different_answers(self):
+        """The proof of the whole feature: the same recipe in two folders of one tree, and each run
+        reports the folder it ran in rather than the tree it was pointed at."""
+        with patch("ai_code_engineer.runner.available", return_value=["python-unittest"]):
+            rows = runner.targets(self.root)
+        for row in rows:
+            result = runner.run(self.root, "python-unittest", timeout=120, target=row["path"])
+            self.assertEqual(result["target"], row["path"])
+            expected = "passed" if "auth" in row["path"] else "failed"
+            self.assertEqual(result["status"], expected, row["path"])
+            self.assertIn("in auth-service" if "auth" in row["path"] else "in product-service",
+                          runner.summarize(result))
+
+    def test_the_root_of_a_folder_that_is_only_a_container_has_no_command(self):
+        with patch("ai_code_engineer.runner.available", return_value=["python-unittest"]):
+            self.assertEqual(runner.detect(self.root), [])
+
+    def test_scanning_ten_modules_asks_the_path_once_per_tool(self):
+        """`available()` resolves each executable against PATH; nine modules used to pay that nine
+        times, which was half a second on the reactor this was written for."""
+        calls = []
+        real = runner.available
+
+        def counted():
+            calls.append(1)
+            return real()
+
+        with patch("ai_code_engineer.runner.available", side_effect=counted):
+            runner.targets(self.root)
+        self.assertEqual(len(calls), 1)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -293,6 +388,32 @@ class ToolchainRecipeTests(unittest.TestCase):
         self.assertEqual(result["status"], "unverified")
         self.assertFalse(result["tests_observed"])
 
+    # ---------------- the count a workspace prints more than once ----------------
+    def test_every_summary_line_in_a_workspace_counts(self):
+        """One crate, one summary. A workspace of two printed 20 and 4, and the old reader took
+        the first match and reported 20 — a number that quietly disagreed with the run."""
+        output = ("test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                  "test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n")
+        proof = runner.console_proof(runner.RECIPES["cargo-test"], output)
+        self.assertEqual((proof["tests"], proof["failures"], proof["skipped"]), (24, 0, 1))
+        self.assertEqual(proof["source"], "cargo's own summary")
+        self.assertEqual(runner.summarize({"recipe": "cargo-test", "label": "Cargo test", "status": "passed",
+                                           "exit_code": 0, "seconds": 1.0, "tests_observed": True,
+                                           "proof": proof, "truncated": False, "timed_out": False}),
+                         "Cargo test: passed (24 tests, 0 failed, 0 errors (cargo's own summary), 1.0s)")
+
+    def test_a_run_that_printed_no_summary_proves_nothing(self):
+        # Returning 0 here would read as "green, and there were no tests" — the honest answer is
+        # that there is no count, which leaves the exit code and expects_proof to decide.
+        self.assertIsNone(runner.console_proof(runner.RECIPES["cargo-test"], "Compiling\ncollecting\n"))
+        # A recipe that declares no console proof is never read for one, whatever its output says.
+        self.assertIsNone(runner.console_proof(runner.RECIPES["go-test"], self.CARGO_GREEN))
+
+    def test_the_console_count_survives_into_the_result(self):
+        result = self.pretend("cargo-test", self.CARGO_GREEN)[0]
+        self.assertEqual(result["proof"]["tests"], 5)
+        self.assertEqual(result["proof"]["source"], "cargo's own summary")
+
     def test_go_counts_packages_because_it_prints_no_total(self):
         result = self.pretend("go-test", self.GO_GREEN)[0]
         self.assertEqual(result["status"], "passed")
@@ -317,10 +438,17 @@ class ToolchainRecipeTests(unittest.TestCase):
                          "passed")
         self.assertEqual(self.pretend("pnpm-test", "# tests 0\n")[0]["status"], "unverified")
 
-    def test_only_jvm_recipes_keep_the_long_timeout(self):
-        for recipe in ("uv-pytest", "pnpm-test", "cargo-test", "go-test"):
-            self.assertEqual(runner.timeout_for(recipe), runner.DEFAULT_TIMEOUT)
-        self.assertEqual(runner.timeout_for("maven-test"), runner.LONG_TIMEOUT)
+    def test_the_compilers_keep_the_long_timeout(self):
+        """Cargo is not a script suite: `cargo test` is a compile the first time anything changes.
+
+        It used to sit with the fast recipes at 600 s because the long timeout was written as a JVM
+        rule, so a cold Rust build got killed for being slow and the window reported a timeout where
+        the truth was ten minutes of codegen.
+        """
+        for recipe in ("maven-test", "gradle-test", "cargo-test"):
+            self.assertEqual(runner.timeout_for(recipe), runner.LONG_TIMEOUT, recipe)
+        for recipe in ("uv-pytest", "pnpm-test", "node-test", "go-test", "python-unittest"):
+            self.assertEqual(runner.timeout_for(recipe), runner.DEFAULT_TIMEOUT, recipe)
 
     def test_recipes_without_an_installed_tool_never_spawn(self):
         for recipe in ("uv-pytest", "pnpm-test", "cargo-test", "go-test"):

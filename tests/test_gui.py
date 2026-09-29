@@ -11,32 +11,23 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
 from ai_code_engineer import labels, memory, repair
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import (atomic_json, load_session, plan, proposal_hash)
 from ai_code_engineer.errors import Cancelled
-from ai_code_engineer import catalog
 from ai_code_engineer.gui import AgentWindow, SEARCH_PLACEHOLDER
 from ai_code_engineer.providers import OpenAICompatibleProvider
 from ai_code_engineer.workspace import Workspace
-
-OLLAMA_ENTRY = {"id": "test-local", "name": "Test Local", "cloud": False,
-                "description": "Synthetic local model for tests"}
-FREE_ENTRY = {"id": "x:free", "name": "X Free", "free": True, "cloud": True,
-              "description": "Synthetic free cloud model"}
+from doubles import (ChatModel, FREE_ENTRY, OLLAMA_ENTRY,
+                     patched_catalog as shared_patched_catalog)
+from helpers import sandbox_repo
 
 
 def patched_catalog():
-    """Discovery for tests: one call, the real ``(entries, source)`` shape, no socket.
-
-    The window used to patch one function per provider; discovery is now
-    ``models_for(kind, endpoint, key)`` for every row, and the source is what the status line
-    quotes back ("live list" versus the names this tool ships with).
-    """
-    def models_for(kind, endpoint="", api_key=None):
-        return (list(FREE_ENTRY) if kind.free_only else [OLLAMA_ENTRY]), catalog.LIVE
-    return patch("ai_code_engineer.gui.models_for", side_effect=models_for)
+    """This window's discovery patch: the shared double, aimed at Tk's own import."""
+    return shared_patched_catalog("gui")
 
 # "Fix the add function", built from code points so this file stays ASCII and cannot itself arrive
 # mangled — a mojibake string looks like Arabic in a terminal and is not.
@@ -96,17 +87,6 @@ class CancellationTests(unittest.TestCase):
         self.assertEqual(os.environ.get("OPENROUTER_API_KEY"), before)
 
 
-class ChatModel:
-    model = "test-local"
-
-    def __init__(self):
-        self.calls = []
-
-    def generate(self, messages, json_mode=True):
-        self.calls.append((messages, json_mode))
-        return "A monotonic clock never moves backwards."
-
-
 class ScriptedModel:
     """Answers with queued tool actions so a repair turn needs no real model."""
 
@@ -126,9 +106,7 @@ class DesktopTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        self.repo.mkdir()
-        (self.repo / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
+        self.repo = sandbox_repo(self.app_dir, with_tests=False)
         # The startup catalog refresh must stay offline in tests.
         patches = (patched_catalog(),)
         for started in patches:
@@ -689,6 +667,72 @@ Validate the token.
         self.assertEqual(self.ui.session["state"], "WAITING_APPROVAL")
         self.assertTrue(self.ui.session["task"].startswith("The Python unittest command failed"))
         self.assertIn("FAILED (failures=1)", self.ui.session["evidence"])
+
+    def test_the_same_failure_twice_stops_the_loop_rather_than_buying_another_turn(self):
+        """The web window's stop has a twin here, decided and worded by the same `repair` code: a
+        round that moved nothing is not a reason to ask the model again."""
+        self.applied_draft()
+        self.make_runnable()
+        stuck = self.run_result(proof={"tests": 7, "failures": 3, "errors": 0, "source": "pytest"})
+        with patch("ai_code_engineer.gui.runner.run", return_value=stuck):
+            self.ui.run_tests(False)
+            self.wait_for_job()
+            self.ui.run_tests(False)
+            self.wait_for_job()
+        with patch("ai_code_engineer.gui.make_provider") as provider:
+            self.ui._auto_fix = True
+            self.ui.ask_for_fix(stuck)
+        provider.assert_not_called()
+        self.assertFalse(self.ui._auto_fix)
+        self.assertIn("No progress", self.ui.status.get())
+        thread = [text for _, text in self.ui.messages]
+        self.assertTrue(any(line.startswith("🛑 No progress") for line in thread), thread)
+        self.assertTrue(any("Tried so far:" in line and "7 tests, 3 failing" in line
+                            for line in thread), thread)
+
+    def test_the_checks_card_names_each_module_and_runs_the_one_picked(self):
+        """A monorepo opened at the top: the card lists the modules it found, and Run points the
+        command at the one showing in the picker rather than at the folder the whole tree shares."""
+        root = self.app_dir / "mono"
+        for name in ("auth-service", "product-service"):
+            folder = root / name
+            (folder / "tests").mkdir(parents=True)
+            (folder / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (folder / "tests" / "test_one.py").write_text(
+                "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                "    def test_ok(self):\n        self.assertEqual(2, 1 + 1)\n", encoding="utf-8")
+        with patch("ai_code_engineer.runner.available", return_value=["python-unittest"]):
+            self.ui.repo.set(str(root))
+            self.ui.task.insert("1.0", "Fix calculator.py")
+            self.ui.mode.set("Ollama")
+            self.ui.mode_changed()
+            self.ui.model.set("test-local")
+            with patch("ai_code_engineer.gui.make_provider", return_value=FakeModel()):
+                self.ui.start_plan()
+                self.wait_for_job()
+            self.assertEqual([row["path"] for row in self.ui.targets],
+                             ["auth-service", "product-service"])
+            self.assertEqual(list(self.ui.target_box["values"]),
+                             ["auth-service", "product-service"])
+            self.ui.target_name.set("product-service")
+            self.ui.target_changed()
+            self.assertEqual(self.ui.target, "product-service")
+            self.ui.target_name.set("nowhere")
+            self.ui.target_changed()
+            self.assertEqual(self.ui.target, "product-service", "an unknown label changes nothing")
+            with patch("ai_code_engineer.gui.messagebox.askyesno", return_value=True):
+                self.ui.apply()
+                self.wait_for_job()
+            seen = {}
+
+            def record(repo, recipe, timeout=60, progress=lambda line: None, target="."):
+                seen["target"] = target
+                return self.run_result("passed")
+
+            with patch("ai_code_engineer.gui.runner.run", side_effect=record):
+                self.ui.run_tests(False)
+                self.wait_for_job()
+        self.assertEqual(seen["target"], "product-service")
 
     def test_applying_a_fix_reruns_the_command_automatically(self):
         self.applied_draft()

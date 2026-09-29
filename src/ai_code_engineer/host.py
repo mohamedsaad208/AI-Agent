@@ -8,14 +8,21 @@ itself, and the review that named them counted the drift in the old tree: settin
 (`chat_message` ×15 against `_add` ×19), asking (`messagebox.*` ×6 against `self.confirm` ×6) and
 streaming (`events.put` ×7 against `_emit` ×13).
 
-Those four are the contract below. A window implements them and nothing else may reach the
-screen, so a sentence written for one window cannot fail to exist in the other.
+Those four are the contract below, and both windows now carry them under these names. Being honest
+about how far that goes: the verbs are the sanctioned way out to the screen, and the count of raw
+primitives is ratcheted in `tests/test_host.py` rather than reduced to zero. Converting 88 status
+assignments in one pass is the rewrite this module exists to make unnecessary; what matters is that
+the number cannot grow, that a *decision* — the Apply dialog, the write warning, a sentence either
+window may have to say — goes through a verb, and that the names exist so a test can ask the other
+window the same question.
 
-The second half of this file is the part that had actually drifted. Both windows assemble their
-own Apply dialog, and they had diverged in a way no test could see: the web window passes
-`repair.must_ask()`'s reason into the dialog and the Tk window shows only the removal notice, so
-the same proposal warned about different things depending on which window happened to be open —
-and Tk has no Auto-Apply or `must_ask` call at all. One builder, one answer.
+The second half of this file is the part that had actually drifted, and the fix that made the
+contract worth having. Both windows assemble their own Apply dialog and had diverged in a way no
+test could see: the web window passed `repair.must_ask()`'s reason in and Tk dropped both the reason
+and the `warning` field the builder returned, so the same proposal warned about different things
+depending on which window happened to be open. Tk also called `must_ask(session)` without the
+prior-task half of the rule, leaving that branch unreachable there — and it has no Auto-Apply, so
+that difference is a feature gap, not drift, and is recorded as one.
 """
 from __future__ import annotations
 

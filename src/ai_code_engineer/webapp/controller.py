@@ -9,6 +9,7 @@ front-end and block until it answers.
 from __future__ import annotations
 
 import ctypes
+import copy
 import difflib
 import json
 import os
@@ -22,7 +23,7 @@ import threading
 import uuid
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ..catalog import LIVE, models_for
 from ..chat import (context_block, context_use, create_chat, load_chat, project_of, respond,
@@ -40,9 +41,11 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, STEP_FIELDS, TONE, UNV
                       log_dropped_line,
                       no_branch_note,
                       no_checkpoint_note, queue_notes,
-                      restore_done, restore_offer, run_unrecorded_line, run_verdict, say, state_label,
+                      restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
+                      say, state_label,
                       status_text, step_has_detail, step_line, step_missing_line,
                       write_notice)
+from ..labels import note as shared_note     # `note` is a local variable in three methods here
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
@@ -229,6 +232,17 @@ class AgentController:
         self._session_cache: dict[Path, tuple[tuple, dict | None]] = {}
         self._chat_cache: dict[Path, tuple[tuple, dict | None]] = {}
         self._jobs: list[threading.Thread] = []
+        # One re-entrant lock over the state the two windows read. `ThreadingHTTPServer` runs a
+        # thread per request and `run_job` adds a worker per task, so an action handler, a worker
+        # announcing progress and a browser asking for a snapshot are all in this object at once —
+        # the log and message lists were being appended and serialized against each other, and two
+        # clicks in one tick could both claim the busy flag before either saw the other.
+        #
+        # It guards short transitions only: the busy claim and release, the message and log
+        # mutators, the catalog and connection fields, and the whole of `snapshot`. It is **never
+        # held across a wait** — `confirm_choice` blocks on an event whose answer arrives on another
+        # HTTP thread, and holding the lock there would be a deadlock with the user holding the key.
+        self._state = threading.RLock()
 
         self.status = "Ready — a new chat answers in prose. Choose a project for reviewed changes."
         self.log: list[dict] = []
@@ -291,6 +305,12 @@ class AgentController:
         self.ledger_path: Path | None = None
         self.ledger: dict | None = None
         self.recipes: list[str] = []
+        # Which module of a multi-project folder the command runs in, and every module that has one.
+        # `_targets_root` records the folder the list was scanned from, so a task whose folder is not
+        # the window's folder cannot be handed a module path that only made sense next to the other.
+        self.targets: list[dict] = []
+        self.target = ""
+        self._targets_root = ""
         self.review_file = 0
         self.diff_tab = "diff"
         self._fix_round = 0
@@ -411,19 +431,25 @@ class AgentController:
         """
         request_id = secrets.token_hex(8)
         waiter = threading.Event()
-        self._replies[request_id] = waiter
-        # A list, not one slot: two questions were simultaneously live during the run — the previous
-        # task's offer and the current one — and a single field would have dropped the first along
-        # with the only id that could unblock it.
-        self._active_asks.append({"kind": kind, "id": request_id, **payload})
+        with self._state:
+            self._replies[request_id] = waiter
+            # A list, not one slot: two questions were simultaneously live during the run — the previous
+            # task's offer and the current one — and a single field would have dropped the first along
+            # with the only id that could unblock it.
+            self._active_asks.append({"kind": kind, "id": request_id, **payload})
         self._emit({"kind": kind, "id": request_id, **payload})
+        # The wait is outside the lock, and that is the whole shape of this rule: the answer arrives
+        # on an HTTP thread that has to take the lock to deliver it. A thread that waits for the user
+        # while holding it would stop every other request in the window behind one open dialog.
         answered = waiter.wait(timeout=ASK_TIMEOUT)
-        self._replies.pop(request_id, None)
-        self._active_asks = [a for a in self._active_asks if a.get("id") != request_id]
+        with self._state:
+            self._replies.pop(request_id, None)
+            self._active_asks = [a for a in self._active_asks if a.get("id") != request_id]
+            if not answered:
+                self._answers.pop(request_id, None)
+                self.status = status_text("ask_expired")
         if not answered:
-            self._answers.pop(request_id, None)
             self._emit({"kind": "retract", "id": request_id})
-            self.status = status_text("ask_expired")
             return {}
         return self._answers.pop(request_id, {}) or {}
 
@@ -443,6 +469,24 @@ class AgentController:
         answer = self.confirm_choice(title, message, warning, ok_label)
         return bool(answer.get("ok"))
 
+    # ---------------- the four Host verbs ----------------
+    # The web half of `host.Host`, and the reason the contract is not Tk-only vocabulary. Every one of
+    # these already existed under another name; the verb is the name the *other* window can be checked
+    # against, which is what `tests/test_host.py` does — including a ratchet on the raw primitives
+    # below, so a new un-routed sink has to be a deliberate act.
+    def say(self, text: str) -> None:
+        self.status = text
+
+    def line(self, role: str, author: str, text: str) -> None:
+        self._add(role, author, text)
+
+    def ask(self, title: str, message: str, warning: str = "", ok_label: str = "Continue",
+            alt_label: str = "") -> bool:
+        return self.confirm(title, message, warning, alt_label or ok_label)
+
+    def stream(self, event: dict) -> None:
+        self._emit(event)
+
     def ask_directory(self, title: str, hint: str = "", mustexist: bool = True) -> Path | None:
         start = self.repo or str(Path.home())
         answer = self._ask("folder", {"title": title, "hint": hint, "path": start, "mustexist": mustexist})
@@ -458,35 +502,40 @@ class AgentController:
         return Path(chosen) if chosen else None
 
     def set_reply(self, request_id: str, reply: dict) -> None:
-        waiter = self._replies.pop(request_id, None)
-        if waiter is None:
-            return                      # a reply for a question that already closed or expired
-        # Retire on the answering side too: the thread that asked has to be scheduled before it
-        # removes itself, and a snapshot built in that gap would redraw a question already answered.
-        self._active_asks = [a for a in self._active_asks if a.get("id") != request_id]
-        self._answers[request_id] = reply or {}
+        with self._state:
+            waiter = self._replies.pop(request_id, None)
+            if waiter is None:
+                return                  # a reply for a question that already closed or expired
+            # Retire on the answering side too: the thread that asked has to be scheduled before it
+            # removes itself, and a snapshot built in that gap would redraw a question already answered.
+            self._active_asks = [a for a in self._active_asks if a.get("id") != request_id]
+            self._answers[request_id] = reply or {}
+        # Woken outside the lock: the worker this releases goes on to take the lock itself, and a
+        # thread that has been handed the state it is waiting for must never be made to queue twice.
         waiter.set()
 
     # ------------------------------ jobs ------------------------------
     def run_job(self, operation, on_done, status: str, *, cancellable: bool = False,
                 on_busy=None) -> None:
-        self._job_started = False
-        if self.busy:
-            # Two clicks in one tick both pass the caller's `busy` check, because each HTTP handler
-            # reads the flag before either job has claimed it. A message that is dropped here is
-            # work the user already typed, so the caller gets to say what it becomes instead.
-            if on_busy is not None:
-                on_busy()
-            return
-        self._job_started = True
-        self.busy, self.cancellable = True, cancellable
-        self.cancel_event.clear()
-        self.status = status
-        self._last_progress = ""
-        self.pending = status
-        self._emit({"kind": "busy", "value": True, "cancellable": cancellable})
-        self._emit({"kind": "status", "text": status})
-        self._note("job", status)
+        with self._state:
+            self._job_started = False
+            if self.busy:
+                # Two clicks in one tick used to both pass this check, because each HTTP handler read
+                # the flag before either job had claimed it. The claim is inside the lock now, so
+                # exactly one of them gets here — and a message that is dropped is work the user
+                # already typed, so the caller still gets to say what it becomes.
+                if on_busy is not None:
+                    on_busy()
+                return
+            self._job_started = True
+            self.busy, self.cancellable = True, cancellable
+            self.cancel_event.clear()
+            self.status = status
+            self._last_progress = ""
+            self.pending = status
+            self._emit({"kind": "busy", "value": True, "cancellable": cancellable})
+            self._emit({"kind": "status", "text": status})
+            self._note("job", status)
 
         def worker():
             result, failure, raw_error = None, None, None
@@ -495,15 +544,17 @@ class AgentController:
             except Exception as exc:                       # noqa: BLE001 - reported, never raised
                 raw_error = str(exc)
                 failure = friendly_error(exc)
-            self.busy = self.cancellable = False
-            self.pending = None
+            with self._state:
+                self.busy = self.cancellable = False
+                self.pending = None
             self._emit({"kind": "busy", "value": False, "cancellable": False})
             if failure is not None:
-                self.status = failure
                 # The detail is the exception verbatim, which is the one field that can carry a
                 # provider's own text — including a bearer token it echoed back. Cap after redacting.
                 log_msg = (f"{failure} [Detail: {redact(raw_error)[:300]}]"
                            if (raw_error and raw_error != failure) else failure)
+                with self._state:
+                    self.status = failure
                 self._note("error", log_msg)
                 self._add("tool", "Tool", failure)
             else:
@@ -733,12 +784,13 @@ class AgentController:
 
     def _note(self, kind: str, text: str) -> None:
         entry = {"ts": _clock(), "kind": kind, "text": text}
-        self.log.append(entry)
-        if len(self.log) > MAX_LOG_ENTRIES:
-            # Counted rather than trimmed: the dropped number is drawn at the top of Activity, because
-            # a log that quietly got shorter reads as a task that did less than it did.
-            self.log.pop(0)
-            self.log_dropped += 1
+        with self._state:
+            self.log.append(entry)
+            if len(self.log) > MAX_LOG_ENTRIES:
+                # Counted rather than trimmed: the dropped number is drawn at the top of Activity, because
+                # a log that quietly got shorter reads as a task that did less than it did.
+                self.log.pop(0)
+                self.log_dropped += 1
         # `kind` names the SSE channel, so the entry travels inside its own field instead of
         # being flattened into the event — flattened, the two kinds collided.
         self._emit({"kind": "log", "entry": entry})
@@ -749,8 +801,17 @@ class AgentController:
             # A step row is a message with a handle on its own record: the sentence is what the row
             # says, and `step` is what lets it be opened again after a reload or a reopen.
             message["step"] = step
-        self.messages.append(message)
+        with self._state:
+            self.messages.append(message)
         self._emit({"kind": "message", "message": message})
+
+    def note_failure(self, reference: str, detail: str) -> None:
+        """The one place a raw exception may be written down: the Activity log, redacted and capped.
+
+        `server._fail` answers the browser with a fixed sentence and this id, so the reason is still
+        findable by a person who needs it and is never handed to whoever asked.
+        """
+        self._note("error", f"Request {reference}: {detail}")
 
     # ------------------------------ contract ------------------------------
     def _git_info(self) -> dict:
@@ -803,6 +864,19 @@ class AgentController:
                 "text": applied_note(arabic=self.arabic, count=self.auto_banner)}
 
     def snapshot(self) -> dict:
+        """The whole UI contract, as a structure that cannot change under whoever reads it.
+
+        The caller is a different thread from the one writing: the HTTP handler serializes this while
+        a worker is appending its next line, and `self.messages` used to be handed out as the live
+        list. Building it and freezing it happen inside the same lock, so no line can arrive between
+        the two. Measured on the worst state this window holds — 200 messages, a 400-line Activity
+        log and a 300-entry model list, 117 KB of snapshot — the copy costs 3.4 ms against a 1.0 ms
+        serialization, and a state push happens per action, not per token.
+        """
+        with self._state:
+            return copy.deepcopy(self._snapshot())
+
+    def _snapshot(self) -> dict:
         project = Path(self.repo) if self.repo else None
         plan_info = self._plan_info()
         return {
@@ -829,6 +903,17 @@ class AgentController:
             "connection": self.connection_info(),
             "recipes": [runner.RECIPES[name]["label"] for name in self.recipes],
             "recipe": self.recipe, "canRun": self._can_run(), "runInfo": self.run_info,
+            # Which folder of a multi-project folder the command runs in. One entry means there is
+            # nothing to choose, and the window says so rather than drawing a picker of one.
+            "targets": [{"path": row["path"], "label": row["label"]} for row in self.targets],
+            "target": self.target, "targetLabel": self.target_label(),
+            # Rounds used to exist only as a number in one window's memory and a status line that had
+            # already scrolled away by the third one. The count is in-memory and belongs in the
+            # snapshot; the attempts themselves are read from the sessions when the offer or the stop
+            # line needs them, never on every poll.
+            "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self._fix_round},
+            # Said where the button is, not only in the docstring of the module that runs it.
+            "runWarning": run_warning(arabic=self.arabic),
             "memory": {"info": self._memory_info()},
             "settings": {"project": self.repo, "plan": self.plan_file, "chained": self.chained,
                          "auto_apply": self.auto_apply, "bound": bool(self.branch.get("bound")),
@@ -888,6 +973,7 @@ class AgentController:
             "set_model": lambda: self.set_model(payload.get("value", "")),
             "set_filter": lambda: self.set_filter(payload.get("value", "")),
             "set_recipe": lambda: self.set_recipe(payload.get("value", "")),
+            "set_target": lambda: self.set_target(str(payload.get("value", ""))),
             "set_chained": lambda: self.set_chained(bool(payload.get("value"))),
             "set_timeout": lambda: self.set_timeout(payload.get("value")),
             "set_key": lambda: self.set_key(payload.get("value", "")),
@@ -1213,8 +1299,8 @@ class AgentController:
         # Change mode on the user's behalf instead of leaving prose as the default.
         self.set_composer(CHANGE_COMPOSER)
         self._save_state()
-        self.status = ("Plan attached. Send starts its first unfinished step." if self.chained
-                       else "Plan attached. Describe the phase, then press Send.")
+        self.status = shared_note("plan_attached_chained" if self.chained
+                                  else "plan_attached_plain", arabic=self.arabic)
         self.refresh_plan_status()
 
     def clear_plan(self) -> None:
@@ -1225,13 +1311,15 @@ class AgentController:
     def set_mode(self, value: str) -> None:
         if value not in MODES:
             return
-        self.selections[self.active_mode] = self.model
-        self.active_mode = self.mode = value
-        self.model = self.selections.get(value, "")
-        self.cloud_ok = False
-        self.model_filter = ""
-        self.subtitle = self._subtitle()
-        if not self.catalogs.get(value):
+        with self._state:
+            self.selections[self.active_mode] = self.model
+            self.active_mode = self.mode = value
+            self.model = self.selections.get(value, "")
+            self.cloud_ok = False
+            self.model_filter = ""
+            self.subtitle = self._subtitle()
+            refresh = not self.catalogs.get(value)
+        if refresh:
             self.check_setup()
 
     # ------------------------------- connection -------------------------------
@@ -1253,19 +1341,20 @@ class AgentController:
         """
         kind = self.active_kind()
         text = str(value or "").strip()
-        if not text:
-            self.endpoints.pop(kind.key, None)
-        else:
-            try:
-                self.endpoints[kind.key] = config.check_endpoint(kind, text)
-            except AgentError as exc:
-                self.status = friendly_error(exc)
-                return
-        for label, row in MODE_ROWS:
-            if row is kind:
-                self.catalogs[label] = []
-                self.catalog_source.pop(label, None)
-        self.subtitle = self._subtitle()
+        with self._state:
+            if not text:
+                self.endpoints.pop(kind.key, None)
+            else:
+                try:
+                    self.endpoints[kind.key] = config.check_endpoint(kind, text)
+                except AgentError as exc:
+                    self.status = friendly_error(exc)
+                    return
+            for label, row in MODE_ROWS:
+                if row is kind:
+                    self.catalogs[label] = []
+                    self.catalog_source.pop(label, None)
+            self.subtitle = self._subtitle()
         self._save_state()
         self.check_setup()
 
@@ -1561,7 +1650,11 @@ class AgentController:
             subprocess.Popen(command, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
-            self.status = "Could not open the folder: " + str(exc)[:120]
+            # The one place this window wrote an exception's own text to a surface the browser
+            # reads. A Windows `OSError` names a path, and a path in the status line is a piece of
+            # the file system nobody granted. The reason still gets recorded, redacted, in Activity.
+            self.status = "Could not open the folder."
+            self._note("error", "Could not open the folder: " + redact(str(exc))[:120])
             return
         self.status = "Opened " + path.name + " in the file manager."
 
@@ -1574,7 +1667,7 @@ class AgentController:
         except (AgentError, OSError) as exc:
             self.status = friendly_error(exc)
             return
-        self.status = "Project notes saved outside the project folder."
+        self.status = shared_note("notes_saved", arabic=self.arabic)
         self._note("memory", "Project notes updated.")
 
     # ------------------------------- planning -------------------------------
@@ -1644,18 +1737,17 @@ class AgentController:
             self.ledger_path, self.ledger = ledger_path, book
         prior = self._unverified_prior(self.chat_id, repo)
         if prior:
-            note = ("The last task here ('" + str(prior.get("task", ""))[:60] + "') left files applied "
-                    "without a passing command run (" + prior["state"] + ").")
+            note = shared_note("prior_write", arabic=self.arabic,
+                                task=str(prior.get("task", ""))[:60], state=prior["state"])
             if prior["state"] in INTERRUPTED_STATES:
                 if not self.confirm("Unfinished task",
-                                    note + "\n\nContinue with a new task anyway? Rolling back that task "
-                                    "first is the safer step.", ok_label="Continue anyway"):
-                    self.status = note + " Roll it back or run its command, then start the new task."
+                                    note + shared_note("prior_continue", arabic=self.arabic),
+                                    ok_label="Continue anyway"):
+                    self.status = note + shared_note("prior_blocked", arabic=self.arabic)
                     return
-                self._add("tool", "Tool", note + " Continuing on this state by your choice.")
+                self._add("tool", "Tool", note + shared_note("prior_continued", arabic=self.arabic))
             else:
-                self._add("tool", "Tool", note + " Run its command (or roll it back) before stacking "
-                          "more changes on top of it.")
+                self._add("tool", "Tool", note + shared_note("prior_stacked", arabic=self.arabic))
                 self.status = status_text("prior_unverified", arabic=self.arabic)
         self.title = task.replace("\n", " ")[:45]
         self._add("user", "You", task)
@@ -1667,8 +1759,8 @@ class AgentController:
         self.session = self.session_path = None
         notes = self._project_notes()
         if notes:
-            self._add("tool", "Tool", "Your saved project notes (" + str(len(notes)) +
-                      " characters) are part of this request.")
+            self._add("tool", "Tool", shared_note("notes_in_request", arabic=self.arabic,
+                                                      count=len(notes)))
         chat_id = self.chat_id
 
         def work():
@@ -1729,13 +1821,16 @@ class AgentController:
         the index of the row it added, or -1 when the line collapsed into the one before it.
         """
         index = -1
-        if line != self._last_step:
-            self._last_step = line
-            self._add("tool", "Steps", line, step={
-                "id": step_id or uuid.uuid4().hex[:8], "action": action,
-                "fields": dict(fields or {}),
-                "detail": step_has_detail(action, fields)})
-            index = len(self.messages) - 1
+        with self._state:
+            # The compare and the append are one decision: two workers announcing the same read in the
+            # same tick must collapse to one row, and checking outside the lock would let both add one.
+            if line != self._last_step:
+                self._last_step = line
+                self._add("tool", "Steps", line, step={
+                    "id": step_id or uuid.uuid4().hex[:8], "action": action,
+                    "fields": dict(fields or {}),
+                    "detail": step_has_detail(action, fields)})
+                index = len(self.messages) - 1
         self._progress(line, record=False)
         return index
 
@@ -1747,17 +1842,18 @@ class AgentController:
         how a finished red run gets waited on.
         """
         index, self._run_step = self._run_step, -1
-        if not 0 <= index < len(self.messages):
-            return
-        message = self.messages[index]
-        step = message.get("step") or {}
-        if step.get("action") != "executing":
-            return
-        step["action"] = "executed"
-        step["detail"] = step_has_detail("executed", step.get("fields"))
-        message["text"] = executed_line(
-            arabic=self.arabic, command=str(step.get("fields", {}).get("command", "")),
-            verdict=run_verdict(self.arabic, result))
+        with self._state:
+            if not 0 <= index < len(self.messages):
+                return
+            message = self.messages[index]
+            step = message.get("step") or {}
+            if step.get("action") != "executing":
+                return
+            step["action"] = "executed"
+            step["detail"] = step_has_detail("executed", step.get("fields"))
+            message["text"] = executed_line(
+                arabic=self.arabic, command=str(step.get("fields", {}).get("command", "")),
+                verdict=run_verdict(self.arabic, result))
 
     def open_step(self, step_id: str) -> None:
         """Open one step row, or close every one of them when the id is empty.
@@ -1771,7 +1867,11 @@ class AgentController:
             return
         missing = {"id": step_id, "sections": [], "files": [],
                    "note": step_missing_line(arabic=self.arabic)}
-        for message in reversed(self.messages):
+        # A copy taken under the lock, then searched outside it: `_detail_for` reads the session on
+        # disk, and no reason exists to hold the window's state while a file is being opened.
+        with self._state:
+            messages = list(self.messages)
+        for message in reversed(messages):
             step = message.get("step") or {}
             if step.get("id") == step_id:
                 block = self._detail_for(step)
@@ -1904,12 +2004,13 @@ class AgentController:
             return ""
 
     def stop(self) -> None:
-        if self.busy and self.cancellable:
-            self.cancel_event.set()
-            self.status = "Stop requested. Waiting for the current model request to finish."
-            # A queue that carried on the instant this task ended would make the button mean
-            # "skip to the next one". It holds; ▶ in the strip resumes it.
-            self._queue_held = True
+        with self._state:
+            if self.busy and self.cancellable:
+                self.cancel_event.set()
+                self.status = shared_note("stop_requested", arabic=self.arabic)
+                # A queue that carried on the instant this task ended would make the button mean
+                # "skip to the next one". It holds; ▶ in the strip resumes it.
+                self._queue_held = True
 
     def _unverified_prior(self, chat_id: str, repo: str) -> dict | None:
         try:
@@ -1968,8 +2069,8 @@ class AgentController:
         changes = self.session.get("changes", [])
         again = ""
         if self._auto_fix and self.selected_recipe():
-            again = ("\nIt will then run " + runner.RECIPES[self.selected_recipe()]["label"] +
-                     " again in that folder, which executes the project's own build and test code.")
+            again = shared_note("apply_rerun_warning", arabic=self.arabic,
+                                label=runner.RECIPES[self.selected_recipe()]["label"])
         notice = self.removal_notice()
         prior = self._unverified_prior(self.chat_id, self.repo or "")
         # `must_ask` is the whole refusal rule, and it is the same one the switch's own tooltip
@@ -2083,9 +2184,8 @@ class AgentController:
 
         def done(result):
             self.display_session(path)
-            self.status = ("Syntax check found a problem. Open the Checks tab for details."
-                           if result["status"] == "failed" else
-                           "Syntax checks finished. Project tests have not run; verification remains incomplete.")
+            self.status = shared_note("syntax_failed" if result["status"] == "failed"
+                                        else "syntax_clean", arabic=self.arabic)
 
         self.run_job(lambda: verify(path), done, "Checking syntax in changed files…")
 
@@ -2135,8 +2235,7 @@ class AgentController:
                     self.status = status_text("ledger_needs_look", arabic=self.arabic) + friendly_error(exc)
                     return
                 self.refresh_plan_status()
-                self._add("tool", "Tool", "Reopened plan step " + str(step_id) +
-                          ": the files that passed are gone, so the step must be implemented again.")
+                self._add("tool", "Tool", shared_note("step_reopened", arabic=self.arabic, step=step_id))
 
         self.run_job(operation, done, "Rolling back changes…")
 
@@ -2240,13 +2339,34 @@ class AgentController:
                      done, "Asking git about branches…")
 
     def refresh_recipes(self) -> None:
+        """Which folders in this project have a command, and what each one answers to.
+
+        A single-project folder produces one target and the picker is not shown; a reactor or a
+        monorepo produces one per module, because `backend/pom.xml` was always invisible to a scan
+        that only looked at the opened folder's own children.
+        """
         try:
-            self.recipes = runner.detect(Path(self.repo)) if self.repo and Path(self.repo).is_dir() else []
+            self.targets = (runner.targets(Path(self.repo))
+                            if self.repo and Path(self.repo).is_dir() else [])
+            self._targets_root = str(Path(self.repo).resolve()) if self.targets else ""
         except OSError:
-            self.recipes = []
+            self.targets, self._targets_root = [], ""
+        if not any(row["path"] == self.target for row in self.targets):
+            self.target = self.targets[0]["path"] if self.targets else ""
+        self.recipes = next((row["recipes"] for row in self.targets if row["path"] == self.target), [])
         labels = [runner.RECIPES[name]["label"] for name in self.recipes]
         if self.recipe not in labels:
             self.recipe = labels[0] if labels else ""
+
+    def set_target(self, label: str) -> None:
+        """Choose which module of this project the command runs in — by the label it was shown as."""
+        chosen = next((row for row in self.targets if row["label"] == label), None)
+        if chosen and chosen["path"] != self.target:
+            self.target = chosen["path"]
+            self.refresh_recipes()
+
+    def target_label(self) -> str:
+        return next((row["label"] for row in self.targets if row["path"] == self.target), "")
 
     def selected_recipe(self) -> str | None:
         labels = [runner.RECIPES[name]["label"] for name in self.recipes]
@@ -2285,9 +2405,13 @@ class AgentController:
         # it -- `repair.record_run` refuses any state outside its own set, and writing into one of
         # those would rewrite a finished task's verdict.
         repo = self.session["root"] if self.session else self.repo.strip()
+        # The module list was scanned from the window's folder. A task pointed somewhere else gets
+        # its own root and no module, rather than a path resolved against the wrong tree.
+        target = self.target if str(Path(repo).resolve()) == self._targets_root else "."
         path = self.session_path
         recordable = bool(path) and state in MUTABLE_STATES
         label = runner.RECIPES[recipe]["label"]
+        where = Path(repo).name if target in ("", ".") else PurePosixPath(target).name
         # Say the command before running it, not only after it fails: a project's own build
         # executes code the repository defines, and this is the last line worth reading first.
         # The interpreter is named, not pathed, because the absolute path is noise here and the
@@ -2299,7 +2423,7 @@ class AgentController:
 
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=self._build_line)
+                                progress=self._build_line, target=target)
             return (repair.record_run(path, result) if recordable else None), result
 
         def done(pair):
@@ -2312,7 +2436,7 @@ class AgentController:
                 self._add("tool", "Checks",
                           run_unrecorded_line(arabic=self.arabic, project=Path(repo).name))
 
-        self.run_job(work, done, f"Running {label} in {Path(repo).name}…")
+        self.run_job(work, done, f"Running {label} in {where}…")
 
     def report_run(self, result) -> None:
         summary = runner.summarize(result)
@@ -2354,13 +2478,43 @@ class AgentController:
                 return
         self.advance_plan(result)
 
+    def round_history(self) -> list:
+        """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window
+        only knows where its own chat lives."""
+        if not self.session:
+            return []
+        return repair.round_history(self.runs, self.session["root"], self.chat_id)
+
+    def fix_rounds(self) -> list:
+        """The attempt rows the offer, the stop line and the report all read: what ran, what it cost."""
+        if not self.session:
+            return []
+        return repair.attempts_of(self.runs, self.session["root"], self.chat_id)
+
+    def _show_rounds(self) -> None:
+        """Put the attempts on record where they stay readable after the round counter has moved on."""
+        block = repair.timeline(self.fix_rounds())
+        if block:
+            self.line("tool", "Tool", block)
+
+    def stop_fix_loop(self, reason: str) -> None:
+        """The one answer both windows give when the loop has no reason to spend another turn.
+
+        The two sentences are `repair`'s, because the Tk window reaches the same decision from a
+        different place and used to word it differently on the way.
+        """
+        self._auto_fix = False
+        self.line("tool", "Tool", repair.stop_line(reason))
+        self.say(repair.stop_status(reason))
+        self._show_rounds()
+
     def _offer_fix(self, run) -> bool:
         """Ask before spending a turn. Continuing used to be a status line to interpret.
 
         Nothing is written here either: the round produces a proposal, and Apply stays a
         separate, deliberate click.
         """
-        if self._fix_round >= repair.MAX_FIX_ROUNDS or not self.model:
+        if not self.model:
             return False
         if not self.session or self.session.get("state") not in MUTABLE_STATES:
             # A fix round repairs *a task's* proposal, so it needs one to sit on. The run itself no
@@ -2368,12 +2522,19 @@ class AgentController:
             # model a task with no folder to change.
             return False
         if self._batch_fixes_off:
-            # Suppressed, but never silently: the failure line above is the only other evidence the
-            # tool saw this at all.
+            # Suppressed first: the operator said once that no further round is wanted in this batch,
+            # and a batch of red builds is not the place to argue about why each one is hopeless too.
             self._add("tool", "Tool", fix_offers_off_line(arabic=self.arabic))
             return False
+        stop, reason = repair.should_stop(self.round_history(), self._fix_round)
+        if stop:
+            # D42's other half: three rounds that leave the same seven failures standing are not
+            # progress, and asking the user to spend another model turn to find that out again is.
+            self.stop_fix_loop(reason)
+            return False
         answer = self.confirm_choice(repair.FIX_OFFER_TITLE,
-                                     repair.fix_offer(self.model, self._fix_round + 1, self.auto_apply),
+                                     repair.fix_offer(self.model, self._fix_round + 1, self.auto_apply,
+                                                      history=self.fix_rounds()),
                                      ok_label="Run the fix round", alt_label=repair.FIX_OFFER_ALT)
         if answer.get("alt"):
             self._batch_fixes_off = True
@@ -2386,10 +2547,9 @@ class AgentController:
         return True
 
     def ask_for_fix(self, run) -> None:
-        if self._fix_round >= repair.MAX_FIX_ROUNDS:
-            self._auto_fix = False
-            self.status = (f"Stopped after {repair.MAX_FIX_ROUNDS} fix rounds and the command still fails. "
-                           "Try a narrower task, another model, or inspect the output in Checks.")
+        stop, reason = repair.should_stop(self.round_history(), self._fix_round)
+        if stop:
+            self.stop_fix_loop(reason)
             return
         cloud, paid = self.cloud_choice()
         if cloud and not self.cloud_ok:
@@ -2406,8 +2566,9 @@ class AgentController:
         plan_file = str(Path(repo) / reference["path"]) if reference and step_id is not None else None
         task, evidence = repair.fix_task(run), repair.evidence(run)
         notes = self._project_notes()
-        status = (f"Fix round {self._fix_round}/{repair.MAX_FIX_ROUNDS}: asking {settings.model} "
-                  "for the smallest change that makes the command pass…")
+        # The category belongs in the line the user reads, because "asking for a fix" and "asking for
+        # a fix to a dependency the machine cannot resolve" are different odds of working.
+        status = repair.round_status(settings.model, self._fix_round, repair.classify(run))
 
         def work():
             provider = make_provider(settings, allow_cloud=cloud,
@@ -2421,6 +2582,16 @@ class AgentController:
 
         def done(path):
             self.display_session(path)
+            # The proposal exists now, so this is the first moment its *contents* can be compared
+            # with the previous rounds'. A second attempt that writes the same files with the same
+            # text is not a second attempt, and counting it as one is how a loop reads as progress.
+            earlier = [item for item in self.round_history() if item.get("id") != path.parent.name]
+            if repair.already_tried(earlier, (self.session or {}).get("changes") or []):
+                self._auto_fix = False
+                self.line("tool", "Tool", "🔁 " + repair.REPEATED_PROPOSAL)
+                self.say(repair.REPEATED_ADVICE)
+                self._show_rounds()
+                return
             if plan_file:
                 try:
                     pair = self.ledger_for(self.session)
@@ -2467,9 +2638,9 @@ class AgentController:
         try:
             planbook.complete(path, book, step_id, session)
         except (AgentError, OSError) as exc:
-            self._add("tool", "Tool", "The command passed, but step " + str(step_id) +
-                      " is not marked done: " + friendly_error(exc))
-            self.status = "Step " + str(step_id) + " still open — see the conversation."
+            self._add("tool", "Tool", shared_note("step_open_detail", arabic=self.arabic, step=step_id,
+                                                     reason=friendly_error(exc)))
+            self.status = shared_note("step_still_open", arabic=self.arabic, step=step_id)
             return
         self.refresh_plan_status()
         nxt = planbook.current(book)
@@ -2663,8 +2834,9 @@ class AgentController:
             elif turn.get("role") == "assistant":
                 self.messages.append({"role": "assistant", "author": "AI Code Engineer",
                                       "text": turn.get("content", ""), "time": ""})
-        self.status = ("Chat reopened — it reads " + Path(project["path"]).name + " as context."
-                       if project else "Chat reopened on its own — no project folder is attached.")
+        self.status = (shared_note("chat_reopened_project", arabic=self.arabic,
+                                     project=Path(project["path"]).name) if project
+                         else shared_note("chat_reopened_plain", arabic=self.arabic))
 
     def _history_steps(self, turn: dict) -> list[dict]:
         """The step rows a saved task used to have on screen while it ran.
@@ -2787,11 +2959,9 @@ class AgentController:
         self._draft = ""
         self.branch = {**self.branch, "id": self.chat_id}
         self.reset_conversation()
-        self.status = ("New chat — it answers in prose and reads no project files. Choose a project "
-                       "in the sidebar and it can read that folder too."
+        self.status = (shared_note("new_chat_plain", arabic=self.arabic)
                        if self.branch.get("kind") != BRANCH_PROJECT else
-                       "New chat in " + Path(self.repo).name + " — Send answers in prose; the badge "
-                       "by Send switches to reviewed changes.")
+                       shared_note("new_chat_project", arabic=self.arabic, project=Path(self.repo).name))
         self.refresh_recipes()
 
     def new_chat(self) -> None:
@@ -2806,7 +2976,7 @@ class AgentController:
         self._draft = ("Fix the add function in calculator.py so it adds the two numbers "
                        "instead of subtracting them.")
         self.set_mode("Ollama")
-        self.status = "Sample ready in Change mode. Choose an Ollama model, then press Send."
+        self.status = shared_note("sample_ready", arabic=self.arabic)
 
     def reset_conversation(self) -> None:
         self.messages = [{
@@ -2930,7 +3100,8 @@ class AgentController:
         self._save_state()
 
     def close(self) -> None:
-        self.key = ""
+        with self._state:
+            self.key = ""
 
 
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "program files", "windows", "system32",

@@ -139,6 +139,24 @@ def artifact_card(state: str | None, *, arabic: bool, count: int, project: str,
                 arabic, en="Nothing to apply for this task.", ar="لا يوجد ما يُطبَّق في هذه المهمة.")}
 
 
+def run_warning(*, arabic: bool) -> str:
+    """The sentence that says what pressing Run actually does.
+
+    It lived in `runner.py`'s module docstring and in a code comment, which is how a person who never
+    opens a source file misses it: the command is the project's own build tool, run with this user's
+    permissions in this folder. The argv allowlist and the stripped environment decide *which*
+    program runs and what it inherits; they do not stop it doing whatever that program does. A build
+    script is code, and code from a repository someone else wrote is being executed here.
+    """
+    return say(arabic,
+               en="\u26a0\ufe0f Run and Check syntax execute this project's own build code, with your "
+                  "permissions in this folder. The command is allowlisted and its environment is "
+                  "stripped, but that is a limit, not a sandbox.",
+               ar="\u26a0\ufe0f زرّا Run وCheck syntax ينفّذان كود البناء الخاص بالمشروع نفسه، "
+                  "بصلاحياتك في هذا المجلد. الأمر من قائمة مسموحات والبيئة مُجرَّدة، "
+                  "لكن هذا تقييد وليس صندوق معزول.")
+
+
 def applied_note(*, arabic: bool, count: int) -> str:
     """The line on the card reminding the user that no Apply click was involved in this write.
 
@@ -327,6 +345,92 @@ STATUS_TEXTS = {
 # counterpart (a Tk dialog is modal), and neither has Auto-Apply, so the line that follows a write
 # nobody clicked for -- and the folder that has no command to check it with -- can only appear there.
 SINGLE_WINDOW_STATUS = ("ask_expired", "applied_no_command")
+
+
+# The sentences one window used to write for itself. Each of these existed twice — in `gui.py` and in
+# `webapp/controller.py` — and seven of them had already drifted: Tk said "click Send" where the web
+# window said "press Send", the web note about saved project notes lost the half that explains *why*
+# they are safe, and Tk's stop notice promised "no changes will be applied" that the web one stopped
+# saying. The wording below is the more informative of the two, in both languages, from one place.
+#
+# `{field}` is filled by `note()`. A sentence that needs a field the caller forgot raises KeyError,
+# because a half-formatted status line is the kind of bug nobody notices until it is on screen.
+NOTE_TEMPLATES = {
+    "plan_attached_chained": (
+        "Plan attached. Send starts its first unfinished step; each step unlocks the next only after "
+        "a command run proves it. The message box is an optional note.",
+        "أُرفقت الخطة. الإرسال يبدأ أول خطوة غير منتهية، وكل خطوة تفتح التالية فقط بعد تشغيل أمر "
+        "يُثبتها. صندوق الرسالة ملاحظة اختيارية."),
+    "plan_attached_plain": ("Plan attached. Describe the phase, then press Send.",
+                            "أُرفقت الخطة. صف المرحلة ثم اضغط Send."),
+    "notes_saved": ("Project notes saved outside the project folder, so a proposal cannot rewrite them.",
+                    "حُفظت ملاحظات المشروع خارج مجلد المشروع، لذا لا يستطيع أي مقترح إعادة كتابتها."),
+    "notes_in_request": ("Your saved project notes ({count} characters) are part of this request.",
+                         "ملاحظاتك المحفوظة عن المشروع ({count} حرفًا) جزء من هذا الطلب."),
+    "new_chat_plain": ("New chat — it answers in prose and reads no project files. Choose a project "
+                       "and it can read that folder too.",
+                       "محادثة جديدة — تجيب بنثر ولا تقرأ ملفات مشروع. اختر مشروعًا ليُقرأ مجلده أيضًا."),
+    "new_chat_project": ("New chat in {project} — Send answers in prose; the badge by Send switches "
+                         "to reviewed changes.",
+                         "محادثة جديدة في {project} — الإرسال يجيب بنثر، والشارة بجوار Send تحوّل إلى "
+                         "التغييرات بعد المراجعة."),
+    "sample_ready": ("Sample ready. Choose a model, then press Send.",
+                     "المثال جاهز. اختر موديلًا ثم اضغط Send."),
+    "chat_reopened_plain": ("Chat reopened — still no project attached.",
+                            "أُعيد فتح المحادثة — لا يوجد مشروع مرفق بعد."),
+    "chat_reopened_project": ("Chat reopened — it reads {project} as context.",
+                              "أُعيد فتح المحادثة — تقرأ {project} كسياق."),
+    "stop_requested": ("Stop requested. Waiting for the current model request to finish; no changes "
+                       "will be applied.",
+                       "طُلب الإيقاف. في انتظار انتهاء طلب الموديل الحالي، ولن تُطبَّق أي تغييرات."),
+    "syntax_failed": ("Syntax check found a problem. Open the Checks tab for details.",
+                      "فحص الصياغة وجد مشكلة. افتح تبويب Checks للتفاصيل."),
+    "syntax_clean": ("Syntax checks finished. Project tests have not run; verification remains "
+                     "incomplete.",
+                     "انتهى فحص الصياغة. اختبارات المشروع لم تُشغَّل، فالتحقق ما زال ناقصًا."),
+    "step_open_detail": ("The command passed, but step {step} is not marked done: {reason}",
+                         "نجح الأمر، لكن الخطوة {step} لم تُعلَّم كمنتهية: {reason}"),
+    "step_still_open": ("Step {step} still open — see the conversation.",
+                        "الخطوة {step} ما زالت مفتوحة — راجع المحادثة."),
+    "step_reopened": ("Reopened plan step {step}: the files that passed are gone, so the step must be "
+                      "implemented again.",
+                      "أُعيد فتح الخطوة {step} من الخطة: الملفات التي نجحت زالت، لذا يجب تنفيذ الخطوة "
+                      "من جديد."),
+    # Leading spaces are part of the text: these three are appended to `prior_write`, which ends in a
+    # full stop. Keeping the space here is what lets both windows join the same two pieces.
+    "apply_rerun_warning": ("\nIt will then run {label} again in that folder, which executes the "
+                            "project's own build and test code.",
+                            "\nسيُشغَّل {label} مرة أخرى في هذا المجلد بعد ذلك، وهذا ينفّذ كود البناء "
+                            "والاختبار الخاص بالمشروع نفسه."),
+    "prior_write": ("The last task here ('{task}') left files applied without a passing command run "
+                    "({state}).",
+                    "آخر مهمة هنا ('{task}') تركت ملفات مطبَّقة بدون تشغيل أمر ناجح ({state})."),
+    "prior_continue": ("\n\nContinue with a new task anyway? Rolling back that task first is the "
+                       "safer step.",
+                       "\n\nهل تضيف مهمة جديدة على أي حال؟ الرجوع عن تلك المهمة أولًا هو الأأمن."),
+    "prior_blocked": (" Roll it back or run its command, then start the new task.",
+                      " تراجع عنها أو شغّل أمرها، ثم ابدأ المهمة الجديدة."),
+    "prior_continued": (" Continuing on this state by your choice.",
+                        " نكمل على هذه الحالة باختيارك."),
+    "prior_stacked": (" Run its command (or roll it back) before stacking more changes on top of it.",
+                      " شغّل أمرها أو تراجع عنها قبل تكديس تغييرات أخرى فوقها."),
+}
+
+# `apply_rerun_warning` is the only one with no second-language twin in the other window: Tk has no
+# Auto-Apply switch, so nothing else in it can promise a command will run by itself.
+NOTE_KEYS = tuple(NOTE_TEMPLATES)
+
+
+def note(key: str, *, arabic: bool = False, **fields) -> str:
+    """One of the sentences both windows owe the user, in the language the task was asked in.
+
+    A key that does not exist raises rather than answering in the wrong language, and a field the
+    caller forgot raises too — a status line that prints `{step}` is worse than no status line.
+    """
+    if key not in NOTE_TEMPLATES:
+        raise KeyError("no shared sentence named " + str(key))
+    english, arabic_text = NOTE_TEMPLATES[key]
+    return say(arabic, en=english, ar=arabic_text).format(**fields)
 
 
 def status_text(key: str, *, arabic: bool = False, tail: str = "") -> str:

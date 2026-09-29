@@ -572,10 +572,39 @@ def dependencies(rows: list[dict]) -> dict[str, list[str]]:
     return edges
 
 
-def render(rows: list[dict], files: list[str], limit: int = 12000) -> str:
+def module_of(relative: str) -> str:
+    """The folder a file belongs to at the level a monorepo is divided — `auth-service` in
+    `auth-service/src/main/java/App.java`, and "." for a file loose at the root."""
+    parts = [part for part in str(relative).replace("\\", "/").split("/") if part not in ("", ".")]
+    return parts[0] if len(parts) > 1 else "."
+
+
+def spread(files: list[str]) -> list[str]:
+    """Round-robin the file list across modules, so a capped map shows every one of them.
+
+    Alphabetical order and a 12 000-char budget mean one thing in a nine-module reactor: the first
+    three modules are described in detail and the other six are not mentioned at all, and the model
+    is asked to plan a cross-module change from that. Within a module the order is unchanged.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in files:
+        groups.setdefault(module_of(name), []).append(name)
+    ordered: list[str] = []
+    depth = 0
+    while any(len(items) > depth for items in groups.values()):
+        for key in sorted(groups):
+            if len(groups[key]) > depth:
+                ordered.append(groups[key][depth])
+        depth += 1
+    return ordered
+
+
+def render(rows: list[dict], files: list[str], limit: int = 12000, spread_files: bool = False) -> str:
     """The repository map: every visible file, with its declarations under it."""
     indexed = {row["path"]: row for row in rows}
     edges = dependencies(rows)
+    if spread_files:
+        files = spread(files)
     out: list[str] = []
     used = 0
     shown = 0
@@ -607,6 +636,12 @@ def render(rows: list[dict], files: list[str], limit: int = 12000) -> str:
         used += len(text)
         shown += 1
     if shown < len(files):
-        out.append("(index truncated: " + str(shown) + " of " + str(len(files)) +
-                   " files listed; read or search the rest on demand)")
+        # Which modules were left out entirely, because "300 of 1 200 files" does not tell a reader
+        # whether the missing ones are a detail or the half of the project they are asking about.
+        missing = sorted({module_of(name) for name in files[shown:]}
+                         - {module_of(name) for name in files[:shown]})
+        out.append("(index truncated: " + str(shown) + " of " + str(len(files)) + " files listed"
+                   + ("; nothing shown from " + ", ".join(missing[:6])
+                      + (" …" if len(missing) > 6 else "") if missing else "")
+                   + "; read or search the rest on demand)")
     return "\n".join(out).strip()

@@ -14,6 +14,7 @@ from .catalog import ollama_models
 from .engine import apply_proposal, load_session, plan, review, rollback
 from .errors import AgentError
 from .providers import make_provider
+from .report import export_file, find_session
 from .verification import RECIPES, verify
 from .workspace import Workspace
 
@@ -48,6 +49,12 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--recipe", choices=sorted(RECIPES))
             command.add_argument("--image", help="Preloaded approved Linux image@sha256:digest")
     sub.add_parser("demo", help="Run deterministic, offline synthetic demo without changing your repository")
+    export = sub.add_parser("export-session",
+                            help="Write one session's record as JSON or as a readable report")
+    export.add_argument("session", help="Session id, a unique id prefix, or its folder/file")
+    export.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    export.add_argument("--runs", type=Path, default=Path(".agent-runs"))
+    export.add_argument("--out", type=Path, help="Write here instead of standard output")
     return root
 
 
@@ -117,6 +124,14 @@ def main(argv: list[str] | None = None) -> int:
             result = demo()
             safe_print(json.dumps(result, indent=2))
             return 0 if result["proposal_apply_rollback"] == "passed" else 1
+        elif args.command == "export-session":
+            text = export_file(find_session(args.runs, args.session), args.format)
+            if args.out:
+                args.out.parent.mkdir(parents=True, exist_ok=True)
+                args.out.write_text(text, encoding="utf-8", newline="\n")
+                safe_print("Wrote " + str(args.out) + " (" + str(len(text)) + " characters)")
+            else:
+                safe_print(text)
         else:
             session = load_session(args.session)
             if args.command == "review":

@@ -1091,12 +1091,21 @@ function renderRail() {
   }
 
   if (DATA.recipes.length) {
+    /* A folder with more than one project in it gets the module named here, because "Maven test" at
+       the reactor root and "Maven test" in one module are different questions with different answers.
+       With one project there is nothing to choose, and a picker of one is noise. */
+    const many = (DATA.targets || []).length > 1;
     const c = el('div', 'card');
     c.innerHTML = `<h5>Checks</h5>
-      <button class="pill" id="recipe" style="width:100%;justify-content:space-between">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
+      ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
+      <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
       <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
+      ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
+      <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
       <div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>`;
     c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
+    if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
+      DATA.targets.map(row => row.label));
     c.querySelector('#run').onclick = () => send('run', { fix: false });
     c.querySelector('#fix').onclick = () => send('run', { fix: true });
     c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;

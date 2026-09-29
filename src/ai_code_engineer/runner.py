@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import io
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import queue
 import re
 import shlex
@@ -111,6 +111,13 @@ RECIPES: dict[str, dict] = {
         "markers": ["cargo.toml"],
         "label": "Cargo test",
         "test_counts": r"test result: \w+\.\s+(\d+) passed",
+        # Cargo writes no report file, so its own summary line is the only count there is. Every
+        # target prints one (`lib`, each bin, each integration test, the doc tests), and the run is
+        # the sum of them: reading only the first proved 20 of 24 tests and said nothing about the
+        # four that had not run.
+        "console_proof": {"line": r"(?m)^test result: \w+\.\s+(?P<tests>\d+) passed;\s+"
+                                  r"(?P<failures>\d+) failed;\s+(?P<skipped>\d+) ignored",
+                          "source": "cargo's own summary"},
     },
     "go-test": {
         "command": ["go", "test", "./..."],
@@ -124,8 +131,14 @@ RECIPES: dict[str, dict] = {
 
 
 def timeout_for(recipe: str) -> int:
-    """JVM builds need minutes even warm; script suites usually do not."""
-    return LONG_TIMEOUT if recipe.startswith(("maven", "gradle")) else DEFAULT_TIMEOUT
+    """JVM builds need minutes even warm; script suites usually do not.
+
+    Cargo joins them: `cargo test` is a *compile* the first time a crate or one of its dependencies
+    changes, and a cold Rust build on this class of machine runs past the 600 seconds the script
+    recipes get. A killed compile reads as "the command timed out", which sends a fix round at a
+    problem that was only ever slow.
+    """
+    return LONG_TIMEOUT if recipe.startswith(("maven", "gradle", "cargo")) else DEFAULT_TIMEOUT
 
 
 def available() -> list[str]:
@@ -138,12 +151,17 @@ def available() -> list[str]:
     return found
 
 
-def detect(repo: Path) -> list[str]:
-    """Recipes matching the project's build files, in RECIPES order."""
+def detect(repo: Path, installed: list[str] | None = None) -> list[str]:
+    """Recipes matching the project's build files, in RECIPES order.
+
+    `installed` lets a caller that scans many folders ask `available()` once: it resolves each
+    executable against PATH, and nine modules of one reactor cost half a second when every `detect()`
+    re-did it.
+    """
     files = {path.name.lower() for path in repo.glob("*")}
     folders = {path.name.lower() for path in repo.iterdir() if path.is_dir()}
     result = []
-    for name in available():
+    for name in (available() if installed is None else installed):
         recipe = RECIPES[name]
         markers = set(recipe["markers"])
         if recipe.get("test_folder") and "tests" in folders:
@@ -156,6 +174,123 @@ def detect(repo: Path) -> list[str]:
 def child_env() -> dict:
     return {key: value for key in ENV_KEYS
             if (value := os.environ.get(key)) is not None}
+
+
+# Folders that hold a build of their own. This is the whole of what a "project" is here: the tool
+# does not guess from the file tree, it reads the file a build tool would have to have. Lowercased,
+# because the comparison is by folded name on a case-insensitive filesystem.
+PROJECT_FILES = ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+                 "package.json", "pyproject.toml", "go.mod", "cargo.toml", "makefile")
+# Walked past, never into: a vendored dependency and a build output both contain build files that
+# belong to somebody else, and `mvn` would be happy to answer to any of them.
+PROJECT_SKIP = {"node_modules", "target", "build", "dist", "out", "bin", "obj", "vendor", "venv",
+                ".venv", ".direnv", "__pycache__", ".git", ".gradle", ".mvn", ".idea", ".next",
+                "site-packages", ".tox", ".pytest_cache"}
+PROJECT_DEPTH = 3
+PROJECT_LIMIT = 40
+
+
+def projects(repo: Path, max_depth: int = PROJECT_DEPTH,
+             limit: int = PROJECT_LIMIT) -> list[str]:
+    """Every folder under `repo` that holds its own build file, the opened folder first.
+
+    A monorepo opened at the top is one folder to the model and five commands to run: the reactor
+    root, and a module each. `detect()` looks at one folder's own children, so `backend/pom.xml` was
+    simply invisible and the window said "no command was detected" about a project that builds
+    perfectly. Depth is capped and vendor folders skipped because a real Spring reactor nests
+    `node_modules` under a starter module, and every one of those has a `package.json` that would be
+    offered as this project's build. The opened folder is always first: it is what the user chose, and
+    a Python project with only a `tests/` folder answers to no marker file at all.
+    """
+    root = Path(repo)
+    if not root.is_dir():
+        return []
+    found = ["."]
+    level, depth = [root], 0
+    while level and len(found) < limit and depth < max_depth:
+        children: list[Path] = []
+        for folder in level:
+            try:
+                entries = sorted((child for child in folder.iterdir() if child.is_dir()),
+                                 key=lambda child: child.name.lower())
+            except OSError:
+                continue
+            for child in entries:
+                if child.name.lower() in PROJECT_SKIP:
+                    continue
+                if _holds_build_file(child):
+                    relative = child.relative_to(root).as_posix()
+                    if relative not in found:
+                        found.append(relative)
+                children.append(child)
+        level, depth = children, depth + 1
+    return found[:limit]
+
+
+def _holds_build_file(folder: Path) -> bool:
+    """Whether this folder is a build of its own, read by folded name rather than by spelling."""
+    try:
+        names = {child.name.lower() for child in folder.iterdir()}
+    except OSError:
+        return False
+    return any(marker in names for marker in PROJECT_FILES)
+
+
+def targets(repo: Path, max_depth: int = PROJECT_DEPTH, limit: int = PROJECT_LIMIT) -> list[dict]:
+    """Where a command can be run in this folder: each project that answers to an installed tool.
+
+    Both windows draw their picker from here, so the list of folders and the commands each one has are
+    decided once. A folder with a build file whose tool is not installed is left out rather than
+    offered as a button that can only answer "Maven is not on PATH" — `detect()` already filters by
+    `available()`, and an empty list means the window hides the whole Checks card.
+    """
+    root = Path(repo)
+    rows: list[dict] = []
+    installed = available()
+    for relative in projects(root, max_depth=max_depth, limit=limit):
+        try:
+            folder = project_folder(root, relative)
+        except (PolicyError, OSError):
+            continue
+        found = detect(folder, installed)
+        if not found:
+            continue
+        rows.append({"path": relative,
+                     # The path is the label, because `api` in two places of one monorepo is two
+                     # modules and the window cannot show one button that means both.
+                     "label": root.name if relative == "." else relative,
+                     "recipes": found})
+    if len(rows) > 1 and rows[0]["path"] == ".":
+        # The opened folder of a monorepo is also the reactor root, and the difference matters when
+        # the choice is between "everything" and "one module".
+        rows[0]["label"] = rows[0]["label"] + " (whole project)"
+    return rows
+
+
+def project_folder(repo: Path, target: str = "") -> Path:
+    """The folder a command runs in: a chosen module of this project, never anything outside it.
+
+    `target` arrives from a window, which means from a click on a label — so it is resolved and then
+    checked against the root rather than trusted. A path that escapes the opened folder is refused
+    here, in the one place both windows go through, because the alternative is a build tool pointed
+    at a tree the user never approved.
+    """
+    root = Path(repo).resolve(strict=True)
+    wanted = str(target or ".").strip().replace("\\", "/")
+    if wanted in ("", ".", "./"):
+        return root
+    path = PurePosixPath(wanted)
+    parts = path.parts
+    if (path.is_absolute() or not parts or any(":" in part for part in parts)
+            or any(part in (".", "..") for part in parts)):
+        raise PolicyError("That folder is not inside the project: " + wanted[:120])
+    try:
+        candidate = (root / Path(*parts)).resolve(strict=True)
+    except OSError:
+        raise PolicyError("That folder is not in the project any more: " + wanted[:120]) from None
+    if root not in candidate.parents:
+        raise PolicyError("That folder is not inside the project: " + wanted[:120])
+    return candidate
 
 
 def kill_tree(process: subprocess.Popen) -> None:
@@ -310,6 +445,30 @@ def tests_ran(recipe_entry: dict, output: str, counts: list) -> bool:
     return any(int(value) > 0 for value in counts)
 
 
+def console_proof(recipe_entry: dict, output: str) -> dict | None:
+    """A count the tool printed itself, for the runners that write no report file.
+
+    Only a recipe that declares one is read this way, and only its own summary lines: a proof built
+    from stdout is the runner's claim about its run, not this program guessing from the word "ok"
+    appearing somewhere. Returns None when the run printed no summary at all, which leaves the exit
+    code and `expects_proof` to decide — the honest answer then is "unverified", not zero.
+    """
+    spec = recipe_entry.get("console_proof")
+    if not spec:
+        return None
+    totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    found = 0
+    for match in re.finditer(spec["line"], output):
+        found += 1
+        for name, value in match.groupdict().items():
+            if name in totals:
+                totals[name] += int(value or 0)
+    if not found:
+        return None
+    totals["source"] = spec["source"]
+    return totals
+
+
 def expects_proof(recipe_entry: dict) -> bool:
     """True for recipes whose whole purpose is running tests, so a silent green run is suspect."""
     return bool(recipe_entry["test_counts"]) or bool(recipe_entry.get("test_ran"))
@@ -415,8 +574,14 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
 
 
 def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
-        progress=lambda _text: None) -> dict:
-    """Execute a fixed recipe with the project folder as the working directory."""
+        progress=lambda _text: None, target: str = "") -> dict:
+    """Execute a fixed recipe in the project folder — or in one module of it, when a target is named.
+
+    `target` is a relative folder of `repo`, never a path the caller invented: `project_folder`
+    resolves and checks it, and the child's `cwd` is the result. A reactor build runs at the root and
+    Maven walks the modules itself; pointing one module at a time is for the monorepo where the
+    modules do not share a build file.
+    """
     if recipe not in RECIPES:
         # A PolicyError carries its reason through friendly_error; a bare ValueError would be
         # replaced by "Could not complete the operation." in both windows.
@@ -427,7 +592,8 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         return {"recipe": recipe, "command": shlex.join(command), "status": "unavailable",
                 "reason": command[0] + " is not installed or not on PATH."}
     command[0] = program or command[0]
-    root = repo.resolve(strict=True)
+    root = Path(repo).resolve(strict=True)
+    where = project_folder(root, target)
     started = time.monotonic()
     started_wall = time.time()
     recipe_entry = RECIPES[recipe]
@@ -438,7 +604,7 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         junit = Path(reports.name) / "junit.xml"
         command += [recipe_entry["junit_arg"], str(junit)]
     progress("Running " + shlex.join(recipe_entry["command"]))
-    options = {"cwd": str(root), "env": child_env(), "stdin": subprocess.DEVNULL,
+    options = {"cwd": str(where), "env": child_env(), "stdin": subprocess.DEVNULL,
                "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -456,10 +622,14 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         pattern = recipe_entry["test_counts"]
         counts = re.findall(pattern, output) if pattern else []
         ran = tests_ran(recipe_entry, output, counts)
-        proof = report_counts(fresh_reports(root, recipe_entry.get("reports", ()),
+        proof = report_counts(fresh_reports(where, recipe_entry.get("reports", ()),
                                             started_wall, junit))
         if proof is not None:
             proof["source"] = recipe_entry.get("proof_source", "JUnit XML")
+        else:
+            # A runner that writes no report file still gets read: cargo prints its own summary and
+            # nothing else, and "exit 0" alone hides how many tests that green actually was.
+            proof = console_proof(recipe_entry, output)
         status = decide_status(timed_out, exit_code, proof, ran, expects_proof(recipe_entry))
     finally:
         if process is not None and process.returncode is None:
@@ -473,6 +643,10 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         if reports is not None:
             reports.cleanup()
     return {"recipe": recipe, "label": recipe_entry["label"],
+            # Which folder of this project the command actually ran in, recorded rather than implied:
+            # a reactor's root and one module of it answer to the same recipe name, and a fix round
+            # sent to "the build failed" with no folder in it is a guess about which build failed.
+            "target": "." if where == root else where.relative_to(root).as_posix(),
             "command": shlex.join(recipe_entry["command"]), "status": status,
             "exit_code": exit_code, "seconds": seconds,
             "tests_observed": bool(proof and proof["tests"]) or ran,
@@ -480,13 +654,30 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
             "output": output, "tail": output[-MODEL_OUTPUT_CHARS:], "failures": _failures(output)}
 
 
+def run_folder(run: dict) -> str:
+    """The module a run happened in, normalised: "" when it was the opened folder itself.
+
+    A target comes from a click, from a record written before this existed, or from a call that never
+    named one, and ".", "./" and "" all mean the same place — the root of the project.
+    """
+    parts = [part for part in str(run.get("target") or ".").replace("\\", "/").split("/")
+             if part not in ("", ".")]
+    return "/".join(parts)
+
+
 def summarize(result: dict) -> str:
-    """Short human line for the status area."""
+    """Short human line for the status area.
+
+    The module is named when the command ran in one: in a nine-module reactor "Maven test: passed"
+    does not say whether the build that passed was the one the user was looking at.
+    """
+    folder = run_folder(result)
+    named = result["label"] + (" in " + PurePosixPath(folder).name if folder else "")
     if result["status"] == "unavailable":
-        return f"{result['label']}: {result['reason']}"
+        return f"{named}: {result['reason']}"
     state = {"passed": "passed", "failed": "FAILED", "timeout": "timed out",
              "unverified": "no tests ran"}[result["status"]]
     proof = result.get("proof")
     counted = (f"{proof['tests']} tests, {proof['failures']} failed, {proof['errors']} errors "
                f"({proof['source']})" if proof else f"exit {result['exit_code']}")
-    return f"{result['label']}: {state} ({counted}, {result['seconds']}s)"
+    return f"{named}: {state} ({counted}, {result['seconds']}s)"

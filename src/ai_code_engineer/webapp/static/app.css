@@ -371,6 +371,11 @@ button.pill:hover { background: var(--hover); border-color: var(--line-2) }
    the undo that used to sit inside it is the action bar under the file list. */
 .auto-note { margin: 0 0 9px; padding: 7px 10px; border: 1px solid var(--warn-line);
   border-radius: var(--r-m); background: var(--warn-bg); color: var(--warn-ink); font-size: 12.5px }
+/* What the Run buttons actually do, written where they are about to be pressed. It used to live in
+   the runner's module docstring, which nobody reads before clicking. */
+.warn { margin-top: 9px; padding: 6px 9px; border: 1px solid var(--warn-line);
+  border-radius: var(--r-m); background: var(--warn-bg); color: var(--warn-ink);
+  font-size: 12px; line-height: 1.45 }
 .pill.path svg { opacity: .5 }
 /* The folder picker's location bar, the drive chips, and the path you can type instead of
    clicking through to a disk the picker did not start on. */

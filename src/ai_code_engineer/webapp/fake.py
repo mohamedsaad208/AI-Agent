@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, labels
+from .. import config, git_integration, labels, repair
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -135,6 +135,14 @@ class FakeController:
         self.git_restore_offer = None
         self.timeout = 300
         self.recipe = "Maven test"
+        # Three modules so the monorepo picker can be reviewed here: the scripted window answers to
+        # what the real one would list, and choosing a module changes the commands offered.
+        self.targets = [{"path": ".", "label": "demo2 (whole project)",
+                         "recipes": ["Maven test", "Maven compile"]},
+                        {"path": "backend", "label": "backend", "recipes": ["Maven test"]},
+                        {"path": "frontend", "label": "frontend", "recipes": ["npm test",
+                                                                              "Node test runner"]}]
+        self.target = "."
         # The model picker is a list you search, so the preview needs a catalog and a filter that
         # behaves like the real view — the settings used to hand back one constant.
         self.mode = "Ollama"
@@ -159,6 +167,8 @@ class FakeController:
         self.memory_info = "412 chars saved · demo2-8f2a.md · sent with every task here"
         self.step = 2
         self.runs = 0
+        self.fix_round = 0
+        self.auto_fix = False
         self.tab = "diff"
         self.pending: str | None = None
         # The activity strip draws from this, so the preview needs a live-looking line of its own.
@@ -261,10 +271,16 @@ class FakeController:
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
                          "models": self.visible_models()},
             "connection": self.connection_info(),
-            "recipes": ["Maven test", "Maven compile", "pytest"], "recipe": self.recipe,
+            "recipes": self.target_recipes(), "recipe": self.recipe,
+            "targets": [{"path": row["path"], "label": row["label"]} for row in self.targets],
+            "target": self.target, "targetLabel": self.target_label(),
             "canRun": self.state in {"APPLIED_UNVERIFIED", "CHECKS_PASSED", "VERIFICATION_FAILED", "VERIFICATION_BLOCKED"},
             "runInfo": "No command has run yet." if not self.runs else
                        f"{self.runs} run(s). Last: Maven test — passed (exit 0, 41.2s)",
+            "runWarning": labels.run_warning(arabic=False),
+            # The loop's budget, from the same constant the real controller reads it from: a field the
+            # preview never sends is a field the window is never drawn with.
+            "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
             "memory": {"info": "412 chars saved"},
             "settings": {"project": "D:\\AI\\AI-Agent\\examples\\demo2", "plan": "plan.md", "chained": self.chained, "auto_apply": self.auto_apply,
                          "timeout": self.timeout, "model_info": self._model_info(),
@@ -510,6 +526,8 @@ class FakeController:
             self.timeout = int(payload.get("value") or 300)
         elif type == "set_recipe":
             self.recipe = str(payload.get("value") or self.recipe)
+        elif type == "set_target":
+            self.set_target(str(payload.get("value") or ""))
         elif type == "set_filter":
             self.model_filter = str(payload.get("value", ""))
         elif type == "set_model":
@@ -624,8 +642,32 @@ class FakeController:
             self._note(emit, "apply", "Applied 3 file(s).")
             emit({"kind": "toast", "text": "Changes applied. You can run the project command now."})
 
+    def target_row(self, path: str) -> dict:
+        return next((row for row in self.targets if row["path"] == path), self.targets[0])
+
+    def target_label(self) -> str:
+        return self.target_row(self.target)["label"]
+
+    def target_recipes(self) -> list:
+        return self.target_row(self.target)["recipes"]
+
+    def set_target(self, label: str) -> None:
+        """The same rule the real window follows: pick by label, and the commands change with it."""
+        chosen = next((row for row in self.targets if row["label"] == label), None)
+        if chosen and chosen["path"] != self.target:
+            self.target = chosen["path"]
+            if self.recipe not in chosen["recipes"]:
+                self.recipe = chosen["recipes"][0]
+
     def _run(self, fix, emit) -> None:
         self.busy = True
+        # The scripted command always passes, so a loop has to be driven by hand: "Run & fix" spends
+        # the budget the same way the real window does — reset, then one round per further run — so
+        # the chip can be reviewed at any value the real one can reach.
+        if fix:
+            self.fix_round, self.auto_fix = 0, True
+        elif self.auto_fix:
+            self.fix_round = min(self.fix_round + 1, repair.MAX_FIX_ROUNDS)
         emit({"kind": "busy", "value": True, "cancellable": False})
 
         def work():

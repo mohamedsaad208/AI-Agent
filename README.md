@@ -11,7 +11,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3B82F6?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-10B981?style=for-the-badge&logo=linux&logoColor=white)]()
 [![Developed with AI](https://img.shields.io/badge/Built%20With-AI%20%26%20Human%20Pairing-8B5CF6?style=for-the-badge&logo=openai&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/Tests-620%2B%20Passing-06B6D4?style=for-the-badge&logo=pytest&logoColor=white)]()
+[![Tests](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml/badge.svg?style=for-the-badge&logo=python&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml)
 
 [Quick Start](#-quick-start) •
 [Why AI Code Engineer](#-why-ai-code-engineer) •
@@ -33,12 +33,35 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 | Feature | Why it matters |
 | :--- | :--- |
 | 🔒 **Zero-Trust Security** | Path-traversal guards, symlink blocking, and automatic secret redaction (AWS, GitHub tokens, Bearer keys, `.env`) prevent leakage to logs or LLMs. |
-| 🛡️ **Cryptographic Diffs** | Nothing reaches your disk without explicit approval. All changes generate `SHA-256` proposal hashes and support one-click rollbacks. |
+| 🛡️ **Reviewed diffs** | Every change is a proposal with a `SHA-256` hash, and applying it is a decision you make (or hand over per folder, explicitly). Rollback is one step, as long as nothing else edited those files afterwards. |
 | ⚡ **100% Offline & Local** | Full first-class support for **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Code stays on your hardware. |
 | ☁️ **Multi-Provider Cloud** | Seamlessly switch between **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, or custom OpenAI-compatible endpoints. |
 | 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
 | 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
 | 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
+
+---
+
+# 🧭 Three modes, and the limits that go with them
+
+**Chat** answers in prose and reads no files until you hand it a folder. **Change** produces a
+proposal you review, and only `Apply` writes. **Auto-Apply** is a switch you turn on *per folder*:
+the agent then writes what it proposes without a click, runs that folder's own command afterwards,
+and keeps the rollback. It still asks first if the proposal would empty or delete an existing file, or
+if a previous task left that folder half-written. The window says so on the card and in the Activity
+log when a write happened without a click — that is the one thing about this tool that is easiest to
+forget and hardest to undo.
+
+| What you should know before you rely on it | |
+| :--- | :--- |
+| **Run and Check syntax execute your project's own code** | They invoke `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` in that folder with *your* permissions. A build script is code, and code from a repository you did not write gets run here. The command list is an allowlist and the environment is stripped of credentials — that is a **limit**, not a sandbox. |
+| **Docker is the isolation, if you need isolation** | For a folder you do not trust, run the tool inside a container with a mount you are willing to lose. Nothing inside this program contains a project's build script. |
+| **The repository map is context, not a compiler** | Symbols are parsed with `ast` for Python and bounded scanners for Java, Kotlin, Go, Rust and TypeScript. It tells the model what files declare; it does not type-check, resolve imports or prove the code works. Only running the project's command does that, and a run that never ran is reported as `unverified`, not as a pass. |
+| **Small local models write small diffs** | The reference setup is a CPU-only `qwen2.5-coder` on Ollama. Larger models produce better proposals; none of them produce a diff you should apply without reading. |
+| **A cloud endpoint means your code leaves the device** | Cloud rows are refused until you approve, the approval is asked per task, cleartext to a remote host is refused outright, and API keys live in memory only — never in a config file, a log line or an error message. |
+
+Running `python agent.py doctor` prints what this machine can actually reach — the local model list,
+whether Docker is installed, and which key variables are set (their values are never printed).
 
 ---
 
@@ -51,14 +74,29 @@ cd AI-Agent
 ```
 
 ```bash
-# Run self-diagnostics
+# Self-diagnostics: python version, Ollama reachability, Docker, key variables (never their values)
 python agent.py doctor
 
-# Run deterministic sandbox demo (No LLM required)
+# Deterministic offline demo — no model, no network, and nothing from your repository is executed
 python agent.py demo
 
-# Run comprehensive test suite
-python -m unittest discover -s tests -v
+# The suite. It is stdlib-only and needs no install step: `tests/*` add `src/` to sys.path itself.
+python -m unittest discover -s tests
+
+# Windows: the same command, with the interpreter this project is counted against.
+# 3.11 is named on purpose — newer interpreters tally subtests differently, so the total moves.
+run-tests.cmd
+```
+
+The suite is the gate CI runs (`.github/workflows/ci.yml`: 3.11 on Windows and Linux, `compileall`,
+`node --check` on the two UI scripts, a wheel build checked for the files the window needs). There is
+no pytest, no `pip install -e .` step and no network access in it.
+
+To open the local web window without an engine behind it — the same UI, scripted data, useful for
+reading the interface before trusting a folder to it:
+
+```bash
+python -m ai_code_engineer.webapp --fake --no-browser --port 8765
 ```
 
 ---
@@ -177,6 +215,25 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
                                                   |  - Autonomous Repair Loop     |
                                                   +-------------------------------+
 ```
+
+---
+
+# 📁 Where everything lives
+
+| path | what it is |
+| :--- | :--- |
+| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command, `labels.py` holds every sentence in both languages, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
+| `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
+| `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
+| `tests/` | **the gate.** 951 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
+| `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
+| `docs/` | plans, implementation status, code reviews. Every measured claim in this README points at one of these. |
+| `tools/` | development aids for this repository — contrast checks, the dogfood ledger, wheel inspection, demo generators. |
+| `sandbox/` | probes that produced a number someone quoted, kept so the number can be re-measured. |
+| `examples/` | folders the agent is pointed at to try it out. |
+| `archive/` | see `archive/README.md` — including why two experiment folders were **not** moved into it. |
+| `.agent-chats/`, `.agent-runs/`, `.agent-projects.json` | what the tool writes next to itself: conversations, run records, the granted-folder registry. Ignored by git, and the history in them is addressed by absolute path. |
 
 ---
 

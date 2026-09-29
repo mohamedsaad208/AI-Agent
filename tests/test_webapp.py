@@ -7,6 +7,8 @@ confinement, and a blocked worker thread waking up when the browser answers.
 import json
 from pathlib import Path
 import inspect
+import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -31,6 +33,7 @@ class Stub:
         self.reply = threading.Event()
         self.answer = {}
         self.granted = {"demo2"}
+        self.failures = []
 
     def snapshot(self):
         return {"ok": True, "busy": False}
@@ -57,23 +60,166 @@ class Stub:
         self.answer = reply
         self.reply.set()
 
+    def note_failure(self, reference, detail):
+        # The real controller writes this to the Activity log; the stub only has to remember that
+        # the server asked, because the pair — a fixed sentence out, the reason in — is the contract.
+        self.failures.append((reference, detail))
+
+
+class TransportHardening(unittest.TestCase):
+    """Who the server will talk to, and what it says when it answers.
+
+    A token proves the request knows the session. It does not prove the request came from the page
+    that holds it, which is the difference `Host` and `Origin` make — and it says nothing at all to
+    the browser about what that page may run, which is what the Content-Security-Policy is for.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stub = Stub()
+        cls.server, cls.url, cls.token = server_module.serve(cls.stub)
+        # Registered first so it runs last: shutdown() stops the loop, server_close() returns the
+        # listening socket. Only the first was called, so each class leaked a bound port.
+        cls.addClassCleanup(cls.server.server_close)
+        cls.addClassCleanup(cls.server.shutdown)
+        cls.base = cls.url.rsplit("?", 1)[0]
+        cls.authority = urllib.parse.urlparse(cls.base).netloc
+
+    def _send(self, path, headers=None, body=None, token=None, query=""):
+        url = self.base + path + "?t=" + urllib.parse.quote(token if token is not None else self.token) + query
+        request = urllib.request.Request(url, data=body, headers={"Connection": "close", **(headers or {})})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def test_a_host_that_is_not_this_server_is_refused(self):
+        # DNS rebinding: the attacker's hostname resolves to 127.0.0.1 inside the victim's browser,
+        # so the request arrives on loopback with somebody else's name in it. The token would still
+        # be needed to answer it — but this is the header that says whether the page asking is the
+        # page this server was opened for.
+        for host in ("evil.example", "127.0.0.1.evil.example", "localhost.attacker.io"):
+            code, _headers, body = self._send("api/bootstrap", {"Host": host})
+            self.assertEqual(code, 425, host)
+            self.assertNotIn(self.token, body.decode(), "a refusal must not echo the session token")
+
+    def test_the_loopback_names_this_server_accepts(self):
+        for host in (self.authority, "127.0.0.1:%d" % self.server.server_address[1],
+                     "localhost:%d" % self.server.server_address[1]):
+            code, _headers, _body = self._send("api/bootstrap", {"Host": host})
+            self.assertEqual(code, 200, host)
+
+    def test_a_wrong_port_is_not_this_server_either(self):
+        code, _h, _b = self._send("api/bootstrap", {"Host": "127.0.0.1:%d" % (self.server.server_address[1] + 1)})
+        self.assertEqual(code, 425)
+
+    def test_a_request_from_another_page_is_refused(self):
+        for origin in ("http://evil.example", "http://127.0.0.1:9999", "https://localhost",
+                      # A loopback page on the default port is not this page: the server is http on
+                      # one random port, and an Origin states the port it lived on.
+                      "http://localhost", "http://127.0.0.1",
+                      # file:// and a sandboxed frame both arrive as `null`.
+                      "null"):
+            code, _h, _b = self.post({"Origin": origin}, {"type": "new_chat"})
+            self.assertEqual(code, 403, origin)
+
+    def test_the_page_this_server_serves_is_the_only_one_asking(self):
+        code, _h, _b = self.post({"Origin": "http://" + self.authority}, {"type": "new_chat"})
+        self.assertEqual(code, 200)
+        code, _h, _b = self.post({"Referer": "http://%s/index.html" % self.authority}, {"type": "new_chat"})
+        self.assertEqual(code, 200)
+        # The other loopback name for the same port is the same page.
+        port = self.server.server_address[1]
+        code, _h, _b = self.post({"Origin": "http://localhost:%d" % port}, {"type": "new_chat"})
+        self.assertEqual(code, 200)
+
+    def test_a_request_with_no_origin_at_all_is_still_authenticated_by_its_token(self):
+        # curl and the test client send no Origin; the token is what carries them. This is the
+        # defence-in-depth rule stated rather than assumed.
+        code, _h, _b = self.post({}, {"type": "new_chat"})
+        self.assertEqual(code, 200)
+        code, _h, _b = self.post({"Origin": "http://evil.example"}, {"type": "new_chat"}, token="wrong")
+        self.assertEqual(code, 403)
+
+    def post(self, headers, payload, token=None):
+        return self._send("api/action", headers, json.dumps(payload).encode(), token)
+
+    def test_every_answer_carries_the_policy(self):
+        for path, extra in (("index.html", ""), ("api/bootstrap", ""), ("nope.css", ""),
+                            ("api/project", "&project=demo2")):
+            url = self.base + path + "?t=" + urllib.parse.quote(self.token) + extra
+            request = urllib.request.Request(url, headers={"Connection": "close"})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    headers = response.headers
+            except urllib.error.HTTPError as exc:      # a 404 has to answer like every other response
+                headers = exc.headers
+            directives = {part.split()[0]: part.strip() for part in
+                          headers["content-security-policy"].split(";") if part.strip()}
+            # The directive that decides whether a page can run code. `style-src` keeps its
+            # 'unsafe-inline' on purpose: eight template strings set layout values inline, and a
+            # style cannot execute script. So this asserts on script-src alone, not the whole header.
+            self.assertEqual(directives["script-src"], "script-src 'self'", path)
+            self.assertEqual(directives["default-src"], "default-src 'none'", path)
+            self.assertEqual(directives["frame-ancestors"], "frame-ancestors 'none'", path)
+            self.assertEqual(headers["x-frame-options"], "DENY", path)
+            self.assertEqual(headers["x-content-type-options"], "nosniff", path)
+            self.assertEqual(headers["referrer-policy"], "no-referrer", path)
+
+    def test_the_refusal_answers_carry_it_too(self):
+        for headers in ({"Host": "evil.example"}, {"Origin": "http://evil.example"}):
+            code, response, _body = self._send("api/bootstrap", headers)
+            self.assertIn("content-security-policy", response, headers)
+
+    def test_the_boot_script_is_a_file_because_the_policy_has_no_unsafe_inline(self):
+        # index.html used to set the theme in an inline <script> before first paint. A script-src
+        # that means it would block that, and 'unsafe-inline' would block nothing — so it is a file,
+        # which still runs before the body is parsed.
+        index = Path(server_module.STATIC, "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("<script>", index)
+        self.assertIn('<script src="boot.js"></script>', index)
+        code, headers, body = self._send("boot.js")
+        self.assertEqual(code, 200)
+        self.assertIn("text/javascript", headers["content-type"])
+        self.assertIn("dataset.style", body.decode())
+
+    def test_an_agent_error_keeps_its_own_sentence(self):
+        # A PolicyError was written by this program to be read in the UI, so a 400 still says what
+        # went wrong. The removal is only for somebody else's exception, and the two are told apart
+        # by type — not by whether the text happens to look harmless.
+        code, _h, body = self._send("api/project", query="&project=elsewhere")
+        self.assertEqual(code, 400)
+        self.assertEqual(body.decode(), "Unknown project.")
+
+    def test_a_failure_the_server_did_not_expect_keeps_its_reason_off_the_wire(self):
+        code, _h, body = self.post({}, {"type": "definitely-not-an-action"})
+        text = body.decode()
+        self.assertEqual(code, 500)
+        self.assertNotIn("ValueError", text)
+        self.assertNotIn("definitely-not-an-action", text)
+        self.assertIn("Activity log", text)
+
 
 class HttpBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.stub = Stub()
         cls.server, cls.url, cls.token = server_module.serve(cls.stub)
+        # Registered first so it runs last: shutdown() stops the loop, server_close() returns the
+        # listening socket. Only the first was called, so each class leaked a bound port.
+        cls.addClassCleanup(cls.server.server_close)
         cls.addClassCleanup(cls.server.shutdown)
         cls.base = cls.url.rsplit("?", 1)[0]
 
-    def get(self, path, token=None, query=""):
+    def get(self, path, token=None, query="", headers=None):
         token = self.token if token is None else token
         url = self.base + path + "?t=" + urllib.parse.quote(token if token is not None else "") + query
-        return self._open(url)
+        return self._open(url, headers=headers)
 
-    def _open(self, url, body=None):
-        headers = {"Connection": "close"} if body else {}
-        request = urllib.request.Request(url, data=body, headers=headers)
+    def _open(self, url, body=None, headers=None):
+        request = urllib.request.Request(url, data=body,
+                                         headers={"Connection": "close", **(headers or {})})
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 return response.status, response.read()
@@ -113,11 +259,80 @@ class HttpBoundaryTests(unittest.TestCase):
 
     def test_an_empty_launch_token_authors_nobody(self):
         """Two empty strings compare equal, so a handler that never got one must answer nothing."""
-        saved = server_module.Handler.token
-        server_module.Handler.token = ""
-        self.addCleanup(setattr, server_module.Handler, "token", saved)
+        bound = self.server.RequestHandlerClass
+        saved = bound.token
+        bound.token = ""
+        self.addCleanup(setattr, bound, "token", saved)
         self.assertEqual(self.get("/api/bootstrap", token="")[0], 403)
         self.assertEqual(self.post("/api/action", {"type": "new_chat"})[0], 403)
+
+    def test_the_same_token_travels_in_a_header_as_in_the_query(self):
+        """The query string is what the launch URL carries, and it is also what a proxy log, a
+        history entry and a referrer would repeat — so the header form exists. Both must open the
+        same doors, or the header quietly becomes a second, untested way in."""
+        url = self.base + "api/bootstrap"
+        self.assertEqual(self._open(url, headers={"X-Auth-Token": self.token})[0], 200)
+        self.assertEqual(self._open(url, headers={"X-Auth-Token": "not-the-launch-token"})[0], 403)
+        # A header must not outrank a query that is present and wrong.
+        self.assertEqual(self.get("/api/bootstrap", token="wrong",
+                                 headers={"X-Auth-Token": self.token})[0], 403)
+        self.assertEqual(self._open(self.base + "api/action", json.dumps({"type": "new_chat"}).encode(),
+                                    {"X-Auth-Token": self.token})[0], 200)
+
+    def test_a_closed_stream_takes_its_subscriber_out_of_the_hub(self):
+        """A tab that is closed, reloaded or navigated away from is the normal way this endpoint
+        ends, and every queue the hub keeps holding is a queue the agent keeps filling.
+
+        The handler only learns the socket is gone when it next writes, so the disconnect is
+        followed by a publish — that write is what has to fail, and the cleanup has to run anyway.
+        """
+        hub = self.server.RequestHandlerClass.hub
+        port = self.server.server_address[1]
+        before = len(hub._clients)
+        client = socket.create_connection(("127.0.0.1", port), timeout=10)
+        client.sendall(("GET /api/events?t=%s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                        "Connection: close\r\n\r\n" % (urllib.parse.quote(self.token), port)).encode())
+        header = client.recv(4096)
+        self.assertIn(b"200", header.split(b"\r\n", 1)[0], header[:80])
+        # SO_LINGER with a zero timeout sends RST rather than FIN, so the next server-side write
+        # cannot succeed into a buffer the peer will never read.
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        deadline = time.monotonic() + 10
+        while len(hub._clients) >= before + 1 and time.monotonic() < deadline:
+            hub.publish({"kind": "log", "entry": {"kind": "job", "text": "write-me", "ts": ""}})
+            threading.Event().wait(0.05)
+        self.assertEqual(len(hub._clients), before,
+                         "the stream left its client queued — a slow leak per closed tab")
+        # And the server is still serving on the same session afterwards.
+        self.assertEqual(self.get("/api/bootstrap")[0], 200)
+
+    def test_two_servers_in_one_process_do_not_share_a_session(self):
+        """The desktop launcher can be asked for a second window, and the second `serve()` used to
+        write its token and its controller onto the *shared* handler class — which did not open a
+        second door, it replaced the first one's lock."""
+        other = Stub()
+        server2, url2, token2 = server_module.serve(other)
+        self.addCleanup(server2.server_close)
+        self.addCleanup(server2.shutdown)
+        base2 = url2.rsplit("?", 1)[0]
+        self.assertNotEqual(token2, self.token)
+        self.assertIsNot(self.server.RequestHandlerClass, server2.RequestHandlerClass)
+        self.assertEqual(self.get("/api/bootstrap")[0], 200)
+        # Each token opens only its own server, and each server answers from its own controller.
+        code, body = self.get("/api/bootstrap")
+        self.assertEqual(json.loads(body), self.stub.snapshot())
+        code, body = self._open(base2 + "api/bootstrap?t=" + urllib.parse.quote(token2))
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body), other.snapshot())
+        self.assertEqual(self._open(base2 + "api/bootstrap?t=" + urllib.parse.quote(self.token))[0], 403)
+        self.assertEqual(self.get("/api/bootstrap", token=token2)[0], 403)
+        # Each server knows only its own port: a request wearing the other window's address is
+        # refused rather than answered with the right token.
+        port1 = self.server.server_address[1]
+        code, _body = self._open(base2 + "api/bootstrap?t=" + urllib.parse.quote(token2),
+                                 headers={"Host": "127.0.0.1:%d" % port1})
+        self.assertEqual(code, 425)
 
     # ------------------------- what a refused POST leaves behind -------------------------
     def test_a_refused_post_gets_its_answer_with_the_body_still_in_flight(self):
@@ -194,7 +409,21 @@ class HttpBoundaryTests(unittest.TestCase):
     def test_an_unknown_action_is_a_server_error_not_a_silent_success(self):
         code, body = self.post("/api/action", {"type": "definitely-not-an-action"})
         self.assertEqual(code, 500)
-        self.assertIn("Unknown action", body.decode())
+        self.assertIn("Activity log", body.decode())
+
+    def test_the_reason_for_a_failed_request_never_travels_in_the_response(self):
+        # The stub raises ValueError("Unknown action: …"), which is a message this program wrote and
+        # harmless — and exactly the shape that a provider's 401 body or a Windows path also takes.
+        # What the boundary does with an unknown exception cannot depend on what is inside it.
+        code, body = self.post("/api/action", {"type": "definitely-not-an-action"})
+        text = body.decode()
+        self.assertEqual(code, 500)
+        self.assertNotIn("ValueError", text)
+        self.assertNotIn("definitely-not-an-action", text)
+        reference = text.split("id ")[1].split(")")[0]
+        recorded = dict((r, d) for r, d in self.stub.failures)
+        self.assertIn(reference, recorded, "the id has to lead somewhere")
+        self.assertIn("Unknown action", recorded[reference])
 
     def test_an_action_returns_the_state_the_client_re_renders_from(self):
         code, body = self.post("/api/action", {"type": "new_chat"})

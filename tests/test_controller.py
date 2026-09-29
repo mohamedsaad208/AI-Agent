@@ -15,67 +15,25 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import catalog, git_integration, memory, repair
+from ai_code_engineer import git_integration, memory, repair
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController
+from doubles import (CALCULATOR_BAD, CALCULATOR_GOOD, ChatModel, FREE_ENTRY, OLLAMA_ENTRY,
+                     PROOF, ProposalModel, run_result)
 
-OLLAMA_ENTRY = {"id": "test-local", "name": "Test Local", "cloud": False,
-                "description": "Synthetic local model for tests"}
-FREE_ENTRY = {"id": "x:free", "name": "X Free", "free": True, "cloud": True,
-              "description": "Synthetic free cloud model"}
-CALCULATOR_BAD = "def add(a, b):\n    return a - b\n"
-CALCULATOR_GOOD = "def add(a, b):\n    return a + b\n"
+# The plan document this suite feeds the model. Not shared with `test_planbook`, whose PLAN is a
+# different document with different sections; the name is the only thing they have in common.
 PLAN = "# Build it\n\n## 1. Foundation\nCreate the package.\n\n## 2. Register\nReject duplicate emails.\n"
+from doubles import patched_catalog as shared_patched_catalog
+from helpers import sandbox_repo
 
 
 def patched_catalog():
-    """The controller's one discovery call, answered without a network.
-
-    Discovery sat behind two functions per provider until the provider list grew; it is now
-    ``models_for(kind, endpoint, key)`` returning ``(entries, source)``, and the window reads the
-    source to say whether a list came from the service or from built-in names. Tests that used to
-    patch one function per provider patch this one.
-    """
-    def models_for(kind, endpoint="", api_key=None):
-        return (list(FREE_ENTRY) if kind.free_only else [OLLAMA_ENTRY]), catalog.LIVE
-    return patch("ai_code_engineer.webapp.controller.models_for", side_effect=models_for)
-
-
-class ProposalModel:
-    model = "test-local"
-
-    def __init__(self, content=CALCULATOR_GOOD):
-        self.content = content
-        self.prompts = []
-
-    def generate(self, messages, json_mode=True):
-        self.prompts.append(messages)
-        return json.dumps({"action": "propose", "summary": "Fix addition", "checks": ["Run unit tests"],
-                           "changes": [{"path": "calculator.py", "content": self.content}]})
-
-
-class ChatModel:
-    model = "test-local"
-
-    def __init__(self):
-        self.calls = []
-
-    def generate(self, messages, json_mode=True):
-        self.calls.append((messages, json_mode))
-        return "A monotonic clock never moves backwards."
-
-
-def run_result(status="passed", proof=None, observed=True, failures=None):
-    return {"recipe": "python-unittest", "label": "Python unittest", "command": "python -m unittest",
-            "status": status, "exit_code": 0 if status == "passed" else 1, "seconds": 1.4,
-            "tests_observed": observed, "proof": proof, "truncated": False, "timed_out": False,
-            "output": "Ran 4 tests\nOK\n", "tail": "Ran 4 tests\nOK\n",
-            "failures": failures or []}
-
-
-PROOF = {"tests": 4, "failures": 0, "errors": 0, "skipped": 0, "source": "JUnit XML"}
+    """This window's discovery patch: the shared double, aimed at the controller's own import."""
+    return shared_patched_catalog("webapp.controller")
 
 
 class Scripted(AgentController):
@@ -143,9 +101,7 @@ class ControllerTests(unittest.TestCase):
         self.addCleanup(self._drain)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD)
+        self.repo = sandbox_repo(self.app_dir)
         started = (patched_catalog(),)
         for patcher in started:
             patcher.start()
@@ -214,7 +170,7 @@ class ControllerTests(unittest.TestCase):
         events = []
         self.controller._emit = events.append
 
-        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None):
+        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
             progress("compiling AuthService.java")
             progress('password = "hunter2-secret-value"')
             progress("   ")
@@ -508,7 +464,7 @@ class ControllerTests(unittest.TestCase):
         self.controller.set_auto_apply(True)
         calls = []
 
-        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None):
+        def fake_run(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
             calls.append(recipe)
             return run_result(proof=PROOF)
 
@@ -634,12 +590,128 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("Keep going?", [row["title"] for row in controller.asked])
         planner.assert_not_called()
 
+    def test_the_same_failure_twice_stops_the_loop_instead_of_asking_again(self):
+        """D42's other half in the window: a round that moved nothing is not a reason to buy another
+        model turn, and the stop has to be readable in the thread, not only in a status line."""
+        controller = self.applied_controller()
+        controller.answers["confirm"] = False
+        stuck = run_result(status="failed", failures=["AssertionError: 3 != 4"],
+                           proof={"tests": 7, "failures": 3, "errors": 0, "source": "pytest"})
+        with patch("ai_code_engineer.webapp.controller.plan") as planner, \
+             patch("ai_code_engineer.runner.run", return_value=stuck):
+            controller.run_tests(False)
+            controller.join()
+            controller.asked.clear()
+            controller.run_tests(False)
+            controller.join()
+        planner.assert_not_called()
+        self.assertNotIn("Keep going?", [row["title"] for row in controller.asked],
+                         "a loop that says it stopped must not also ask to continue")
+        self.assertFalse(controller._auto_fix)
+        self.assertIn("No progress", controller.status)
+        rows = [message["text"] for message in controller.snapshot()["messages"]
+                if message["role"] == "tool"]
+        self.assertTrue(any(text.startswith("🛑 No progress") for text in rows), rows)
+        self.assertTrue(any("Tried so far:" in text and "7 tests, 3 failing" in text
+                            for text in rows), rows)
+
+    def test_the_offer_shows_the_rounds_it_is_about_to_add_to(self):
+        """The offer is the one moment the user decides whether another turn is worth it, so the
+        history belongs in the question rather than in a tab they would have to go and open."""
+        controller = self.applied_controller()
+        controller.answers["confirm"] = False
+        worse = run_result(status="failed", failures=["AssertionError: 3 != 4"],
+                           proof={"tests": 7, "failures": 5, "errors": 0, "source": "pytest"})
+        better = run_result(status="failed", failures=["AssertionError: 3 != 4"],
+                            proof={"tests": 7, "failures": 2, "errors": 0, "source": "pytest"})
+        with patch("ai_code_engineer.webapp.controller.plan"), \
+             patch("ai_code_engineer.runner.run", side_effect=[worse, better]):
+            controller.run_tests(False)
+            controller.join()
+            controller.asked.clear()
+            controller.run_tests(False)
+            controller.join()
+        asked = [row for row in controller.asked if row["title"] == "Keep going?"]
+        self.assertEqual(len(asked), 1, "a moving loop is still worth a round")
+        self.assertIn("Tried so far:", asked[0]["message"])
+        self.assertIn("1. Python unittest: failed (7 tests, 5 failing", asked[0]["message"])
+        self.assertIn("2. Python unittest: failed (7 tests, 2 failing", asked[0]["message"])
+
     def test_a_passing_run_is_offered_nothing(self):
         controller = self.applied_controller()
         with patch("ai_code_engineer.runner.run", return_value=run_result(proof=PROOF)):
             controller.run_tests(False)
             controller.join()
         self.assertEqual(controller.asked, [])
+
+    # ------------------------- one folder, several projects -------------------------
+    def monorepo(self):
+        """Two modules with a command each and no build file at the top of the opened folder."""
+        root = self.app_dir / "mono"
+        for name in ("auth-service", "product-service"):
+            folder = root / name
+            (folder / "tests").mkdir(parents=True)
+            (folder / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (folder / "tests" / "test_one.py").write_text(
+                "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                "    def test_ok(self):\n        self.assertEqual(2, 1 + 1)\n", encoding="utf-8")
+        return root
+
+    def monorepo_controller(self, root):
+        controller = Scripted(self.app_dir, None)
+        self._made.append(controller)
+        controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        controller.model = "test-local"
+        with patch("ai_code_engineer.runner.available", return_value=["python-unittest"]):
+            controller.set_repo(str(root))
+        return controller
+
+    def test_a_folder_of_several_modules_offers_each_one(self):
+        """`detect()` on the opened folder alone found nothing here at all: the build files are one
+        level down, and the window said "no command was detected" about a project that builds."""
+        state = self.monorepo_controller(self.monorepo()).snapshot()
+        self.assertEqual([row["path"] for row in state["targets"]],
+                         ["auth-service", "product-service"])
+        self.assertEqual(state["target"], "auth-service")
+        self.assertEqual(state["targetLabel"], "auth-service")
+        self.assertEqual(state["recipes"], ["Python unittest"])
+
+    def test_choosing_a_module_moves_the_command_and_the_next_run(self):
+        controller = self.monorepo_controller(self.monorepo())
+        controller.set_target("product-service")
+        self.assertEqual(controller.snapshot()["target"], "product-service")
+        seen = {}
+
+        def record(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+            seen["target"] = target
+            return run_result()
+
+        with patch("ai_code_engineer.runner.run", side_effect=record):
+            controller.run_tests(False)
+            controller.join()
+        self.assertEqual(seen["target"], "product-service")
+        controller.set_target("nowhere")
+        self.assertEqual(controller.target, "product-service",
+                         "a label that is not on the list changes nothing")
+
+    def test_a_task_rooted_elsewhere_is_never_handed_this_folders_modules(self):
+        """The module list was scanned from the window's folder. A session pointed at another tree
+        gets that tree's root, because `auth-service` there is a different project's directory."""
+        controller = self.monorepo_controller(self.monorepo())
+        controller.set_target("product-service")
+        controller.session = {"root": str(self.repo), "state": "APPLIED_UNVERIFIED"}
+        seen = {}
+
+        def record(repo, recipe, timeout=60, progress=lambda _line: None, target="."):
+            seen["target"] = target
+            seen["repo"] = repo
+            return run_result()
+
+        with patch("ai_code_engineer.runner.run", side_effect=record):
+            controller.run_tests(False)
+            controller.join()
+        self.assertEqual(seen["target"], ".")
+        self.assertEqual(Path(seen["repo"]), Path(self.repo))
 
     def test_the_next_plan_step_starts_on_an_answer_not_a_guess(self):
         book = {"steps": [{"id": 1, "title": "Add the model", "status": "verified"},
@@ -897,9 +969,7 @@ class BranchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD)
+        self.repo = sandbox_repo(self.app_dir)
         started = (patched_catalog(),)
         for patcher in started:
             patcher.start()
@@ -1546,9 +1616,7 @@ class CheckpointTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
@@ -1635,9 +1703,7 @@ class TaskBranchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
                  "calculator.py")
@@ -1758,9 +1824,7 @@ class GitRestoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
@@ -2103,9 +2167,7 @@ class QueueTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         self.model = GatingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
                    patched_catalog(),
@@ -2402,9 +2464,7 @@ class TheActivityFeed(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         self.model = SteppingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
                    patched_catalog()]
@@ -2550,9 +2610,7 @@ class TheStepRows(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.app_dir = Path(self.temp.name)
-        self.repo = self.app_dir / "repo"
-        (self.repo / "tests").mkdir(parents=True)
-        (self.repo / "calculator.py").write_text(CALCULATOR_BAD, encoding="utf-8", newline="\n")
+        self.repo = sandbox_repo(self.app_dir)
         self.model = SteppingModel()
         for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
                         patched_catalog()):
@@ -2822,6 +2880,126 @@ class SecondSendBecomesAQueueItem(unittest.TestCase):
         self.assertEqual([item["text"] for item in self.controller.queue],
                          ["Create exactly one new file: A.java",
                           "Create exactly one new file: B.java"])
+
+
+class TheStateUnderTwoThreads(unittest.TestCase):
+    """UI 4.2 hardening: one writer, one HTTP thread per browser tab, and a snapshot that is a copy.
+
+    The controller was written as a single-threaded object with a daemon thread that happened to be
+    slow. Two HTTP handlers used to read `busy`, both see False, and both start a job — the second
+    one overwrites the first's `on_done` chain and its writes land in whichever task was last to
+    claim the branch. `snapshot()` returned live lists, so a page reading state while a job appended
+    a step could be handed a list mid-append, or a list it then sorted in place.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=ChatModel()),
+                   patched_catalog()]
+        for patcher in started:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(Path(self.temp.name))
+        self.addCleanup(self.controller.close)
+
+    def test_exactly_one_of_ten_simultaneous_claims_runs(self):
+        """The claim is the lock's job, and the nine losers still get to say what their message became."""
+        gate = threading.Event()
+        runs = []
+        busy_told = []
+
+        def operation():
+            runs.append(1)
+            gate.wait(10)
+            return "done"
+
+        def call():
+            self.controller.run_job(operation, lambda result: None, "Working",
+                                    on_busy=lambda: busy_told.append(1))
+
+        threads = [threading.Thread(target=call) for _ in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(len(runs), 1, "one job per burst of clicks")
+        self.assertEqual(len(busy_told), 9, "the nine that were turned away are not silently dropped")
+        gate.set()
+        self.controller.join(10)
+        self.assertFalse(self.controller.busy)
+
+    def test_a_snapshot_never_shows_a_message_half_written(self):
+        """A reader that never blocks on the writer must still never see a list shorter than the one
+        it read a moment ago, or an entry missing the fields the page indexes by.
+
+        The writer is paced rather than flat-out on purpose: unthrottled, it appends faster than a
+        full frozen snapshot can be copied, so the test spends its time measuring lock contention and
+        ends up timing out instead of reading anything.
+        """
+        stop = threading.Event()
+
+        def writer():
+            number = 0
+            while not stop.is_set():
+                number += 1
+                self.controller._add("tool", "Tool", f"entry {number}")
+                self.controller._note("job", f"entry {number}")
+                threading.Event().wait(0.0005)
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (stop.set(), thread.join(10)))
+        lengths = []
+        for _ in range(80):
+            state = self.controller.snapshot()
+            messages = state["messages"]
+            lengths.append(len(messages))
+            for message in messages:
+                self.assertTrue({"role", "author", "text", "time"} <= set(message), message)
+            threading.Event().wait(0.002)
+        self.assertEqual(lengths, sorted(lengths), "a read list went backwards — a torn list")
+        self.assertGreater(lengths[-1], lengths[0], "and the writer really was writing")
+
+    def test_a_page_reading_state_cannot_starve_the_answer_a_worker_waits_for(self):
+        """The lock is never held across a wait. If it were, this loop is a deadlock: the worker
+        holds the state while it waits for the reply, and the reply is delivered by a thread that
+        has to read the state to find the request id."""
+        answered: dict = {}
+
+        def ask():
+            answered["reply"] = self.controller._ask("confirm", {"title": "Keep going?", "message": "m"})
+
+        thread = threading.Thread(target=ask)
+        thread.start()
+        asks = []
+        for _ in range(150):
+            asks = self.controller.snapshot()["asks"]       # taken many times while the worker waits
+            if asks:
+                break
+            threading.Event().wait(0.02)
+        self.assertTrue(asks, "the question is visible while somebody is blocked on it")
+        thread_done = threading.Event()
+        threading.Thread(target=lambda: (thread.join(10), thread_done.set()), daemon=True).start()
+        self.controller.set_reply(asks[0]["id"], {"ok": True})
+        self.assertTrue(thread_done.wait(10), "a reader polling state cannot wedge the worker")
+        self.assertEqual(answered.get("reply"), {"ok": True})
+
+    def test_the_snapshot_a_page_holds_is_not_the_state(self):
+        """Deep-copied, not merely a new outer dict: a client sorting a list in place, or rewriting
+        one message's text, used to change what the next snapshot showed."""
+        self.controller._add("tool", "Tool", "a sentence the page did not write")
+        before = self.controller.snapshot()
+        state = self.controller.snapshot()
+        self.assertIsNot(state["messages"], self.controller.messages)
+        state["messages"].append({"role": "tool", "author": "Tool", "text": "injected", "time": ""})
+        state["messages"][-1]["text"] = "rewritten"
+        state["log"].clear()
+        fresh = self.controller.snapshot()
+        self.assertEqual([message["text"] for message in fresh["messages"]],
+                         [message["text"] for message in before["messages"]])
+        self.assertNotIn("injected", json.dumps(fresh, ensure_ascii=False))
+        self.assertEqual(len(fresh["log"]), len(before["log"]))
 
 
 if __name__ == "__main__":

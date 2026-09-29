@@ -8,7 +8,7 @@ import re
 import stat
 import tempfile
 
-from . import symbols
+from . import runner, symbols
 from .errors import MissingFileError, PolicyError
 
 MAX_FILE_BYTES = 128 * 1024
@@ -222,7 +222,10 @@ class Workspace:
         for stale in [key for key in list(INDEX_CACHE)
                       if key[0] == self._cache_key and key[1] not in indexed]:
             del INDEX_CACHE[stale]
-        return symbols.render(rows, files)
+        # A folder with several builds in it gets its map spread across them: the budget is the same
+        # 12 000 characters either way, and in a reactor alphabetical order spends all of it on the
+        # first three modules.
+        return symbols.render(rows, files, spread_files=len(runner.projects(self.root)) > 1)
 
     def _index_row(self, relative: str) -> dict | None:
         """This file's declarations, reusing the last parse when the file still fits.

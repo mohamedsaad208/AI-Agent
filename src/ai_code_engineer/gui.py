@@ -5,7 +5,7 @@ from dataclasses import replace
 import difflib
 import json
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import queue
 import sys
 import threading
@@ -22,7 +22,9 @@ from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
-                     catalog_status_line, friendly_error, is_arabic, state_label, status_text)
+                     catalog_status_line, friendly_error, is_arabic, run_warning, state_label,
+                     status_text)
+from .labels import note as shared_note      # `note` is a local variable in two methods here
 from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
@@ -209,11 +211,8 @@ class AgentWindow:
         self.profile = ""
         self.catalog_source: dict[str, str] = {}
         self.key = tk.StringVar()
-        try:
-            saved_timeout = int(self._saved_ui.get("request_timeout") or config.REQUEST_TIMEOUT_DEFAULT)
-        except (TypeError, ValueError):
-            saved_timeout = 300
-        self.request_timeout = tk.IntVar(value=min(900, max(30, saved_timeout)))
+        self.request_timeout = tk.IntVar(value=config.clamp_request_timeout(
+            self._saved_ui.get("request_timeout")))
         self.cloud_ok = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready — choose your project and describe the change")
         self.state_label = tk.StringVar(value="No task open")
@@ -222,6 +221,12 @@ class AgentWindow:
         self.recipe = tk.StringVar()
         self.run_info = tk.StringVar(value="No command has run yet.")
         self.recipes: list[str] = []
+        # Which module of a multi-project folder the command runs in. `target_box` is only packed
+        # when there is more than one, so a single-project folder keeps the card it had before.
+        self.targets: list[dict] = []
+        self.target = ""
+        self.target_name = tk.StringVar()
+        self._targets_root = ""
         self._fix_round = 0
         self._auto_fix = False
         self.root.title("AI Code Engineer")
@@ -405,6 +410,14 @@ class AgentWindow:
         # Checks: run the project's own build/test command, then optionally ask for a fix.
         self.checks_frame = ttk.Frame(card.inner)
         ttk.Label(self.checks_frame, text="Checks", foreground=MUTED, font=("Segoe UI", 10)).pack(anchor="w")
+        # The module first, then the command inside it: in a reactor the folder is the question that
+        # changes the answers. Packed only when there is more than one to choose from.
+        self.target_row = ttk.Frame(self.checks_frame)
+        self.target_box = ttk.Combobox(self.target_row, textvariable=self.target_name, values=[],
+                                       state="readonly", width=24)
+        self.target_box.pack(side="left")
+        self.target_box.bind("<<ComboboxSelected>>", self.target_changed)
+        Tooltip(self.target_box, "Which part of this project the command runs in")
         self.recipe_box = ttk.Combobox(self.checks_frame, textvariable=self.recipe, values=[],
                                        state="readonly", width=24)
         self.recipe_box.pack(anchor="w", pady=(3, 6))
@@ -420,6 +433,7 @@ class AgentWindow:
         ttk.Label(self.checks_frame, textvariable=self.run_info, foreground=MUTED, font=("Segoe UI", 9),
                   wraplength=212, justify="left").pack(anchor="w", pady=(6, 0))
         self.job_controls.append((self.recipe_box, "readonly"))
+        self.job_controls.append((self.target_box, "readonly"))
         # Packed here so it sits between the artifact summary and Sources; hidden
         # again by refresh_recipes() while no project folder is selected.
         self.checks_frame.pack(anchor="w", pady=(0, 12))
@@ -510,6 +524,26 @@ class AgentWindow:
         self.messages.append((author,message))
         self.render_messages()
         self._idle(lambda: self.conversation.yview_moveto(1))
+
+    # ---------------- the four Host verbs ----------------
+    # `host.Host` names the only ways a window may put something on screen. Thin on purpose: Tk's
+    # surface is a StringVar and a Text widget, the web window's is a snapshot and an SSE channel, and
+    # the contract was never one implementation. It is the name that a sentence can be written under
+    # once and be checked for in the other window. `tests/test_host.py` holds both windows to them and
+    # ratchets the raw primitives below, so an un-routed sink cannot quietly be added.
+    def say(self, text: str) -> None:
+        self.status.set(text)
+
+    def line(self, role: str, author: str, text: str) -> None:
+        self.chat_message(author, text)
+
+    def ask(self, title: str, message: str, warning: str = "", ok_label: str = "Continue",
+            alt_label: str = "") -> bool:
+        return bool(messagebox.askyesno(title, message + ("\n\n" + warning if warning else ""),
+                                        parent=self.root))
+
+    def stream(self, event: dict) -> None:
+        self.events.put(event)
 
     def render_messages(self, event=None):
         if getattr(self, "_rendering_messages", False):
@@ -824,6 +858,10 @@ class AgentWindow:
         self.footer_actions = ttk.Frame(parent)
         self.footer_actions.pack(fill="x", pady=(15, 0))
         self.button(self.footer_actions, "Refresh models", self.check_setup).pack(side="left")
+        # The run buttons live in the narrow sidebar card, so the sentence about what they do goes
+        # here, where there is room to read it before pressing one.
+        ttk.Label(parent, text=run_warning(arabic=self.arabic), foreground=MUTED,
+                  font=("Segoe UI", 9), wraplength=500, justify="left").pack(fill="x", pady=(10, 0))
         self.hint = ttk.Label(parent, text="You will review a proposal first. Project files are not changed automatically.", style="Muted.TLabel", anchor="w", wraplength=500, justify="left")
         self.hint.pack(fill="x", pady=(12, 0))
 
@@ -1055,11 +1093,8 @@ class AgentWindow:
         self.plan_file.set(str(Path(self.repo.get()) / reference["path"]))
         if not self.chained.get() and not self.task.get("1.0", "end").strip():
             self.task.insert("1.0", "Read the attached plan and inspect the current project. Implement the next incomplete phase only. Preserve completed work. Propose at most 8 files. Do not run builds, tests, or the application.")
-        if self.chained.get():
-            self.status.set("Plan attached. Send starts its first unfinished step; each step unlocks the "
-                            "next only after a command run proves it. The message box is an optional note.")
-        else:
-            self.status.set("Plan attached. Specify the phase to implement, select a model, then click Send.")
+        self.status.set(shared_note("plan_attached_chained" if self.chained.get()
+                                    else "plan_attached_plain", arabic=self.arabic))
 
     def clear_plan(self):
         self.plan_file.set("")
@@ -1112,7 +1147,7 @@ class AgentWindow:
             self.status.set(friendly_error(exc))
             return
         self.refresh_memory_info()
-        self.status.set("Project notes saved outside the project folder, so a proposal cannot rewrite them.")
+        self.status.set(shared_note("notes_saved", arabic=self.arabic))
 
     def refresh_plan_status(self):
         """Mirror the attached plan's ledger into the header chip and the Settings panel."""
@@ -1175,9 +1210,9 @@ class AgentWindow:
         try:
             planbook.complete(path, book, step_id, session)
         except (AgentError, OSError) as exc:
-            self.chat_message("Tool", "The command passed, but step " + str(step_id) + " is not marked done: "
-                              + friendly_error(exc))
-            self.status.set("Step " + str(step_id) + " still open — see the conversation.")
+            self.chat_message("Tool", shared_note("step_open_detail", arabic=self.arabic, step=step_id,
+                                                  reason=friendly_error(exc)))
+            self.status.set(shared_note("step_still_open", arabic=self.arabic, step=step_id))
             return
         self.refresh_plan_status()
         nxt = planbook.current(book)
@@ -1225,7 +1260,7 @@ class AgentWindow:
         self.task.delete("1.0", "end")
         self.clear_review()
         self.select_view("task")
-        self.status.set("New chat — ask directly, or choose a project to work on its files")
+        self.status.set(shared_note("new_chat_plain", arabic=self.arabic))
         self.refresh_recent()
         self.refresh_recipes()
         self.update_buttons()
@@ -1262,7 +1297,7 @@ class AgentWindow:
         self.task.insert("1.0", "Fix the add function in calculator.py so it adds the two numbers instead of subtracting them.")
         self.mode.set("Ollama")
         self.mode_changed()
-        self.status.set("Sample ready. Choose an Ollama model, then click Send.")
+        self.status.set(shared_note("sample_ready", arabic=self.arabic))
 
     def mode_changed(self, _event=None):
         self.selections[self.active_mode] = self.model.get()
@@ -1417,18 +1452,17 @@ class AgentWindow:
         chat_id = self.chat_id
         prior = self.unverified_prior_task(chat_id, repo)
         if prior:
-            note = ("The last task here ('" + str(prior.get("task", ""))[:60] + "') left files applied "
-                    "without a passing command run (" + prior["state"] + ").")
+            note = shared_note("prior_write", arabic=self.arabic,
+                              task=str(prior.get("task", ""))[:60], state=prior["state"])
             if prior["state"] in INTERRUPTED_STATES:
                 if not messagebox.askyesno("Unfinished task",
-                                           note + "\n\nContinue with a new task anyway? Rolling back that "
-                                           "task first is the safer step.", parent=self.root):
-                    self.status.set(note + " Roll it back or run its command, then start the new task.")
+                                           note + shared_note("prior_continue", arabic=self.arabic),
+                                           parent=self.root):
+                    self.status.set(note + shared_note("prior_blocked", arabic=self.arabic))
                     return
-                self.chat_message("Tool", note + " Continuing on this state by your choice.")
+                self.chat_message("Tool", note + shared_note("prior_continued", arabic=self.arabic))
             else:
-                self.chat_message("Tool", note + " Run its command (or roll it back) before stacking "
-                                  "more changes on top of it.")
+                self.chat_message("Tool", note + shared_note("prior_stacked", arabic=self.arabic))
                 self.status.set(status_text("prior_unverified", arabic=self.arabic))
         self.title.set(task.replace("\n", " ")[:45])
         self.chat_message("You", task)
@@ -1436,8 +1470,8 @@ class AgentWindow:
         self.clear_review()
         notes = self.project_notes()
         if notes:
-            self.chat_message("Tool", "Your saved project notes (" + str(len(notes)) +
-                              " characters) are part of this request.")
+            self.chat_message("Tool", shared_note("notes_in_request", arabic=self.arabic,
+                                                  count=len(notes)))
 
         def work():
             provider = make_provider(settings, allow_cloud=cloud, data_class="public" if cloud else "restricted", api_key=key,
@@ -1490,7 +1524,7 @@ class AgentWindow:
         if self.busy and self.cancellable:
             self.cancel_event.set()
             self.stop_button.configure(state="disabled")
-            self.status.set("Stop requested. Waiting for the current model request to finish; no changes will be applied.")
+            self.status.set(shared_note("stop_requested", arabic=self.arabic))
 
     def _load_session_cached(self, path: Path):
         try:
@@ -1638,7 +1672,7 @@ class AgentWindow:
         self.render_messages()
         self._idle(lambda: self.conversation.yview_moveto(1))
         self.select_view("task")
-        self.status.set("Chat reopened — still no project attached.")
+        self.status.set(shared_note("chat_reopened_plain", arabic=self.arabic))
 
     def open_session(self, path: Path):
         try:
@@ -1772,14 +1806,16 @@ class AgentWindow:
             return
         again = ""
         if self._auto_fix and self.selected_recipe():
-            again = ("\nIt will then run " + runner.RECIPES[self.selected_recipe()]["label"] +
-                     " again in that folder, which executes the project's own build and test code.")
+            again = shared_note("apply_rerun_warning", arabic=self.arabic,
+                                label=runner.RECIPES[self.selected_recipe()]["label"])
         # The same dialog the web window shows, from the same builder. This window used to assemble
-        # its own and had drifted: it never passed `must_ask`'s reason in, so a proposal that emptied
-        # a file warned about it here only because the removal notice happened to say the same thing.
+        # its own and had drifted twice over: it never passed `must_ask`'s reason in, and it then
+        # dropped the `warning` the builder returned, so a proposal that emptied or deleted a file
+        # warned about it in the web window only. Both halves are the verb's job now.
+        prior = self.unverified_prior_task(self.chat_id, self.repo.get().strip())
         prompt = host.apply_prompt(self.session, notice=self.removal_notice(),
-                                   reason=repair.must_ask(self.session), again=again)
-        if not messagebox.askyesno(prompt["title"], prompt["message"], parent=self.root):
+                                   reason=repair.must_ask(self.session, prior), again=again)
+        if not self.ask(prompt["title"], prompt["message"], prompt["warning"], prompt["ok_label"]):
             return
         path, approved = self.session_path, self.session["proposal_hash"]
         self.run_job(lambda: apply_proposal(path, approved), lambda _: self.applied(path), "Applying the changes you reviewed…")
@@ -1793,16 +1829,33 @@ class AgentWindow:
         self.status.set(status_text("applied_idle", arabic=self.arabic))
 
     def refresh_recipes(self):
-        """Detect the commands this project folder actually answers to."""
+        """Detect the folders this project answers to, and the commands each one has.
+
+        The opened folder used to be the only place searched, so a reactor opened at its root showed
+        no command at all — and the module list is the same one the web window draws.
+        """
         repo = self.repo.get().strip()
         try:
-            self.recipes = runner.detect(Path(repo)) if repo and Path(repo).is_dir() else []
+            self.targets = runner.targets(Path(repo)) if repo and Path(repo).is_dir() else []
+            self._targets_root = str(Path(repo).resolve()) if self.targets else ""
         except OSError:
-            self.recipes = []
+            self.targets, self._targets_root = [], ""
+        if not any(row["path"] == self.target for row in self.targets):
+            self.target = self.targets[0]["path"] if self.targets else ""
+        self.recipes = next((row["recipes"] for row in self.targets
+                             if row["path"] == self.target), [])
         labels = [runner.RECIPES[name]["label"] for name in self.recipes]
         self.recipe_box.configure(values=labels)
         if self.recipe.get() not in labels:
             self.recipe.set(labels[0] if labels else "")
+        names = [row["label"] for row in self.targets]
+        self.target_box.configure(values=names)
+        if self.target_name.get() not in names:
+            self.target_name.set(self.target_label() or (names[0] if names else ""))
+        if len(self.targets) > 1:
+            self.target_row.pack(fill="x", pady=(3, 6), before=self.recipe_box)
+        else:
+            self.target_row.pack_forget()
         if labels:
             if not self.checks_frame.winfo_manager():
                 self.checks_frame.pack(anchor="w", pady=(0, 12), before=self.sources_label)
@@ -1810,6 +1863,16 @@ class AgentWindow:
             self.checks_frame.pack_forget()
             self.run_info.set("No command has run yet.")
         self.update_buttons()
+
+    def target_changed(self, event=None):
+        """A module chosen from the list: its commands replace the ones on screen."""
+        chosen = next((row for row in self.targets if row["label"] == self.target_name.get()), None)
+        if chosen and chosen["path"] != self.target:
+            self.target = chosen["path"]
+            self.refresh_recipes()
+
+    def target_label(self) -> str:
+        return next((row["label"] for row in self.targets if row["path"] == self.target), "")
 
     def selected_recipe(self):
         labels = [runner.RECIPES[name]["label"] for name in self.recipes]
@@ -1905,7 +1968,7 @@ class AgentWindow:
         model = self.model.get().strip()
         entry = self.model.get() and self.selected_model()
         if entry is None:
-            self.status.set("Select a model from the list first, then try again.")
+            self.status.set(status_text("pick_model", arabic=self.arabic))
             return None
         cloud, paid = self.cloud_choice()
         if cloud and not self.cloud_ok.get():
@@ -1931,20 +1994,28 @@ class AgentWindow:
         if auto_fix:
             self._fix_round = 0
         repo, path = self.session["root"], self.session_path
+        # The module list was scanned from the window's folder; a task rooted somewhere else gets its
+        # own root and no module, rather than a path resolved against the wrong tree.
+        target = self.target if str(Path(repo).resolve()) == self._targets_root else "."
         label = runner.RECIPES[recipe]["label"]
+        where = Path(repo).name if target in ("", ".") else PurePosixPath(target).name
 
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=lambda line: self.events.put(("progress", line)))
+                                progress=lambda line: self.events.put(("progress", line)),
+                                target=target)
             return repair.record_run(path, result), result
 
         def done(pair):
             self.display_session(path)
             self.report_run(pair[1])
-        self.run_job(work, done, f"Running {label} in {Path(repo).name}…")
+        self.run_job(work, done, f"Running {label} in {where}…")
 
     def report_run(self, result):
-        summary = runner.summarize(result)
+        # `summarize()` interpolates the recipe's own `reason` when the tool is missing, and a
+        # Windows error there carries a path. The web window redacts every field of the same
+        # sentence; this line used to be the one place Tk wrote it straight to the screen.
+        summary = redact(runner.summarize(result))[:300]
         self.run_info.set(summary)
         self.chat_message("Checks", summary)
         if result["status"] == "passed":
@@ -1958,12 +2029,41 @@ class AgentWindow:
             self.status.set(summary + " — the captured output is in the Checks tab.")
         self.advance_plan(result)
 
+    def round_history(self):
+        """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window
+        only knows where its own chat lives."""
+        if not self.session:
+            return []
+        return repair.round_history(self.runs, self.session["root"], self.chat_id)
+
+    def fix_rounds(self):
+        """The attempt rows the offer, the stop line and the report all read: what ran, what it cost."""
+        if not self.session:
+            return []
+        return repair.attempts_of(self.runs, self.session["root"], self.chat_id)
+
+    def _show_rounds(self):
+        """Put the attempts on record where they stay readable after the round counter has moved on."""
+        block = repair.timeline(self.fix_rounds())
+        if block:
+            self.line("tool", "Tool", block)
+
+    def stop_fix_loop(self, reason):
+        """The web window's answer to the same decision, word for word — see `repair.stop_status`."""
+        self._auto_fix = False
+        self.line("tool", "Tool", repair.stop_line(reason))
+        self.say(repair.stop_status(reason))
+        self._show_rounds()
+
     def ask_for_fix(self, run):
-        """Feed the failure back as one more reviewable proposal, up to a bound."""
-        if self._fix_round >= repair.MAX_FIX_ROUNDS:
-            self._auto_fix = False
-            self.status.set(f"Stopped after {repair.MAX_FIX_ROUNDS} fix rounds and the command still fails. "
-                            "Try a narrower task, another model, or inspect the output in Checks.")
+        """Feed the failure back as one more reviewable proposal, up to a bound.
+
+        The bound and the two reasons to stop early are `repair`'s decision, not this window's: the
+        web window asks the same question and must get the same answer.
+        """
+        stop, reason = repair.should_stop(self.round_history(), self._fix_round)
+        if stop:
+            self.stop_fix_loop(reason)
             return
         args = self.provider_args()
         if args is None:
@@ -1978,8 +2078,9 @@ class AgentWindow:
         plan_file = str(Path(repo) / reference["path"]) if reference and step_id is not None else None
         task, evidence = repair.fix_task(run), repair.evidence(run)
         notes = self.project_notes()
-        status = (f"Fix round {self._fix_round}/{repair.MAX_FIX_ROUNDS}: asking {settings.model} "
-                  "for the smallest change that makes the command pass…")
+        # The category belongs in the line the user reads, because "asking for a fix" and "asking for
+        # a fix to a dependency the machine cannot resolve" are different odds of working.
+        status = repair.round_status(settings.model, self._fix_round, repair.classify(run))
 
         def work():
             provider = make_provider(settings, allow_cloud=cloud,
@@ -1992,6 +2093,13 @@ class AgentWindow:
 
         def done(path):
             self.display_session(path)
+            earlier = [item for item in self.round_history() if item.get("id") != path.parent.name]
+            if repair.already_tried(earlier, (self.session or {}).get("changes") or []):
+                self._auto_fix = False
+                self.line("tool", "Tool", "🔁 " + repair.REPEATED_PROPOSAL)
+                self.say(repair.REPEATED_ADVICE)
+                self._show_rounds()
+                return
             if plan_file:
                 try:
                     pair = self.ledger_for(self.session)
@@ -2010,8 +2118,8 @@ class AgentWindow:
 
         def done(result):
             self.display_session(path)
-            self.status.set("Syntax check found a problem. Open the Checks tab for details." if result["status"] == "failed" else
-                            "Syntax checks finished. Project tests have not run; verification remains incomplete.")
+            self.status.set(shared_note("syntax_failed" if result["status"] == "failed"
+                                        else "syntax_clean", arabic=self.arabic))
         self.run_job(lambda: verify(path), done, "Checking syntax in changed files…")
 
     def undo(self):
@@ -2033,8 +2141,7 @@ class AgentWindow:
                     self.status.set(status_text("ledger_needs_look", arabic=self.arabic) + friendly_error(exc))
                     return
                 self.refresh_plan_status()
-                self.chat_message("Tool", "Reopened plan step " + str(step_id) +
-                                  ": the files that passed are gone, so the step must be implemented again.")
+                self.chat_message("Tool", shared_note("step_reopened", arabic=self.arabic, step=step_id))
         self.run_job(lambda: rollback(path, approved), done, "Rolling back changes…")
 
     def close(self):

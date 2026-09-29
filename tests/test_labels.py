@@ -489,5 +489,36 @@ class TheInsideOfAStepRow(unittest.TestCase):
         self.assertFalse(is_arabic(labels.log_dropped_line(arabic=False, count=7)))
 
 
+class TheWarningThatRunIsNotSandboxed(unittest.TestCase):
+    """The one sentence in this program that must not be a code comment.
+
+    Everything else about running the project's command is a mechanism — an argv allowlist, a
+    stripped environment, a kill tree. This is the consequence, and it belongs in front of the
+    person who presses the button, in whatever language they are reading the window in.
+    """
+
+    def test_it_says_what_runs_and_where(self):
+        for text in (labels.run_warning(arabic=False), labels.run_warning(arabic=True)):
+            self.assertIn("\u26a0\ufe0f", text)
+        self.assertTrue(is_arabic(labels.run_warning(arabic=True)))
+        self.assertFalse(is_arabic(labels.run_warning(arabic=False)))
+
+    def test_english_names_the_two_buttons_and_the_limit(self):
+        text = labels.run_warning(arabic=False)
+        for word in ("Run", "Check syntax", "build code", "permissions", "sandbox"):
+            self.assertIn(word.lower(), text.lower(), word)
+        # "a limit, not a sandbox" is the whole point; a sentence that only warns is not it.
+        self.assertIn("not a sandbox", text.lower())
+
+    def test_the_arabic_says_the_same_thing_as_the_english(self):
+        """Both are read by someone deciding whether to click, so neither may be softer."""
+        english = labels.run_warning(arabic=False).lower()
+        arabic = labels.run_warning(arabic=True)
+        self.assertIn("\u0635\u0644\u0627\u062d\u064a\u0627\u062a\u0643", arabic)      # your permissions
+        self.assertIn("\u0644\u064a\u0633 \u0635\u0646\u062f\u0648\u0642", arabic)        # not a sandbox
+        self.assertGreater(len(arabic), 60)
+        self.assertGreater(len(english), 60)
+
+
 if __name__ == "__main__":
     unittest.main()

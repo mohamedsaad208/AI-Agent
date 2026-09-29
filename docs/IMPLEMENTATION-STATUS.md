@@ -1,5 +1,60 @@
 # Implementation status — 2026-09-29
 
+## Phase 2 — cleanup: the boundary tested, the two windows made to share what they say
+
+An eight-item list framed as "not new features, less chance a future change regresses something"
+(`docs/PHASE-2-CLEANUP.md`), measured first. Three items already existed in a different shape, one
+turned out to be a contract nobody had implemented, and the repository-restructuring item had to be
+refused on its consequences. **903 → 951 offline tests**, `node --check` clean, and the new packaging
+gate **run locally** rather than only written into CI.
+
+| what changed | where |
+| --- | --- |
+| the second window is no longer a takeover of the first | `serve()` builds a handler **subclass per launch**: token, controller, hub and port were class attributes on the shared `Handler`, so a second call replaced the first server's authentication |
+| the HTTP boundary's own gaps closed | the `X-Auth-Token` header path (existed in code, tested nowhere), a closed SSE stream removing its client from `Hub` — proved with an `SO_LINGER` RST plus a publish to force the failing write — and two servers in one process keeping separate sessions. Every fixture now calls `server_close()`; the suite was leaking a bound port per class |
+| the wire under a provider, tested on a socket | `tests/test_transport.py`: a 302 refused *and its target never reached*, a proxy in the environment ignored, `sk-…` echoed by a 401 not repeated back, non-JSON, valid-JSON-that-is-a-list, oversized body, a real timeout, a dead port |
+| the command line, which had no test of its wiring | `tests/test_cli.py`: argv in, exit code and stdout out — usage errors exit 2, `doctor` both Ollama branches and never a key, `plan` leaves the folder untouched, `apply` refusing a missing hash / a wrong hash / a non-interactive run, `rollback` refusing before an apply, and the cloud gate refusing **before the transport is called** |
+| a safety rule defined once instead of twice | `labels.NOTE_TEMPLATES` (21 sentences, both languages, `{fields}` verified): seven pairs had already drifted in wording. `gui.py` also had an inline duplicate of a key it imports |
+| the two windows now share four verbs, with a ceiling | `host.Host`'s `say`/`line`/`ask`/`stream` were stubs neither window implemented; both do now, and `tests/test_host.py` ratchets the raw primitives so the un-routed half cannot grow unnoticed |
+| four Tk/web asymmetries, three of them safety-relevant | Tk dropped `apply_prompt`'s `warning`; Tk called `repair.must_ask(session)` without the prior task, leaving that branch dead there; Tk wrote `runner.summarize()` unredacted where the web window redacts every field; and `controller.py` put `str(exc)` into a status line the browser reads |
+| the shared fixtures, with a guard | `tests/doubles.py` + `tests/helpers.py`, and a test that no module re-declares them. The extraction surfaced a latent bug in both copies of `patched_catalog()`: `list(FREE_ENTRY)` is a dict's keys, so a free-only row was handed five strings as a model catalog |
+| a wheel that can be trusted to open a window | `tools/check_package.py` (the four static files must be in the zip) and `tools/package_smoke.py` (install into a venv, start the server, fetch the page, the CSS, both scripts). CI builds the wheel, checks it, installs it. `pyproject.toml` was already right — nothing held it |
+| the README stopped promising things | the `620+` badge is the CI badge, "nothing reaches your disk without explicit approval" became what Auto-Apply actually is, and a *Three modes and the limits* section carries the four caveats: Run/Check executes the project's own build code (a limit, not a sandbox), Docker is the isolation, the repository map is context not a compiler, a cloud row means code leaves the device |
+
+Refused, with the reason written down: `spring-rpoject/` and `project-2/` stay where they are because
+the tool's own history — `.agent-projects.json` and four `.agent-chats/<id>/chat.json` — addresses them
+by absolute path, and "open the window afterwards and read the whole history" outranks a typo in a
+directory name (`archive/README.md`). `ecommerce` is a **gitlink** (`160000`, no `.gitmodules`) and
+de-indexing it changes what the repository records, so it is reported, not run. `ruff` is not added:
+the project is stdlib-only deliberately and a first lint of 5 100 never-linted lines would be a wall
+nobody reads.
+
+## Phase 1 hardening — the boundary, the lock, and one sentence the docstring was keeping
+
+A seven-item priority list, measured against the code before any of it was written
+(`docs/HARDENING-PHASE-1.md`): CI marked done and absent, cargo reported broken in the wrong place,
+no lock anywhere in the web layer, `snapshot()` handing out live lists, a server that checked only its
+token, 500s that echoed exception text, and a "this runs the project's own code" fact that existed only
+in a module docstring. **881 → 903 offline tests**, `node --check` clean on both scripts, and the
+workflow's every command run locally first.
+
+| what changed | where |
+| --- | --- |
+| the server answers only the page it was opened for | `server.Handler._guard()` — `Host` must name a loopback name on this exact port (DNS rebinding), and `Origin`/`Referer`, when sent, must be `http://` + that same port. `serve()` refuses to bind a non-loopback host at all |
+| every response carries the same headers, so a new route cannot forget them | `_safe()` + `CSP`/`SAFE_HEADERS`: `default-src 'none'`, `script-src 'self'`, `frame-ancestors 'none'`, `base-uri`/`form-action 'none'`, `X-Frame-Options: DENY`, `nosniff`, `no-referrer` (the launch URL holds the token in its query) |
+| the policy made a file of the one script that ran before paint | `static/boot.js`, extracted from `index.html`'s inline `<script>`. `style-src 'self' 'unsafe-inline'` stays, deliberately, and is the one loosening documented in the header itself |
+| a failure says one fixed sentence to the browser | `Handler._fail()`: an `AgentError` keeps its own redacted, capped wording because this program wrote it to be read; anything else gets `(id 3f9a1c)` and the reason goes to `controller.note_failure()` — the Activity log, redacted at 600, because a provider's 401 body can echo a bearer token |
+| controller state has one guard, and it is never held across a wait | `self._state = threading.RLock()`: the `busy` claim, `_add`/`_note`/`_step`, `set_reply` (its `Event.set()` deliberately outside), `_ask` (registers locked, waits unlocked), `open_step` (copies inside, searches outside), `snapshot()` |
+| a snapshot cannot change under whoever holds it | `snapshot()` is `deepcopy` of `_snapshot()` inside the lock — a client sorting a list in place used to rewrite the server's state |
+| cargo gets the timeout its own step needs, and the count it already printed | `timeout_for()` puts cargo with the compilers (cold Rust is a *compile*), and `runner.console_proof()` reads cargo's own `test result: …` lines — summed, so a two-crate workspace reporting 20 and 4 says 24 — instead of `summarize()` throwing the parsed number away and saying `exit 0` |
+| the run button now says what it does, in both languages | `labels.run_warning(arabic=)`, drawn under Run in the drawer (`.warn`) and on Tk's Settings page, and carried in `snapshot()["runWarning"]`: project build code, your permissions, this folder — a limit, not a sandbox |
+| the gate that did not exist | `.github/workflows/ci.yml`: 3.11 on `windows-latest` + `ubuntu-latest` (Tk's 41 tests would silently skip on Linux, so `python3-tk` + `Xvfb`), `compileall`, `node --check` on both scripts, then the same `python -m unittest discover -s tests` that `run-tests.cmd` runs. Pinned to one interpreter on purpose: 3.13 tallies subtests differently, and the test count is this project's acceptance measure |
+
+Two premises died in the measurement, and both are worth keeping down: cargo's *marker* was never
+broken — `detect()` lowercases filenames, so `markers: ["cargo.toml"]` has always matched a real
+`Cargo.toml` — and go has no counting hole, since `go test` prints no total by design and the recipe
+already counts `ok <package>` lines. Only cargo declares a console proof.
+
 ## UI 4.2 Phase 1 — the connection spine: eight providers, one endpoint, no literals
 
 Asked for "Multi-Provider Integration": generic OpenAI-compatible providers, TOML profiles,

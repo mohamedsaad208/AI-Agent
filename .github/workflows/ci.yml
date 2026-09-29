@@ -1,0 +1,74 @@
+name: tests
+
+# The suite is the project's only gate: `python -m unittest discover -s tests`, stdlib only, no
+# pytest, no network. run-tests.cmd does the same thing on this machine, so CI runs the command that
+# is already trusted rather than a second way of saying it.
+#
+# Python is pinned to 3.11, which is what run-tests.cmd looks for and what the suite is counted
+# against: subtests are tallied differently on newer interpreters, so a second version here would
+# report a different number for the same suite and nobody would know which one to believe.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The desktop window is built from tkinter, and its tests skip themselves when there is no
+      # display. On Linux that would silently drop 41 tests, so a headless server is started and
+      # the suite runs inside it. Windows has a real display and needs nothing.
+      - name: Headless display for the Tk window (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          Xvfb :99 -screen 0 1280x1024x24 &
+
+      - name: Byte-compile every module
+        run: python -m compileall -q src tests agent.py launcher.py desktop.pyw
+
+      # app.js is a plain script with no build step, so a syntax error in it is a broken window with
+      # a green suite. `node --check` is the whole verification the front end gets.
+      - name: Check the UI script parses
+        run: node --check src/ai_code_engineer/webapp/static/app.js
+
+      - name: Check the boot script parses
+        run: node --check src/ai_code_engineer/webapp/static/boot.js
+
+      - name: Run the suite
+        run: python -m unittest discover -s tests -v
+
+      # `webapp/server.py` finds its static folder from `__file__`, so a wheel built without
+      # package-data installs cleanly, passes all of the above — because those read the checkout —
+      # and opens a window with no stylesheet and no script. Only the artifact can be tested for it.
+      - name: Build the wheel and check what it carries
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel
+          python tools/check_package.py
+
+      # Installed into a throwaway venv, from a directory where `src/` is not reachable, and then
+      # asked to serve the UI. The two tools are in the repository, run by the venv's interpreter.
+      - name: Start the window from the installed package
+        shell: bash
+        run: |
+          python -m venv .pkgcheck
+          if [ -d .pkgcheck/Scripts ]; then BIN=.pkgcheck/Scripts; else BIN=.pkgcheck/bin; fi
+          "$BIN/python" -m pip install --quiet --no-deps --find-links dist ai-code-engineer
+          "$BIN/python" tools/package_smoke.py

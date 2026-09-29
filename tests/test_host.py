@@ -3,9 +3,9 @@
 Code-review item 16 counted the drift in the two presentation layers — 52 `self.status.set()` calls
 against 72 `self.status =`, 15 `chat_message` against 19 `_add`, 6 `messagebox.*` against 6
 `self.confirm`, 7 `events.put` against 13 `_emit` — and recommended four primitives rather than a
-rewrite of both windows. The rewrite was refused at the time and stays refused; what is tested here
-is the part that had actually diverged: the Apply dialog, which the web window built with
-`repair.must_ask()`'s reason and the Tk window built without it.
+rewrite of both windows. The rewrite stays refused. What is held here is three things: the Apply
+dialog neither window may assemble itself, the four verbs each window must actually implement, and
+a ceiling on the raw primitives so the un-routed half cannot grow.
 """
 import sys
 import unittest
@@ -98,6 +98,86 @@ class TheSeamHolds(unittest.TestCase):
         declared = {name for name in dir(contract.Controller) if not name.startswith("_")}
         host_only = {name for name in dir(host.Host) if not name.startswith("_")}
         self.assertEqual(declared & host_only, set())
+
+
+class TheContractIsImplemented(unittest.TestCase):
+    """The verbs used to be four `raise NotImplementedError` and a docstring that said a window
+    implements them. Neither window did, so the sentence in the module header was about a contract
+    nothing could be checked against. These tests are what makes it true instead of claimed."""
+
+    def test_both_windows_implement_the_four_verbs(self):
+        import inspect
+        from ai_code_engineer.gui import AgentWindow
+        from ai_code_engineer.webapp.controller import AgentController
+        for name, window in (("Tk", AgentWindow), ("web", AgentController)):
+            for verb in ("say", "line", "ask", "stream"):
+                method = getattr(window, verb, None)
+                self.assertIsNotNone(method, name + " has no " + verb)
+                self.assertIsNot(method, getattr(host.Host, verb),
+                                 name + " inherits the stub instead of implementing it")
+                self.assertEqual(list(inspect.signature(method).parameters)[1:3],
+                                 list(inspect.signature(getattr(host.Host, verb)).parameters)[1:3],
+                                 "%s.%s answers to a different shape" % (name, verb))
+
+    def test_the_web_verbs_reach_the_surfaces_the_browser_reads(self):
+        import tempfile
+        from ai_code_engineer.webapp.controller import AgentController
+        asked = {}
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            controller = AgentController(Path(temp))
+            self.addCleanup(controller.close)
+            seen = []
+            controller._emit = seen.append
+            controller.say("A sentence from the contract")
+            self.assertEqual(controller.status, "A sentence from the contract")
+            controller.line("tool", "Tool", "A row in the thread")
+            self.assertEqual(controller.messages[-1]["text"], "A row in the thread")
+            controller.stream({"kind": "log"})
+            self.assertIn({"kind": "log"}, seen)
+
+            def record(title, message, warning="", ok_label="Continue", **kwargs):
+                asked.update(title=title, message=message, warning=warning, ok=ok_label)
+                return {"ok": True}
+
+            controller.confirm_choice = record
+            self.assertTrue(controller.ask("Apply changes", "body", "It deletes a file", "Apply"))
+            self.assertEqual(asked["warning"], "It deletes a file",
+                             "the verb that drops the warning is the bug this class exists to hold")
+
+    def test_the_warning_the_builder_returns_is_passed_by_both_windows(self):
+        """The specific drift: `apply_prompt` returns a `warning`, the web window showed it and Tk
+        threw it away. Each window now asks through its own verb, and the field is named there."""
+        gui = (SRC / "gui.py").read_text(encoding="utf-8")
+        controller = (SRC / "webapp" / "controller.py").read_text(encoding="utf-8")
+        self.assertIn('self.ask(prompt["title"], prompt["message"], prompt["warning"]', gui)
+        self.assertIn('self.confirm(prompt["title"], prompt["message"], prompt["warning"]', controller)
+
+    def test_the_seam_answers_the_half_written_folder_question_too(self):
+        """Tk called `repair.must_ask(session)` without the prior task, so the branch that refuses to
+        stack work on a folder a previous task left half-written was unreachable there."""
+        gui = (SRC / "gui.py").read_text(encoding="utf-8")
+        self.assertIn("repair.must_ask(self.session, prior)", gui)
+        self.assertNotIn("reason=repair.must_ask(self.session)", gui)
+
+    def test_an_unrouted_sink_cannot_be_added_quietly(self):
+        """A ceiling, not a target. Converting all 89 status assignments in one pass is the rewrite
+        this module exists to make unnecessary; what is not negotiable is that the number cannot
+        grow, because every increment is one more sentence that may differ between the windows with
+        no test able to see it."""
+        ceilings = {
+            SRC / "gui.py": {"status.set(": 59, "self.chat_message(": 16, "messagebox.": 6,
+                             "events.put(": 6},
+            SRC / "webapp" / "controller.py": {"self.status = ": 89, "self._add(": 33,
+                                               "self._emit(": 21, "self._note(": 9},
+        }
+        for path, limits in ceilings.items():
+            text = path.read_text(encoding="utf-8")
+            for needle, ceiling in limits.items():
+                found = text.count(needle)
+                self.assertLessEqual(found, ceiling,
+                                     "%s went from %d to %d %s — route it through a verb"
+                                     % (path.name, ceiling, found, needle))
 
 
 if __name__ == "__main__":
