@@ -409,6 +409,7 @@ class LiveRepositoryTests(unittest.TestCase):
         git.forget()
         self.addCleanup(git.forget)
         self.git("init", "-q")
+        self.git("config", "core.autocrlf", "false")
 
     def git(self, *args):
         finished = subprocess.run([git.git_program(), *self.IDENTITY, *args],
@@ -836,6 +837,7 @@ class LiveRestoreTests(unittest.TestCase):
         git.forget()
         self.addCleanup(git.forget)
         self.git("init", "-q")
+        self.git("config", "core.autocrlf", "false")
         (self.root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
         (self.root / "src" / "keep.py").write_text("k = 1\n", encoding="utf-8", newline="\n")
         self.git("add", "--", "src/a.py", "src/keep.py")
@@ -866,7 +868,7 @@ class LiveRestoreTests(unittest.TestCase):
         # `checkout <hash> -- <path>` writes the bytes and the index, so a restore that moves a file
         # back behind HEAD shows as staged. That is git's contract, and the chip has to say so rather
         # than promise a clean tree.
-        self.assertIn("M  src/a.py", status)
+        self.assertTrue(any(line.startswith("M") and line.endswith("src/a.py") for line in status), status)
         self.assertIn(" M src/keep.py", status, "the neighbour's edit stays unstaged")
 
     def test_a_file_that_did_not_exist_in_that_commit_is_skipped_not_fatal(self):

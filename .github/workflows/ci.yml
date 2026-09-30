@@ -60,6 +60,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global core.autocrlf false
 
       - name: Run the suite
         run: python -m unittest discover -s tests -v
