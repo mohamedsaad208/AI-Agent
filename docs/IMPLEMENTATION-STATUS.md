@@ -1,5 +1,33 @@
 # Implementation status — 2026-09-30
 
+## Endpoints out of the code — one resolution order, and a profile that can forget its URL
+
+The request: *any URL or IP belonging to Ollama or to any model belongs in the model's configuration,
+not in the code, so the tool isn't tied to one type.* Measured first in `docs/ENDPOINT-CONFIG.md`,
+which records the two claims of mine that the code contradicted. **1450 → 1466 offline tests.**
+
+| what changed | where |
+| --- | --- |
+| one order, in the one function every caller already passed through | typed value → `Kind.url_env` (the variable that server already documents: `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST`, `OPENAI_BASE_URL`, `GROQ_BASE_URL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL`, `AGENT_ENDPOINT`) → the row's own base → refused if none. `default_endpoint()` is the same order, so a window cannot show a hint its gates then reject |
+| a profile that forgets its endpoint no longer gets Ollama's address | the bug the request exposed: `load_settings` filled a missing `endpoint` with a **literal loopback URL regardless of the provider named in the same file**, and because a loopback URL passes the https rule it *validated* — a cloud profile then talked to a local port. It resolves through `check_endpoint(kind_for(provider), …)` now |
+| the three strays are gone | `Settings.endpoint` carries no address at all, and `webapp/fake.py`'s two scripted rows ask the table |
+| a bare `host:port` is a URL | `OLLAMA_HOST` is documented without a scheme, so the normaliser adds one — otherwise the variable exists and does nothing |
+| the policy is untouched, and the error names its source | a local row aimed off-device by the environment is still refused, and the message says `(set by OLLAMA_HOST)`, because a rule about a value nobody typed reads like a bug otherwise |
+| consent is judged on the address that will be used | `make_provider` resolves first; a custom endpoint arriving from the environment used to be consent-checked on the raw, empty settings value |
+| a guard, not a habit | an AST walk over `src/ai_code_engineer` asserts that every http(s) URL literal in code is a `Kind.base` inside `config.py` — measured result today: seven literals, one module. That is what stops the fourth copy |
+
+**Verified live, on the real service:** `OLLAMA_HOST=127.0.0.1:11434` (bare form) answers with all 11
+models; `OLLAMA_HOST=http://127.0.0.1:11999` answers `unreachable` and the audit row prints
+`Cannot reach Ollama at http://127.0.0.1:11999.` — the relocated address is the one being asked, with no
+silent fallback to the default port. A `groq` profile with no `endpoint` line resolves to
+`https://api.groq.com/openai/v1`.
+
+**Refused, with the reason:** a fourth config file (profiles + the window's per-provider store + the
+environment already cover every case, and a fourth place to write a URL is a fourth way to disagree);
+loosening the local-provider rule so `OLLAMA_HOST` may point at a LAN box over cleartext (a config
+convenience is not the consent that mode asks for); any change to where keys come from (environment
+only, named by `Kind.key_env`, never stored).
+
 ## UI 4.4 — the folder's position became a fact: read-only as a declaration every surface reads
 
 The request was "there is something called read-only mode, make it a flag and finish it". The reading

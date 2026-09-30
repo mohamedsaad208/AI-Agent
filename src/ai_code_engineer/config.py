@@ -2,7 +2,12 @@
 
 The provider list lives here rather than in ``providers`` because both ``validate`` and the
 windows need it, and ``providers`` imports this module — the other direction would be a cycle.
+
+This module is also the only place in the codebase that names a model server's address. A URL resolves
+in one order everywhere: what the person typed, what their environment says for that provider
+(``OLLAMA_HOST``, ``GROQ_BASE_URL`` and the rest of ``Kind.url_env``), then the provider's own row.
 """
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -53,23 +58,29 @@ class Kind:
     routing: bool = False         # OpenRouter only: upstream routing block and model echo
     free_only: bool = False       # OpenRouter only: a paid model needs an explicit choice
     verified: tuple[str, ...] = ()  # names to offer when a live list cannot be fetched
+    # The variable that may supply this provider's base URL, named the way that server already
+    # documents it rather than the way this tool would invent. A row with "" has no such convention.
+    url_env: str = ""
 
 
 KINDS = (
-    Kind("ollama", "Ollama", "http://127.0.0.1:11434", "ollama", False, False, ""),
-    Kind("lmstudio", "LM Studio", "http://localhost:1234/v1", "openai", False, False, ""),
-    Kind("vllm", "vLLM", "http://localhost:8000/v1", "openai", False, False, ""),
+    Kind("ollama", "Ollama", "http://127.0.0.1:11434", "ollama", False, False, "",
+         url_env="OLLAMA_HOST"),
+    Kind("lmstudio", "LM Studio", "http://localhost:1234/v1", "openai", False, False, "",
+         url_env="LMSTUDIO_HOST"),
+    Kind("vllm", "vLLM", "http://localhost:8000/v1", "openai", False, False, "", url_env="VLLM_HOST"),
     Kind("openai", "OpenAI", "https://api.openai.com/v1", "openai", True, True, "OPENAI_API_KEY",
-         verified=("gpt-4o-mini", "gpt-4o")),
+         verified=("gpt-4o-mini", "gpt-4o"), url_env="OPENAI_BASE_URL"),
     Kind("groq", "Groq", "https://api.groq.com/openai/v1", "openai", True, True, "GROQ_API_KEY",
-         verified=("llama-3.3-70b-versatile", "llama-3.1-8b-instant")),
+         verified=("llama-3.3-70b-versatile", "llama-3.1-8b-instant"), url_env="GROQ_BASE_URL"),
     Kind("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "openai", True, True,
-         "DEEPSEEK_API_KEY", verified=("deepseek-chat", "deepseek-reasoner")),
+         "DEEPSEEK_API_KEY", verified=("deepseek-chat", "deepseek-reasoner"),
+         url_env="DEEPSEEK_BASE_URL"),
     Kind("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "openai", True, True,
-         "OPENROUTER_API_KEY", routing=True, free_only=True),
+         "OPENROUTER_API_KEY", routing=True, free_only=True, url_env="OPENROUTER_BASE_URL"),
     # A user-typed base URL. The shape is OpenAI-compatible; the trust is decided by the host, so
     # loopback is local and anything else is treated exactly like a cloud row.
-    Kind("generic", "Custom endpoint", "", "openai", False, False, ""),
+    Kind("generic", "Custom endpoint", "", "openai", False, False, "", url_env="AGENT_ENDPOINT"),
 )
 BY_KEY = {kind.key: kind for kind in KINDS}
 OLLAMA = BY_KEY["ollama"]
@@ -142,15 +153,47 @@ def is_loopback(endpoint: str) -> bool:
         return False
 
 
+def env_url(kind: Kind) -> str:
+    """The base URL this provider's own environment variable supplies, or "".
+
+    Normalising is the whole job here, because `OLLAMA_HOST` is documented as `host:port` with no
+    scheme: a value copied out of a shell profile has to become a URL the same policy can judge. A
+    variable set to nothing is not a value — the table's own base answers then.
+    """
+    if not kind.url_env:
+        return ""
+    raw = str(os.environ.get(kind.url_env) or "").strip()
+    if not raw:
+        return ""
+    return raw if "://" in raw else "http://" + raw
+
+
+def default_endpoint(kind: Kind) -> str:
+    """What the endpoint would be if nobody typed one, in the same order the gates resolve it.
+
+    A window that showed ``kind.base`` here could be advertising a URL its own policy then refuses,
+    which is the difference between a default and a hint that lies.
+    """
+    return env_url(kind) or kind.base
+
+
 def check_endpoint(kind: Kind, endpoint) -> str:
     """The base URL for a provider, validated and normalised, or a PolicyError saying why not.
+
+    The order is one rule with three sources: what the person typed in this window, what their
+    environment says for that provider, and what the provider's own row in ``KINDS`` carries. Nothing
+    else in the codebase names a model URL, which is what keeps a fourth provider from being a code
+    change rather than a table entry and a profile.
 
     Paths are allowed — they are the whole shape of an OpenAI-compatible base
     (``http://localhost:1234/v1``) — which is what the old loopback rule got wrong. What stays
     refused: any scheme but http/https, credentials in the URL, a query or a fragment, and a
     provider that is not supposed to leave the machine doing exactly that.
     """
-    raw = str(endpoint or "").strip() or kind.base
+    typed = str(endpoint or "").strip()
+    from_env = not typed and bool(env_url(kind))
+    where = f" (set by {kind.url_env})" if from_env else ""
+    raw = typed or env_url(kind) or kind.base
     if not raw:
         raise PolicyError("This provider needs an endpoint before it can be used.")
     try:
@@ -158,21 +201,21 @@ def check_endpoint(kind: Kind, endpoint) -> str:
     except ValueError:
         raise PolicyError("The endpoint is not a valid URL.") from None
     if url.scheme not in {"http", "https"} or not url.hostname:
-        raise PolicyError("The endpoint must be an http or https URL.")
+        raise PolicyError("The endpoint must be an http or https URL." + where)
     if url.username or url.password:
-        raise PolicyError("The endpoint must not carry credentials.")
+        raise PolicyError("The endpoint must not carry credentials." + where)
     if url.query or url.fragment:
-        raise PolicyError("The endpoint must not carry a query or a fragment.")
+        raise PolicyError("The endpoint must not carry a query or a fragment." + where)
     local = url.hostname in LOOPBACK
     if not kind.cloud and kind.key != GENERIC.key and not local:
         raise PolicyError(f"{kind.label} is a local provider: the endpoint must be this device "
-                          "(127.0.0.1, localhost or ::1).")
+                          "(127.0.0.1, localhost or ::1)." + where)
     # Cleartext to another machine is the one shape that leaks a key, so it is refused for everyone.
     # A cloud row aimed at loopback is allowed: that is a local proxy on the user's own device, and
     # ``make_provider`` still gates it behind the cloud consent switch before it can be reached.
     if needs_consent(kind, raw) and not local and url.scheme != "https":
         raise PolicyError(f"{kind.label} at a remote address sends your code and your key over the "
-                          "internet, so the endpoint must be https.")
+                          "internet, so the endpoint must be https." + where)
     return raw.rstrip("/")
 
 
@@ -188,7 +231,10 @@ MIN_CONTEXT_CHARS = 6000
 class Settings:
     provider: str = "ollama"
     model: str = "qwen2.5-coder:1.5b"
-    endpoint: str = "http://127.0.0.1:11434"
+    # No address of its own. "" means "ask the order `check_endpoint` implements": the profile, then
+    # the provider's environment variable, then its row in the table. A default written here would be
+    # one more place a URL is hardcoded, and the one that got read for a provider it never named.
+    endpoint: str = ""
     max_turns: int = 12
     timeout_seconds: int = 120
     context_chars: int = 24000
@@ -216,10 +262,17 @@ def load_settings(path: Path | None) -> Settings:
         settings = Settings(
             provider=model.get("provider", "ollama"),
             model=model.get("name", "qwen2.5-coder:1.5b"),
-            endpoint=model.get("endpoint", "http://127.0.0.1:11434"),
             api_key_env=model.get("api_key_env", ""),
             **limits,
         )
+        # The endpoint is resolved against the provider this same file names, through the one function
+        # that owns the order. It used to fall back to a literal Ollama address here, which meant a
+        # cloud profile that forgot its endpoint validated — loopback passes the https rule — and then
+        # sent the task to a local port instead of to the vendor its own name.
+        kind = kind_for(settings.provider)
+        if kind is None:
+            raise AgentError("Provider must be one of: " + ", ".join(item.key for item in KINDS) + ".")
+        settings = replace(settings, endpoint=check_endpoint(kind, model.get("endpoint", "")))
         validate(settings)
         return settings
     except (OSError, ValueError, TypeError) as exc:
@@ -254,7 +307,7 @@ def settings_for(kind: Kind, endpoint: str = "", **changes) -> Settings:
     name; this is the one place that pairs a kind with the endpoint that kind actually uses.
     """
     return replace(Settings(), provider=kind.key,
-                   endpoint=check_endpoint(kind, endpoint or kind.base), **changes)
+                   endpoint=check_endpoint(kind, endpoint), **changes)
 
 
 # A profile label arrives from a browser dropdown, so it is a name from a closed shape rather than

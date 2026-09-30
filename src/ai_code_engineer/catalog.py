@@ -130,7 +130,7 @@ def models_for(kind: Kind, endpoint: str = "",
     carry verified names fall back; a local server with nothing on it correctly reports zero models
     rather than a list of guesses.
     """
-    base = check_endpoint(kind, endpoint or kind.base)
+    base = check_endpoint(kind, endpoint)
     try:
         if kind.shape == "ollama":
             return ollama_models(base), LIVE

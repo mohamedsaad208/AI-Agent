@@ -36,6 +36,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 | 🛡️ **Reviewed diffs** | Every change is a proposal with a `SHA-256` hash, and applying it is a decision you make (or hand over per folder, explicitly). Rollback is one step, as long as nothing else edited those files afterwards. |
 | ⚡ **100% Offline & Local** | Full first-class support for **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Code stays on your hardware. |
 | ☁️ **Multi-Provider Cloud** | Seamlessly switch between **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, or custom OpenAI-compatible endpoints. |
+| 🔌 **Endpoints are configuration** | No model server's address is written in the code — the provider table carries one default per row, and a URL resolves as *what you typed → your environment (`OLLAMA_HOST`, `GROQ_BASE_URL`, …) → the table's own row*. Point Ollama at another port without editing a file, and a profile that forgets its endpoint gets **its own** provider's address, never a local default. |
 | 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
 | 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
 | 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
@@ -245,7 +246,7 @@ chat there, a second window you can move beside the conversation on the desktop.
 | `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
 | `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
 | `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | **the gate.** 1450 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `tests/` | **the gate.** 1466 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
 | `docs/` | plans, implementation status, code reviews. Every measured claim in this README points at one of these. |

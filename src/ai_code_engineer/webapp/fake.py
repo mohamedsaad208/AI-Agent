@@ -192,7 +192,8 @@ class FakeController:
                                  FREE_MODELS if label == config.free_mode(kind) else
                                  PAID_MODELS if label == config.paid_mode(kind) else SERVED_MODELS)
                          for label, kind in config.mode_rows()}
-        self.endpoints = {kind.key: kind.base for kind in config.KINDS if kind.base}
+        self.endpoints = {kind.key: config.default_endpoint(kind) for kind in config.KINDS
+                           if config.default_endpoint(kind)}
         self.profile = ""
         self.catalog_source = {label: "live" for label in MODES}
         self.model = "qwen2.5-coder:1.5b"
@@ -293,13 +294,14 @@ class FakeController:
         self.setup_demo: dict | None = None
 
     def _script_setup(self) -> list[dict]:
-        rows = setup.audit(repo="", provider="ollama", endpoint="http://127.0.0.1:11434",
+        rows = setup.audit(repo="", provider="ollama",
+                           endpoint=config.default_endpoint(config.OLLAMA),
                            model=self.model, probe=False)
         out = []
         for row in rows:
             if row["id"] == "provider":
                 row = {"id": "provider", "status": "ok", "advice": "",
-                       "text": "Ollama answers at http://127.0.0.1:11434."}
+                       "text": "Ollama answers at " + config.default_endpoint(config.OLLAMA) + "."}
             elif row["id"] == "model":
                 row = {"id": "model", "status": "ok", "advice": "",
                        "text": "11 models (10 of them local). Using " + self.model + "."}
@@ -474,9 +476,9 @@ class FakeController:
         rules and nothing else, which is what makes it safe to click in a preview.
         """
         kind = config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
-        endpoint = self.endpoints.get(kind.key, "") or kind.base
+        endpoint = self.endpoints.get(kind.key, "") or config.default_endpoint(kind)
         return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
-                "default_endpoint": kind.base, "cloud": kind.cloud, "shape": kind.shape,
+                "default_endpoint": config.default_endpoint(kind), "cloud": kind.cloud, "shape": kind.shape,
                 "needs_key": kind.needs_key, "key_env": kind.key_env,
                 "consent": config.needs_consent(kind, endpoint),
                 "paid": self.mode == config.paid_mode(kind),
@@ -665,7 +667,7 @@ class FakeController:
             # Checked by the same rule the real window uses, so a rejected URL is refused here too
             # and the tab can be reviewed against a refusal rather than only against a success.
             kind = config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
-            text = str(payload.get("value", "")).strip() or kind.base
+            text = str(payload.get("value", "")).strip() or config.default_endpoint(kind)
             try:
                 self.endpoints[kind.key] = config.check_endpoint(kind, text)
             except PolicyError as exc:

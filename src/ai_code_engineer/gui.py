@@ -2237,7 +2237,7 @@ class AgentWindow:
 
     def endpoint_for(self, mode: str = "") -> str:
         kind = config.MODE_KIND.get(mode or self.mode.get(), config.DEFAULT_KIND)
-        return self.endpoints.get(kind.key, "") or kind.base
+        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind)
 
     def cloud_choice(self):
         """``(cloud, paid)`` for the row on screen: the provider, the endpoint and the model entry

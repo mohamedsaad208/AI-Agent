@@ -6,10 +6,12 @@ whitelist, the loopback rule that refused a URL path - is now one row of a table
 are what keeps the rows honest.
 """
 from dataclasses import replace
+import ast
 import inspect
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 import sys
 import tempfile
 import unittest
@@ -26,6 +28,31 @@ from ai_code_engineer.providers import (OpenAICompatibleProvider, OllamaProvider
                                         REASONING_CHARS, read_reasoning)
 
 ANSWER = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
+
+
+def http_literals(path: Path) -> list:
+    """Every http(s) URL written in a module's code, with docstrings left out.
+
+    A docstring may name a URL to explain a rule; the claim under test is that no *code path* picks
+    one, so only value nodes counted. A fragment like ``f"http://{host}:{port}"`` has no netloc on
+    either side of the interpolation, which is what keeps the local web server's own URL out of it.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docs.add(id(body[0].value))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or id(node) in docs:
+            continue
+        parsed = urlparse(node.value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            found.append((node.lineno, node.value))
+    return found
 
 
 def catalog_status(live):
@@ -68,6 +95,154 @@ class TheProviderTable(unittest.TestCase):
         with self.assertRaises(AgentError):
             validate(replace(Settings(), api_key_env="sk-or-vl-abcdefghijklmnopqrst"))
         validate(replace(Settings(), api_key_env="GROQ_API_KEY"))
+
+
+class TheEndpointResolution(unittest.TestCase):
+    """Where a model URL is allowed to come from: the typed value, the environment, the table.
+
+    The request was that no address live in the code, so the tool is not tied to one vendor's default
+    port. A row's own base stays - that is what a row *is* - and everything else resolves through the
+    one order in `check_endpoint`, which is what every caller already passes through.
+    """
+
+    NAMES = {kind.url_env for kind in KINDS if kind.url_env}
+
+    def env(self, **values):
+        """Exactly these provider variables, with every other one set to nothing.
+
+        An unset variable and an empty one answer the same question, so clearing the rest keeps a
+        value left over from the developer's own shell out of the assertion.
+        """
+        staged = {name: "" for name in self.NAMES}
+        staged.update(values)
+        return patch.dict(os.environ, staged, clear=False)
+
+    # ------------------------------- the order -------------------------------
+    def test_with_nothing_typed_the_row_answers(self):
+        with self.env():
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), kind_for("ollama").base)
+            self.assertEqual(check_endpoint(kind_for("groq"), ""), kind_for("groq").base)
+
+    def test_the_environment_answers_before_the_row(self):
+        with self.env(OLLAMA_HOST="http://127.0.0.1:11999"):
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), "http://127.0.0.1:11999")
+
+    def test_what_the_person_typed_answers_before_everything(self):
+        with self.env(OLLAMA_HOST="http://127.0.0.1:11999"):
+            self.assertEqual(check_endpoint(kind_for("ollama"), "http://localhost:11434"),
+                             "http://localhost:11434")
+
+    def test_a_bare_host_and_port_becomes_a_url_because_that_is_the_documented_form(self):
+        """`OLLAMA_HOST=127.0.0.1:11434` is what Ollama's own docs tell you to set. Refusing it for
+        missing a scheme would mean the variable exists and does nothing."""
+        with self.env(OLLAMA_HOST="127.0.0.1:11435"):
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), "http://127.0.0.1:11435")
+        with self.env(OLLAMA_HOST="http://127.0.0.1:11435/"):
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), "http://127.0.0.1:11435")
+
+    def test_an_empty_variable_is_no_answer_at_all(self):
+        with self.env(OLLAMA_HOST="   "):
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), kind_for("ollama").base)
+
+    def test_each_variable_belongs_to_one_row_and_no_further(self):
+        with self.env(OLLAMA_HOST="http://127.0.0.1:11999"):
+            self.assertEqual(check_endpoint(kind_for("groq"), ""), "https://api.groq.com/openai/v1")
+        with self.env(GROQ_BASE_URL="https://groq.internal.example/v1"):
+            self.assertEqual(check_endpoint(kind_for("groq"), ""), "https://groq.internal.example/v1")
+            self.assertEqual(check_endpoint(kind_for("ollama"), ""), kind_for("ollama").base)
+
+    def test_a_custom_endpoint_is_the_one_row_with_no_default_and_a_variable_of_its_own(self):
+        with self.env():
+            with self.assertRaises(PolicyError):
+                check_endpoint(kind_for("generic"), "")
+        with self.env(AGENT_ENDPOINT="https://inference.example/v1"):
+            self.assertEqual(check_endpoint(kind_for("generic"), ""), "https://inference.example/v1")
+
+    # ------------------------------- the policy still holds -------------------------------
+    def test_a_local_row_stays_local_when_the_environment_says_otherwise(self):
+        with self.env(OLLAMA_HOST="https://someone-elses-ollama.example"):
+            with self.assertRaises(PolicyError) as caught:
+                check_endpoint(kind_for("ollama"), "")
+        self.assertIn("OLLAMA_HOST", str(caught.exception),
+                      "a rule about a value the operator never typed has to name where it came from")
+
+    def test_the_hint_a_window_shows_is_the_answer_the_gates_will_give(self):
+        """`default_endpoint` is placeholder text in both windows. Showing the table's base while the
+        environment says otherwise advertises a URL that the same code then refuses."""
+        for row in KINDS:
+            with self.env(**{row.url_env: "http://127.0.0.1:9/v1"} if row.url_env else {}):
+                if row.key == "generic":
+                    continue          # no default of its own, by design
+                self.assertEqual(config.default_endpoint(row), check_endpoint(row, ""))
+
+    def test_the_settings_object_carries_no_address_of_its_own(self):
+        self.assertEqual(Settings().endpoint, "")
+        with self.env():
+            self.assertEqual(check_endpoint(kind_for("ollama"), Settings().endpoint),
+                             kind_for("ollama").base)
+
+    def test_consent_is_judged_on_the_address_that_will_actually_be_used(self):
+        """A generic row reads its host from the environment, so a consent decision made on the raw
+        settings value would be made about a host nobody chose."""
+        with self.env(AGENT_ENDPOINT="http://127.0.0.1:8000/v1"):
+            settings = settings_for(kind_for("generic"))
+            self.assertFalse(needs_consent(kind_for("generic"), settings.endpoint))
+        with self.env(AGENT_ENDPOINT="https://inference.example/v1"):
+            settings = settings_for(kind_for("generic"))
+            self.assertTrue(needs_consent(kind_for("generic"), settings.endpoint))
+
+    # ------------------------------- the profile file -------------------------------
+    def profile(self, text):
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "chosen.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_a_profile_without_an_endpoint_gets_its_own_provider_s_address(self):
+        """The bug the order fixes. A cloud profile that forgot its endpoint used to fall back to a
+        literal Ollama address - and a loopback URL passes the https rule, so it validated, then sent
+        the task to a local port instead of to the vendor its own name."""
+        path = self.profile('[model]\nprovider = "groq"\nname = "llama-3.3-70b-versatile"\n')
+        with self.env():
+            settings = config.load_settings(path)
+        self.assertEqual(settings.endpoint, "https://api.groq.com/openai/v1")
+        self.assertNotIn("127.0.0.1", settings.endpoint)
+        self.assertNotIn("11434", settings.endpoint)
+
+    def test_a_profile_s_own_endpoint_beats_the_environment(self):
+        path = self.profile('[model]\nprovider = "ollama"\nname = "m"\n'
+                            'endpoint = "http://127.0.0.1:12345"\n')
+        with self.env(OLLAMA_HOST="http://127.0.0.1:11999"):
+            self.assertEqual(config.load_settings(path).endpoint, "http://127.0.0.1:12345")
+
+    def test_a_profile_can_omit_the_endpoint_and_the_environment_still_answers(self):
+        path = self.profile('[model]\nprovider = "ollama"\nname = "m"\n')
+        with self.env(OLLAMA_HOST="127.0.0.1:11999"):
+            self.assertEqual(config.load_settings(path).endpoint, "http://127.0.0.1:11999")
+
+    def test_a_provider_nobody_listed_is_named_before_any_endpoint_is_resolved(self):
+        path = self.profile('[model]\nprovider = "anthropic"\nname = "m"\n')
+        with self.assertRaises(AgentError):
+            config.load_settings(path)
+
+    # ------------------------------- the guard -------------------------------
+    def test_the_only_model_address_written_in_the_code_is_the_table(self):
+        """One table, one order, and a check so the fourth copy cannot be added by habit.
+
+        This started as three strays around one table: the Ollama URL as a dataclass default, the same
+        literal as the profile fallback, and twice more in the scripted preview. A count of the shapes
+        is the only thing that keeps them from coming back.
+        """
+        sources = Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer"
+        bases = {kind.base for kind in KINDS if kind.base}
+        strays = {}
+        for path in sorted(sources.rglob("*.py")):
+            for line, value in http_literals(path):
+                if path.name == "config.py" and value in bases:
+                    continue
+                strays.setdefault(path.name, []).append((line, value))
+        self.assertEqual(strays, {}, f"a model URL outside the provider table: {strays}")
 
 
 class TheEndpointPolicy(unittest.TestCase):

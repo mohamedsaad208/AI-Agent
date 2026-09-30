@@ -1477,7 +1477,7 @@ class AgentController:
     def endpoint_for(self, mode: str = "") -> str:
         """Where this provider row actually is — typed value, saved value, or its own default."""
         kind = MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
-        return self.endpoints.get(kind.key, "") or kind.base
+        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind)
 
     def set_endpoint(self, value: str) -> None:
         """Point the active row somewhere else. Refused loudly, never half-applied.
@@ -1549,7 +1549,7 @@ class AgentController:
         endpoint = self.endpoint_for()
         needs_consent = config.needs_consent(kind, endpoint)
         return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
-                "default_endpoint": kind.base, "cloud": kind.cloud, "shape": kind.shape,
+                "default_endpoint": config.default_endpoint(kind), "cloud": kind.cloud, "shape": kind.shape,
                 "needs_key": kind.needs_key, "key_env": kind.key_env or "",
                 "consent": needs_consent, "paid": self.mode.endswith(" \u00b7 Paid"),
                 "profile": self.profile, "profiles": self.available_profiles(),

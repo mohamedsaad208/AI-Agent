@@ -360,12 +360,16 @@ def make_provider(settings: Settings, *, allow_cloud: bool, data_class: str,
                   api_key: str | None = None, allow_paid: bool = False) -> ModelProvider:
     validate(settings)
     kind = kind_for(settings.provider) or OLLAMA
+    # Judged on the address that will actually be used, not on the string the settings happened to
+    # carry: an empty endpoint resolves through the profile, the environment and the table, and a
+    # consent decision made before that question is answered is made about a host nobody chose.
+    endpoint = check_endpoint(kind, settings.endpoint)
     if kind.shape == "ollama":
         # A cloud-backed Ollama model is discovered in preflight, not assumed from the endpoint.
         provider = OllamaProvider(settings, allow_cloud=allow_cloud and data_class in {"public", "synthetic"})
         provider.preflight()
         return provider
-    if needs_consent(kind, settings.endpoint) and (
+    if needs_consent(kind, endpoint) and (
             not allow_cloud or data_class not in {"public", "synthetic"}):
         raise PolicyError("Cloud requires --allow-cloud and --data-class public or synthetic.")
     return OpenAICompatibleProvider(settings, api_key=api_key, allow_paid=allow_paid, kind=kind)

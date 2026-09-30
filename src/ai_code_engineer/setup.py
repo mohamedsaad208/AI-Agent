@@ -122,7 +122,7 @@ def provider_rows(kind: config.Kind, endpoint: str, api_key: str | None, model: 
                     advice_ar="شغّل الفحوص عشان تسأل البروفايدر عند إيه.")]
     label = kind.label
     try:
-        checked = config.check_endpoint(kind, endpoint or kind.base)
+        checked = config.check_endpoint(kind, endpoint)
     except AgentError as exc:
         return [row("provider", BAD, arabic=arabic, en=f"{label}: the endpoint is refused.",
                     ar=f"{label}: العنوان مرفوض.", advice_en=str(exc), advice_ar=str(exc)),
