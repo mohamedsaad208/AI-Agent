@@ -24,7 +24,7 @@ AI Code Engineer is an open-source coding agent with a local Web UI, a Tk fallba
 
 <br/>
 
-<img src="assets/demo-complex.gif" alt="AI Code Engineer Multi-File Refactor & Self-Healing Loop" width="100%"/>
+<img src="assets/demo-webapp.gif" alt="AI Code Engineer Desktop WebApp Interface" width="100%"/>
 
 </div>
 
@@ -192,10 +192,6 @@ python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ---
 
 # 🖥️ Interactive Desktop WebApp
-
-<div align="center">
-<img src="assets/demo-webapp.gif" alt="AI Code Engineer Desktop WebApp Interface" width="100%"/>
-</div>
 
 The application features a sleek, local WebApp interface served on `127.0.0.1` with:
 - **Compact change card:** One current proposal card updates to the applied state. It shows total files, additions and deletions, the first three files, and a toggle for the rest. File descriptions summarize recorded changes; clicking a file opens its diff.
