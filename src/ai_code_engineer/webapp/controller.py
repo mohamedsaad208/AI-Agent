@@ -1518,7 +1518,7 @@ class AgentController:
                 self._save_state()
                 message = friendly_error(exc)
                 self.say(message)
-                self._emit({"kind": "toast", "text": message, "level": "bad"})
+                self.stream({"kind": "toast", "text": message, "level": "bad"})
                 return
         # Attaching a plan is a decision to implement it, so this is the one path that selects
         # Change mode on the user's behalf instead of leaving prose as the default.
@@ -2006,7 +2006,7 @@ class AgentController:
             if self.repo and (self.branch.get("key") == key or (folder and str(Path(self.repo).resolve()) == str(Path(folder).resolve()))):
                 self._select_branch(BRANCH_CHAT, "")
             self._save_state()
-            self.status = "Removed project from the sidebar."
+            self.say("Removed project from the sidebar.")
 
     def save_memory(self, text: str) -> None:
         if not self.repo:
@@ -3298,8 +3298,8 @@ class AgentController:
         row.update(status="verified", verified_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         atomic_json(self.ledger_path, self.ledger)
         self.refresh_plan_status()
-        self.status = f"Plan step {step_id} verified."
-        self._add("tool", "Tool", f"Plan step {step_id}: {row.get('title', '')} verified.")
+        self.say(f"Plan step {step_id} verified.")
+        self.line("tool", "Tool", f"Plan step {step_id}: {row.get('title', '')} verified.")
 
     def refresh_plan_status(self) -> None:
         repo, plan_file = self.repo.strip(), self.plan_file.strip()
