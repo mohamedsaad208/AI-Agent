@@ -51,6 +51,16 @@ jobs:
       - name: Check the boot script parses
         run: node --check src/ai_code_engineer/webapp/static/boot.js
 
+      # A checkpoint is the program's own `git commit`, and git takes the author from the machine's
+      # config. A runner has no user, so without this the live-repository tests fail on
+      # "Please tell me who you are" while every other step stays green. The machine is naming
+      # itself for the tests; no repository config is written.
+      - name: Set Git identity for tests
+        shell: bash
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Run the suite
         run: python -m unittest discover -s tests -v
 
