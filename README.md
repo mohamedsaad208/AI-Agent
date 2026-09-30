@@ -11,7 +11,7 @@ AI Code Engineer is an open-source coding agent with a local Web UI, a Tk fallba
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3B82F6?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-10B981?style=for-the-badge&logo=linux&logoColor=white)]()
 [![Developed with AI](https://img.shields.io/badge/Built%20With-AI%20%26%20Human%20Pairing-8B5CF6?style=for-the-badge&logo=openai&logoColor=white)]()
-[![Tests](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml/badge.svg?style=for-the-badge&logo=python&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml)
+[![Tests](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml/badge.svg?branch=main&style=for-the-badge&logo=python&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml?query=branch%3Amain)
 
 [Quick Start](#-quick-start) •
 [Why AI Code Engineer](#-why-ai-code-engineer) •
