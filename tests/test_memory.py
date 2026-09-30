@@ -1,5 +1,6 @@
 """Project notes: stored outside the folder the model can write, and sent every task."""
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
@@ -29,8 +30,13 @@ class MemoryTests(unittest.TestCase):
 
     def test_the_same_folder_written_differently_shares_one_note(self):
         first = memory.key_for(str(self.repo))
-        self.assertEqual(first, memory.key_for(str(self.repo) + "\\"))
-        self.assertEqual(first, memory.key_for(str(self.repo).upper()))
+        self.assertEqual(first, memory.key_for(str(self.repo) + os.sep))
+        self.assertEqual(first, memory.key_for(str(self.repo) + os.sep + "."))
+        if os.name == "nt":
+            # Case-insensitivity belongs to the folder's OS, not to the store. On a case-sensitive
+            # filesystem two spellings are two projects, and `key_for` giving them two files is the
+            # correct answer, so the assertion would be testing the wrong thing there.
+            self.assertEqual(first, memory.key_for(str(self.repo).upper()))
         self.assertNotEqual(first, memory.key_for(str(self.base / "other")))
 
     def test_a_note_too_long_is_refused_rather_than_cut(self):

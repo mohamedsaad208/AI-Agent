@@ -36,7 +36,7 @@ PASSED_PROOF = [{"recipe": "maven-test", "status": "passed", "exit_code": 0,
 class LedgerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
+        root = Path(self.temp.name).resolve()
         self.addCleanup(self.temp.cleanup)
         self.repo = root / "repo"
         self.repo.mkdir()

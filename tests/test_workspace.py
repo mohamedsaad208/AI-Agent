@@ -24,7 +24,7 @@ class PathPolicyTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.base = Path(temp.name)
+        self.base = Path(temp.name).resolve()
         self.root = self.base / "repo"
         (self.root / "src" / "main" / "java").mkdir(parents=True)
         (self.root / "app.py").write_text("answer = 1\n", encoding="utf-8")
@@ -219,7 +219,7 @@ class ReadTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "repo"
+        self.root = Path(temp.name).resolve() / "repo"
         self.root.mkdir()
         self.file = self.root / "app.py"
         self.file.write_bytes(b"answer = 1\n")       # exact bytes: the content is what is hashed
@@ -282,7 +282,7 @@ class WriteTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "repo"
+        self.root = Path(temp.name).resolve() / "repo"
         self.root.mkdir()
         (self.root / "app.py").write_bytes(b"answer = 1\n")
         self.ws = Workspace(self.root)
@@ -328,7 +328,7 @@ class ListingTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "repo"
+        self.root = Path(temp.name).resolve() / "repo"
         (self.root / "src").mkdir(parents=True)
         (self.root / "src/app.py").write_text("answer = 1\n", encoding="utf-8")
         (self.root / "src/util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
@@ -402,7 +402,7 @@ class ProjectFolderTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.base = Path(temp.name)
+        self.base = Path(temp.name).resolve()
 
     def test_only_an_absolute_folder_inside_a_drive_can_be_chosen(self):
         for name in ("relative/dir", "C:/", "C:" + SLASH, "/"):

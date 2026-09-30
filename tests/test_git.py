@@ -55,7 +55,7 @@ class Scripted(unittest.TestCase):
         self.killed = []
         self.replies = {}
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.addCleanup(self.temp.cleanup)
         git.forget()
         self.addCleanup(git.forget)
@@ -403,7 +403,7 @@ class LiveRepositoryTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name) / "repo"
+        self.root = Path(self.temp.name).resolve() / "repo"
         self.root.mkdir()
         self.addCleanup(self.temp.cleanup)
         git.forget()
@@ -665,7 +665,7 @@ class LiveBranchTests(unittest.TestCase):
         if git.git_program() is None:
             self.skipTest("git is not installed")
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name) / "repo"
+        self.root = Path(self.temp.name).resolve() / "repo"
         self.root.mkdir()
         self.addCleanup(self.temp.cleanup)
         git.forget()
@@ -830,7 +830,7 @@ class LiveRestoreTests(unittest.TestCase):
         if git.git_program() is None:
             self.skipTest("git is not installed")
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name) / "repo"
+        self.root = Path(self.temp.name).resolve() / "repo"
         (self.root / "src").mkdir(parents=True)
         self.addCleanup(self.temp.cleanup)
         git.forget()

@@ -374,7 +374,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((self.target / "src/util.py").read_bytes(),
                          (self.root / "src/util.py").read_bytes())
         self.assertEqual(hashes["app.py"], digest(b"answer = 1\n"))
-        self.assertEqual([p.name for p in self.target.iterdir()], ["app.py", "src"])
+        # `iterdir` has no ordering contract — alphabetical on NTFS, hash order on ext4 — so the
+        # set is what is being pinned here, not the sequence the folder happened to return.
+        self.assertEqual(sorted(p.name for p in self.target.iterdir()), ["app.py", "src"])
 
     def test_one_file_too_big_for_a_prompt_does_not_veto_the_whole_snapshot(self):
         # 128 KiB is what may reach a model's context, not what a sandbox may be given. A repo

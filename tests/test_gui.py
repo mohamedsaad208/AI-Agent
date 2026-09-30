@@ -105,7 +105,7 @@ class ScriptedModel:
 class DesktopTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir, with_tests=False)
         # The startup catalog refresh must stay offline in tests.
         patches = (patched_catalog(),)

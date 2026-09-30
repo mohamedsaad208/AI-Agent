@@ -101,7 +101,7 @@ class ControllerTests(unittest.TestCase):
         self._made = []
         self.addCleanup(self._drain)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         started = (patched_catalog(),)
         for patcher in started:
@@ -1040,7 +1040,7 @@ class BranchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         started = (patched_catalog(),)
         for patcher in started:
@@ -1362,9 +1362,13 @@ class BranchTests(unittest.TestCase):
 
     # --------------------------- reaching another disk ---------------------------
     def test_the_folder_picker_lists_the_mounted_roots_at_a_drive_root(self):
-        listing = self.fresh().list_dir(str(Path(self.repo).drive) + "\\")
-        self.assertIsNone(listing["parent"], "a drive root has no parent to walk up to")
-        self.assertIn(Path(self.repo).drive + "\\", listing["roots"])
+        # `anchor` is the filesystem root whatever the OS calls it: `D:\` here, `/` on Linux, where
+        # `drive_roots()` already answers `["/"]`. Hardcoding a drive letter made this test Windows
+        # -only and let the POSIX branch go unproven.
+        anchor = Path(self.repo).anchor
+        listing = self.fresh().list_dir(anchor)
+        self.assertIsNone(listing["parent"], "a root folder has no parent to walk up to")
+        self.assertIn(anchor, listing["roots"])
 
     def test_a_typed_path_can_name_a_project_that_does_not_exist_yet(self):
         target = self.app_dir / "spring-project"
@@ -1687,7 +1691,7 @@ class CheckpointTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
@@ -1774,7 +1778,7 @@ class TaskBranchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
@@ -1895,7 +1899,7 @@ class GitRestoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
@@ -2027,7 +2031,7 @@ class RememberedFolderModeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = self.app_dir / "svc"
         (self.repo / "src").mkdir(parents=True)
 
@@ -2076,7 +2080,7 @@ class ReadOnlyModeTests(unittest.TestCase):
         self._made = []
         self.addCleanup(self._drain)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         patcher = patched_catalog()
         patcher.start()
@@ -2251,7 +2255,7 @@ class TheFirstRunCard(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         patcher = patched_catalog()
         patcher.start()
@@ -2405,7 +2409,7 @@ class BlockApplyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = self.app_dir / "repo"
         (self.repo / "src").mkdir(parents=True)
         (self.repo / "src" / "main.py").write_text("def add(a, b):\n    return a - b\n",
@@ -2502,7 +2506,7 @@ class TheModelFilter(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.controller = AgentController(Path(self.temp.name))
+        self.controller = AgentController(Path(self.temp.name).resolve())
         self.addCleanup(self.controller.close)
         self.controller.catalogs["Ollama"] = [dict(entry) for entry in self.ENTRIES]
         self.controller.model = "codellama:13b"
@@ -2574,7 +2578,7 @@ class QueueTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.model = GatingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
@@ -2871,7 +2875,7 @@ class TheActivityFeed(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.model = SteppingModel()
         started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
@@ -3018,7 +3022,7 @@ class TheStepRows(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.model = SteppingModel()
         for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
@@ -3257,7 +3261,7 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.events = []
 
@@ -3340,7 +3344,7 @@ class TheThoughtRowInAWindow(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         self.model = ThinkingModel()
         for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
@@ -3434,7 +3438,7 @@ class WithdrawnQuestionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.controller = AgentController(Path(self.temp.name))
+        self.controller = AgentController(Path(self.temp.name).resolve())
         self.addCleanup(self.controller.close)
         self.events = []
         self.controller._emit = self.events.append
@@ -3485,7 +3489,7 @@ class SecondSendBecomesAQueueItem(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
-        self.controller = AgentController(Path(self.temp.name))
+        self.controller = AgentController(Path(self.temp.name).resolve())
         self.addCleanup(self.controller.close)
         self.events = []
         self.controller._emit = self.events.append
@@ -3582,7 +3586,7 @@ class TheStateUnderTwoThreads(unittest.TestCase):
         for patcher in started:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.controller = Scripted(Path(self.temp.name))
+        self.controller = Scripted(Path(self.temp.name).resolve())
         self.addCleanup(self.controller.close)
 
     def test_exactly_one_of_ten_simultaneous_claims_runs(self):
@@ -3696,7 +3700,7 @@ class TheModuleGraph(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(temp.cleanup)
-        self.app_dir = Path(temp.name)
+        self.app_dir = Path(temp.name).resolve()
         self.repo = self.app_dir / "reactor"
         for folder, name, imports in (("core", "Registry", []),
                                       ("auth", "Jwt", ["core.Registry"]),
@@ -3793,7 +3797,7 @@ class TheDeclarationOutlivesTheWindow(unittest.TestCase):
         self._made = []
         self.addCleanup(self._drain)
         self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name)
+        self.app_dir = Path(self.temp.name).resolve()
         self.repo = sandbox_repo(self.app_dir)
         patcher = patched_catalog()
         patcher.start()
