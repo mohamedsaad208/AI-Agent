@@ -250,10 +250,10 @@ chat there, a second window you can move beside the conversation on the desktop.
 | `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
 | `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
 | `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | **the gate.** 1466 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `tests/` | **the gate.** 1534 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
-| `docs/` | plans, implementation status, code reviews. Every measured claim in this README points at one of these. |
+| `docs/` | plans, implementation status, code reviews — **local working notes, gitignored.** They quote this machine's paths, ports and counts, so they are kept on the device that measured them instead of shipped as product files. The rules they describe live in the modules' own docstrings, and the test suite is the gate: nothing in `src/`, `tests/` or CI reads a `docs/` file. |
 | `tools/` | development aids for this repository — contrast checks, the dogfood ledger, wheel inspection, demo generators. |
 | `sandbox/` | probes that produced a number someone quoted, kept so the number can be re-measured. |
 | `examples/` | folders the agent is pointed at to try it out. |

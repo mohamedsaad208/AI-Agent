@@ -49,6 +49,12 @@ dist/
 # Credential files the app itself refuses to touch (workspace.py BLOCKED_PARTS).
 .env
 
+# The plans, the implementation status, the measured claims. Kept on the machine that produced them:
+# they quote this working tree's paths, ports and counts, so they are working notes rather than product
+# files. Nothing in `src/`, `tests/`, `pyproject.toml` or CI reads them — the rules live in the modules'
+# own docstrings, and the test suite is the gate.
+docs/
+
 # Build outputs
 target/
 .design-preview$1.png
