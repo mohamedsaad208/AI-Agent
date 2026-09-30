@@ -111,12 +111,16 @@ def artifact_title(*, arabic: bool, count: int, project: str, written: bool) -> 
 
 
 def artifact_card(state: str | None, *, arabic: bool, count: int, project: str,
-                  summary: str = "", written: bool = False, has_project: bool = True) -> dict:
+                  summary: str = "", written: bool = False, has_project: bool = True,
+                  rejected: bool = False) -> dict:
     """The whole right-hand card: headline, tone, title and detail in one language.
 
     Both controllers build this card, and `--fake` is the window a design is reviewed in, so the
     sentence lives here once rather than twice. `state` is the engine state name; `count` the
     files it touches; `written` says whether they are on disk yet.
+
+    A declined proposal stays WAITING_APPROVAL, with its latest hash-scoped decision recorded
+    in events. The shared engine enforces that decision until an explicit reopen for review.
     """
     if not state:
         return {"state": "No task open", "tone": "idle", "written": False,
@@ -128,7 +132,7 @@ def artifact_card(state: str | None, *, arabic: bool, count: int, project: str,
                     arabic,
                     en="This chat has no project attached, so nothing is proposed.",
                     ar="هذا الحوار بلا مشروع مرتبط، لذلك لا يُقترح شيء.")}
-    return {"state": state_label(state, arabic=arabic), "tone": TONE.get(state, ""),
+    card = {"state": state_label(state, arabic=arabic), "tone": TONE.get(state, ""),
             # `written` travels with the card: the same file list reads as "saved to disk" after a
             # click and as "waiting for you" before it, and only this side knows which.
             "written": bool(count) and written,
@@ -137,6 +141,15 @@ def artifact_card(state: str | None, *, arabic: bool, count: int, project: str,
             # used to leave the card with an empty detail line rather than the advice.
             "detail": (summary or "").strip()[:240] or say(
                 arabic, en="Nothing to apply for this task.", ar="لا يوجد ما يُطبَّق في هذه المهمة.")}
+    if rejected and count:
+        card["state"] = say(arabic, en="Rejected", ar="رُفض")
+        card["tone"] = "idle"
+        card["written"] = False
+        card["title"] = say(
+            arabic,
+            en=f"{count} file(s) this proposal would have changed in {project}; none did",
+            ar=f"{count} ملف(ات) كان هذا المقترح يغيّرها في {project}؛ لم يتغيّر شيء")
+    return card
 
 
 def run_warning(*, arabic: bool) -> str:
@@ -168,6 +181,57 @@ def applied_note(*, arabic: bool, count: int) -> str:
                   f" Roll back from this card.",
                ar=f"\u2705 تم التطبيق والحفظ على القرص: {count} ملف(ات) بلا ضغطة Apply."
                   f" التراجع من هذه البطاقة.")
+
+
+# Who the window is answering, and how long the quotation is allowed to be. The phrases are whole
+# noun phrases in both languages so the sentence around them never has to agree with them.
+QUOTE_WHO = {
+    "user": ("your earlier message", "رسالتك السابقة"),
+    "assistant": ("the agent's earlier reply", "رد الوكيل السابق"),
+    "tool": ("the tool's earlier notice", "إشعار البرنامج السابق"),
+}
+QUOTE_CHARS = 160
+
+
+def quote_reference(arabic: bool, role: str, words: str) -> str:
+    """The line that puts a quotation in front of the message that answers it.
+
+    Quoted, attributed and bounded. The block says whose words they are rather than letting a sentence
+    the agent wrote arrive in the prompt dressed as an instruction from the operator — the same rule
+    the standing notes follow when they are labelled. 160 characters is the whole of it, because the
+    reference is a pointer at an earlier row and that row is already in the conversation.
+    """
+    who = QUOTE_WHO.get(role, QUOTE_WHO["assistant"])[0 if not arabic else 1]
+    shown = words[:QUOTE_CHARS] + ("…" if len(words) > QUOTE_CHARS else "")
+    return say(arabic, en=f'> [In reference to {who}: "{shown}"]\n\n',
+               ar=f'> [بالإشارة إلى {who}: "{shown}"]\n\n')
+
+
+def asked_of(text: str) -> str:
+    """The operator's own words, with any reference block taken back off.
+
+    A display question only: the thread row and the task record keep the whole message the model read,
+    and a card title that opens with a hundred and sixty quoted characters has stopped naming the
+    request it belongs to.
+    """
+    lines = str(text or "").split("\n")
+    while lines and lines[0].startswith("> [") and lines[0].endswith('"]'):
+        lines.pop(0)
+    return "\n".join(lines).lstrip()
+
+
+def rejected_note(*, arabic: bool, count: int) -> str:
+    """What the thread says after the operator declines a proposal.
+
+    The work is kept in the task's record even though nothing was written, and the sentence says both
+    halves: a refusal that reads like a crash would be the second time this window has made a
+    model's authored code look lost.
+    """
+    return say(arabic,
+               en=f"\U0001f6ab Proposal declined: {count} file(s) stay exactly as they are. Nothing "
+                  "was written, and the change is kept in this task's record.",
+               ar=f"\U0001f6ab رُفض المقترح: {count} ملف(ات) تبقى كما هي تمامًا. لم تُكتَب أي بيانات، "
+                  "والتغيير محفوظ في سجل هذه المهمة.")
 
 
 def write_notice(*, arabic: bool, count: int, summary: str = "", lines: int = 0,
@@ -356,6 +420,12 @@ SINGLE_WINDOW_STATUS = ("ask_expired", "applied_no_command")
 # `{field}` is filled by `note()`. A sentence that needs a field the caller forgot raises KeyError,
 # because a half-formatted status line is the kind of bug nobody notices until it is on screen.
 NOTE_TEMPLATES = {
+    "proposal_reject_nothing": (
+        "There is no proposal on this screen to decline.",
+        "لا يوجد مقترح على هذه الشاشة لرفضه."),
+    "proposal_reject_twice": (
+        "This proposal is already declined. Nothing was written, and the next one will ask again.",
+        "هذا المقترح مرفوض بالفعل. لم تُكتَب أي ملفات، والمقترح التالي سيسأل من جديد."),
     "plan_attached_chained": (
         "Plan attached. Send starts its first unfinished step; each step unlocks the next only after "
         "a command run proves it. The message box is an optional note.",
@@ -744,6 +814,105 @@ def log_dropped_line(*, arabic: bool, count: int) -> str:
                en=f"\u2026 {count} earlier line(s) are not kept in this window; the task's own "
                   "record still holds them.",
                ar=f"\u2026 {count} سطر أقدم غير محفوظ في هذه النافذة؛ سجل المهمة نفسه ما زال يحتفظ بها.")
+
+
+def log_line(arabic: bool, entry: dict) -> str:
+    """One stored session event, said as a sentence for the Activity list.
+
+    A reopened task rebuilds its Activity rows from the session's own records, and those records are
+    audit rows — `event(session, "tool", name=…, path=…, sha256=…)`. Printed as they are stored they
+    read `tool name=read_file path=pom.xml sha256=9f3c2…`, which is the engine's notebook rather than
+    something an operator can scan, and a `plan_attached` event carries the plan's whole text in its
+    `content` field, so the old form printed a file's worth of body inside one status row. Every kind
+    this window can reopen therefore has a sentence here, and it names at most the field a reader
+    would act on: a path, a query, a verdict. Hashes belong to the step row that opens onto them.
+
+    A kind this function has never met is still said, by name — a row that comes out blank hides a
+    whole phase of a run, which is the failure worth more.
+    """
+    kind = str(entry.get("kind", ""))
+    if kind == "step":
+        return step_line(arabic, str(entry.get("action", "")),
+                         **{key: entry[key] for key in STEP_FIELDS if key in entry})
+    if kind == "run":
+        return executed_line(arabic=arabic, command=str(entry.get("recipe", "")),
+                             verdict=run_verdict(arabic, entry))
+    if kind == "tool":
+        name = str(entry.get("name", ""))
+        if name == "read_file":
+            return say(arabic, en=f"\U0001f4d6 Read {entry.get('path', '')}",
+                       ar=f"\U0001f4d6 قراءة {entry.get('path', '')}")
+        if name == "list_files":
+            return say(arabic, en=f"\U0001f4c1 Listed {entry.get('count', 0)} file(s)",
+                       ar=f"\U0001f4c1 حصر {entry.get('count', 0)} ملف(ات)")
+        if name == "search_code":
+            return say(arabic, en=f"\U0001f50d {entry.get('matches', 0)} match(es) in the project",
+                       ar=f"\U0001f50d {entry.get('matches', 0)} نتيجة في المشروع")
+        if entry.get("query"):
+            return say(arabic, en=f"\U0001f50d {name}: {entry['query']} — {entry.get('count', 0)} hit(s)",
+                       ar=f"\U0001f50d {name}: {entry['query']} — {entry.get('count', 0)} نتيجة")
+        return say(arabic, en=f"\u2699\ufe0f {name} — {entry.get('count', 0)} result(s)",
+                   ar=f"\u2699\ufe0f {name} — {entry.get('count', 0)} نتيجة")
+    if kind == "context_file":
+        phrase = CONTEXT_REASON.get(str(entry.get("why", "")), "")
+        why = say(arabic, en=phrase[0], ar=phrase[1]).replace("{}", str(entry.get("symbol", ""))) \
+            if phrase else ""
+        return say(arabic, en=f"\U0001f3af Read {entry.get('path', '')} into the context" +
+                              (f" ({why})" if why else ""),
+                   ar=f"\U0001f3af قراءة {entry.get('path', '')} في السياق" +
+                      (f" ({why})" if why else ""))
+    if kind == "auto_read":
+        return say(arabic, en=f"\U0001f4d6 Read {entry.get('path', '')} before it was asked for",
+                   ar=f"\U0001f4d6 قراءة {entry.get('path', '')} قبل طلبها")
+    if kind == "file_not_found":
+        can = say(arabic, en=" — it may be created", ar=" — يمكن إنشاؤه") \
+            if entry.get("can_create") else ""
+        return say(arabic, en=f"\U0001f50e {entry.get('path', '')} is not in the project{can}",
+                   ar=f"\U0001f50e {entry.get('path', '')} ليس في المشروع{can}")
+    if kind == "rejected_action":
+        return say(arabic, en=f"\U0001f6ab Refused an action: {entry.get('reason', '')}",
+                   ar=f"\U0001f6ab رفض إجراء: {entry.get('reason', '')}")
+    if kind == "proposal":
+        return say(arabic, en="\u270d\ufe0f Proposal recorded", ar="\u270d\ufe0f تسجيل المقترح")
+    if kind == "approved":
+        return say(arabic, en="\u2705 Approved for writing", ar="\u2705 الموافقة على الكتابة")
+    if kind == "proposal_rejected":
+        return say(arabic, en="\U0001f6ab Proposal declined — nothing was written",
+                   ar="\U0001f6ab رُفض المقترح — لم تُكتَب أي ملفات")
+    if kind == "proposal_reopened":
+        return say(arabic, en="Proposal reopened for review — nothing was written",
+                   ar="أُعيد فتح المقترح للمراجعة — لم تُكتب أي ملفات")
+    if kind == "written":
+        return say(arabic, en=f"\U0001f4be Wrote {entry.get('path', '')}",
+                   ar=f"\U0001f4be كتابة {entry.get('path', '')}")
+    if kind == "removed":
+        return say(arabic, en=f"\U0001f5d1 Removed {entry.get('path', '')}",
+                   ar=f"\U0001f5d1 حذف {entry.get('path', '')}")
+    if kind == "block_chosen":
+        return say(arabic, en=f"\u2702\ufe0f Took {entry.get('path', '')} from a code block in the answer",
+                   ar=f"\u2702\ufe0f أخذ {entry.get('path', '')} من كتلة كود في الرد")
+    if kind == "rolled_back_file":
+        return say(arabic, en=f"\u21a9 Restored {entry.get('path', '')}",
+                   ar=f"\u21a9 استرجاع {entry.get('path', '')}")
+    if kind == "rolled_back":
+        return status_text("rolled_back", arabic=arabic)
+    if kind == "verification":
+        status = str(entry.get("status", ""))
+        word = RUN_WORDS.get(status, (status, status))
+        return say(arabic, en=f"\U0001f6e1 Checks {word[0]}", ar=f"\U0001f6e1 الفحوص {word[1]}")
+    if kind == "stopped":
+        return say(arabic, en=f"\u26d4 Stopped: {entry.get('reason', '')}",
+                   ar=f"\u26d4 توقف: {entry.get('reason', '')}")
+    if kind == "plan_attached":
+        return say(arabic, en=f"\U0001f4cb Plan attached: {entry.get('path', '')}",
+                   ar=f"\U0001f4cb إرفاق الخطة: {entry.get('path', '')}")
+    if kind == "memory_attached":
+        return say(arabic, en=f"\U0001f9e0 Standing notes sent ({entry.get('characters', 0)} characters)",
+                   ar=f"\U0001f9e0 إرسال ملاحظات ثابتة ({entry.get('characters', 0)} حرف)")
+    if kind == "evidence_attached":
+        return say(arabic, en=f"\U0001f4ce Build evidence sent ({entry.get('characters', 0)} characters)",
+                   ar=f"\U0001f4ce إرسال دليل البناء ({entry.get('characters', 0)} حرف)")
+    return say(arabic, en=f"\u2699\ufe0f {kind}", ar=f"\u2699\ufe0f {kind}")
 
 
 def queue_notes(arabic: bool, elsewhere: int, asked: bool) -> dict:

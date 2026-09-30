@@ -9,7 +9,7 @@ import os
 
 from .config import Kind, OLLAMA, OPENROUTER, check_endpoint
 from .errors import ProviderError
-from .providers import request_json
+from .providers import request_probe_with_retry
 
 LIVE = "live"
 BUILT_IN = "built-in"
@@ -17,7 +17,7 @@ BUILT_IN = "built-in"
 
 def ollama_models(endpoint: str = "") -> list[dict]:
     base = check_endpoint(OLLAMA, endpoint)
-    data = request_json(base + "/api/tags", timeout=10)
+    data = request_probe_with_retry(base + "/api/tags", timeout=10)
     entries = data.get("models")
     if not isinstance(entries, list):
         raise ProviderError("Ollama returned an invalid model list.")
@@ -48,7 +48,7 @@ def price(value) -> Decimal | None:
 
 def openrouter_models(api_key: str | None = None, endpoint: str = "") -> list[dict]:
     base = check_endpoint(OPENROUTER, endpoint)
-    data = request_json(base + "/models", key=api_key or os.environ.get("OPENROUTER_API_KEY"),
+    data = request_probe_with_retry(base + "/models", key=api_key or os.environ.get("OPENROUTER_API_KEY"),
                         timeout=20, max_bytes=16_000_000)
     entries = data.get("data")
     if not isinstance(entries, list):
@@ -92,7 +92,7 @@ def openai_models(base: str, api_key: str | None = None, *, cloud: bool = True) 
     The payload is a list of identifiers and nothing else that is useful here: pricing is not in
     it, so the description says what the request can prove (where it runs) and nothing more.
     """
-    data = request_json(base + "/models", key=api_key, timeout=20, max_bytes=8_000_000)
+    data = request_probe_with_retry(base + "/models", key=api_key, timeout=20, max_bytes=8_000_000)
     entries = data.get("data")
     if not isinstance(entries, list):
         entries = data.get("models")

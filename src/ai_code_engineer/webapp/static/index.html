@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>AI Code Engineer</title>
+<link rel="icon" type="image/png" href="favicon.png">
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="app.css">
 <script src="boot.js"></script>
@@ -14,7 +15,7 @@
 
   <aside class="side">
     <div class="brand">
-      <div class="mark">A</div><b>AI Code Engineer</b>
+      <div class="mark brand-mark"><img src="favicon.png" alt="Logo" class="brand-logo"></div><b>AI Code Engineer</b>
       <div class="spacer"></div>
       <button class="icon-btn" id="collapse" title="Collapse sidebar (Ctrl+B)" aria-label="Collapse sidebar">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M10 5v14"/></svg>
@@ -65,6 +66,7 @@
       <div class="dock">
         <div class="setup" id="setup" role="region" aria-label="First-run checks"></div>
         <div class="queue" id="queue" aria-live="polite"></div>
+        <div class="quotebar" id="quote" role="region" aria-label="Message being answered"></div>
         <div class="composer" id="composer">
           <textarea id="prompt" dir="auto" rows="2" placeholder="Ask anything — or choose a project and describe the change"></textarea>
           <div class="cbar" id="cbar"></div>
@@ -74,10 +76,13 @@
 
     <!-- activity -->
     <section class="view" id="view-details" role="tabpanel" aria-label="Activity">
-      <div class="logwrap"><div class="log" id="log"></div></div>
+      <div class="logwrap"><div class="log" id="log"></div>
+        <details class="rawstream" id="raw" hidden><summary id="rawhead">Debug / Raw stream</summary>
+          <div class="rawbody" id="rawbody" dir="ltr"></div></details></div>
     </section>
   </main>
 
+  <div class="rail-resizer" id="rail-resizer" title="Drag to resize rail · Double-click to reset" role="separator" aria-orientation="vertical"></div>
   <aside class="rail" id="rail"></aside>
 </div>
 

@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .config import (Kind, OLLAMA, OPENROUTER, Settings, check_endpoint, kind_for, needs_consent,
                      validate)
-from .errors import PolicyError, ProviderError
+from .errors import PolicyError, ProviderError, ProviderUnavailable
 from .redaction import redact
 
 
@@ -61,10 +62,38 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
     except HTTPError as exc:
         raise _refuse(exc) from None
     except (URLError, TimeoutError, OSError):
-        raise ProviderError("Provider connection failed or timed out. A local model needs a longer "
-                       "request timeout for a reply this large.") from None
+        raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
+                       "longer request timeout for a reply this large.") from None
     except (ValueError, UnicodeError):
         raise ProviderError("Provider returned invalid JSON.") from None
+
+
+# A cold Ollama daemon answers nothing for a few seconds while it loads, which is the one failure a
+# second ask genuinely fixes. Two attempts and one second is the whole policy; more would only be a
+# slower way of saying the service is not running.
+PROBE_ATTEMPTS = 2
+PROBE_PAUSE = 1.0
+
+
+def request_probe_with_retry(url: str, payload: dict | None = None, *, key: str | None = None,
+                             timeout: int = 10, max_bytes: int = 2_000_000,
+                             attempts: int = PROBE_ATTEMPTS, pause: float = PROBE_PAUSE) -> dict:
+    """One metadata read, asked twice if the first attempt never reached anything.
+
+    Only ever for metadata: `/api/tags` and `/api/show` are pure reads, so a repeat costs a second and
+    changes nothing. A generation call is deliberately not in here. Re-running `/api/chat` or a stream
+    starts another model load — minutes of CPU on a machine that may have just said it has no room —
+    and restarting a stream mid-answer breaks the row the user is already watching, which is what
+    `tests/test_transport.py` holds the refusal sentence for. So those keep one attempt, and the
+    distinction is typed (`ProviderUnavailable`) rather than read back out of an English message.
+    """
+    for attempt in range(max(1, attempts)):
+        try:
+            return request_json(url, payload, key=key, timeout=timeout, max_bytes=max_bytes)
+        except ProviderUnavailable:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(pause)
 
 
 # A streaming body announces no length to trust, so the cap moves to what has been read. The same
@@ -84,7 +113,13 @@ def ollama_chunk(line: bytes) -> dict | None:
     return {"content": str(message.get("content") or ""),
             "thinking": str(message.get("thinking") or message.get("reasoning") or ""),
             "finish": str(chunk.get("done_reason") or "") or None,
-            "model": "", "done": bool(chunk.get("done"))}
+            "model": "", "done": bool(chunk.get("done")),
+            # Ollama writes these two only on the last chunk, and they are the measured counterpart of
+            # `estimate_tokens` below: when `prompt_eval_count` comes back smaller than what was sent,
+            # the server cut the prompt in half — which is a plumbing failure that has always looked
+            # like a model that could not code.
+            "prompt_tokens": chunk.get("prompt_eval_count"),
+            "completion_tokens": chunk.get("eval_count")}
 
 
 def openai_chunk(line: bytes) -> dict | None:
@@ -107,10 +142,15 @@ def openai_chunk(line: bytes) -> dict | None:
     choices = chunk.get("choices") or []
     first = choices[0] if choices and isinstance(choices[0], dict) else {}
     delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+    usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else {}
     return {"content": str(delta.get("content") or ""),
             "thinking": str(delta.get("reasoning_content") or delta.get("reasoning") or ""),
             "finish": first.get("finish_reason") or None,
-            "model": str(chunk.get("model") or ""), "done": False}
+            "model": str(chunk.get("model") or ""), "done": False,
+            # Only present on the servers that send a usage frame, which is why these stay optional
+            # rather than defaulting to zero: 0 tokens would be a measurement nobody made.
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens")}
 
 
 def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int = 120,
@@ -126,6 +166,7 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
         headers["Authorization"] = "Bearer " + key
     request = Request(url, data=json.dumps(payload).encode(), headers=headers)
     content, thought, size, model, finish = [], [], 0, "", None
+    seen: dict = {}
     try:
         with _opener().open(request, timeout=timeout) as response:
             for line in response:
@@ -139,6 +180,11 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
                     model = part["model"]
                 if part.get("finish"):
                     finish = part["finish"]
+                for field in ("prompt_tokens", "completion_tokens"):
+                    # Last one wins rather than a sum: a server that repeats the counts on every frame
+                    # would otherwise turn one answer into forty.
+                    if isinstance(part.get(field), int):
+                        seen[field] = part[field]
                 if part["content"]:
                     content.append(part["content"])
                     if on_token is not None:
@@ -149,12 +195,38 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
     except HTTPError as exc:
         raise _refuse(exc) from None
     except (URLError, TimeoutError, OSError):
-        raise ProviderError("Provider connection failed or timed out. A local model needs a longer "
-                       "request timeout for a reply this large.") from None
+        raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
+                       "longer request timeout for a reply this large.") from None
     except ValueError:
         raise ProviderError("Provider returned invalid JSON.") from None
     return {"content": "".join(content), "thinking": "".join(thought),
-            "finish": finish, "model": model}
+            "finish": finish, "model": model, **seen}
+
+
+def counts(answer: dict) -> dict:
+    """One provider answer's token counts, in one shape — or `{}` when it reported none.
+
+    Absence is kept as absence. Writing 0 for a server that measured nothing would be a number in the
+    audit that says "this cost nothing", which is the one reading nobody corrects.
+    """
+    found = {}
+    for name, keys in (("prompt_tokens", ("prompt_tokens", "prompt_eval_count")),
+                       ("completion_tokens", ("completion_tokens", "eval_count"))):
+        for key in keys:
+            if isinstance(answer.get(key), int):
+                found[name] = answer[key]
+                break
+    return found
+
+
+def metrics_of(provider) -> dict:
+    """What the provider measured on its last answer, if a provider measures anything.
+
+    Optional by construction, exactly as `reasoning` and `supports_stream` are: the scripted models this
+    suite runs answer a string and own no transport, so a provider without a `metrics` attribute has
+    reported nothing — which is not the same claim as having reported zero.
+    """
+    return counts(getattr(provider, "metrics", None) or {})
 
 
 # Ollama's default context is small enough to cut a real coding prompt in half without saying so.
@@ -236,7 +308,8 @@ class OllamaProvider:
         self.endpoint = check_endpoint(OLLAMA, settings.endpoint)
 
     def preflight(self) -> None:
-        info = request_json(self.endpoint + "/api/show", {"model": self.model}, timeout=10)
+        info = request_probe_with_retry(self.endpoint + "/api/show", {"model": self.model},
+                                        timeout=10)
         cloud_backed = bool("cloud" in self.model.casefold() or info.get("remote_host") or info.get("remote_model"))
         if cloud_backed and not self.allow_cloud:
             raise PolicyError("This Ollama model runs in the cloud. Approve cloud processing for public/synthetic code or choose a local model.")
@@ -246,6 +319,7 @@ class OllamaProvider:
 
     def generate(self, messages: list[dict], json_mode: bool = True, on_token=None) -> str:
         self.reasoning = ""
+        self.metrics = {}
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages or [])
         payload = {
             "model": self.model, "messages": messages,
@@ -274,12 +348,14 @@ class OllamaProvider:
             message = result.get("message") if isinstance(result.get("message"), dict) else {}
             value, thought = message.get("content"), message
             truncated = result.get("done_reason") == "length"
+            self.metrics = counts(result)
         else:
             streamed = read_stream(self.endpoint + "/api/chat", payload,
                                    timeout=self.settings.timeout_seconds, on_token=on_token,
                                    chunk=ollama_chunk)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             truncated = streamed["finish"] == "length"
+            self.metrics = counts(streamed)
         self.reasoning = read_reasoning(thought)
         if truncated:
             raise ProviderError("Model output truncated; reduce the change size.")
@@ -337,6 +413,8 @@ class OpenAICompatibleProvider:
                 message = choice["message"] if isinstance(choice.get("message"), dict) else {}
                 value, thought = message.get("content"), message
                 finish, echoed = choice.get("finish_reason"), str(result.get("model") or "")
+                self.metrics = counts(result.get("usage") if isinstance(result.get("usage"),
+                                                dict) else {})
             except (KeyError, IndexError, TypeError, AttributeError):
                 raise ProviderError(f"Invalid {self.kind.label} response.") from None
         else:
@@ -345,6 +423,7 @@ class OpenAICompatibleProvider:
                                    chunk=openai_chunk)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             finish, echoed = streamed["finish"], streamed["model"]
+            self.metrics = counts(streamed)
         self.reasoning = read_reasoning(thought)
         # Proposals must be complete; chat tolerates a missing finish_reason.
         if not (finish == "stop" or (not json_mode and finish is None)):

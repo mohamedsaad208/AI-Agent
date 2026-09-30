@@ -69,6 +69,18 @@ class TheNumbers(unittest.TestCase):
         self.assertEqual(data["state_label"], "Selected checks passed")
         self.assertEqual(data["proposal"]["hash"], "3" * 64)
 
+    def test_the_measured_token_counts_are_part_of_the_record(self):
+        spent = {"prompt_tokens": 2050, "completion_tokens": 180}
+        self.assertEqual(summary(session(metrics=spent))["metrics"], spent)
+        self.assertIn("2050 / 180", export(session(metrics=spent)))
+
+    def test_a_session_nobody_measured_is_not_reported_as_free(self):
+        # The distinction the whole item rests on: "not measured" and "cost nothing" are different
+        # sentences, and a zero in the table would claim the second one about a session that simply
+        # never had a provider that counts.
+        self.assertIsNone(summary(session())["metrics"])
+        self.assertIn("not reported", export(session()))
+
     def test_files_read_separate_the_model_call_from_the_tools_own(self):
         data = summary(session())
         self.assertEqual([row["path"] for row in data["reads"]["by_model"]], ["calculator.py"])
@@ -258,6 +270,13 @@ class FindingASession(unittest.TestCase):
     def test_an_unexplained_stop_says_that_rather_than_printing_a_blank(self):
         rows = refusals(session(events=[{"at": "2026-09-28T10:00:00+00:00", "kind": "stopped"}]))
         self.assertEqual(rows[0]["why"], "the record does not say why it stopped")
+
+    def test_a_proposal_the_operator_declined_is_a_refusal_like_any_other(self):
+        """UI 4.6: a session that shows a proposal and then nothing else reads as lost work."""
+        rows = refusals(session(events=[{"at": "2026-09-28T10:00:00+00:00",
+                                          "kind": "proposal_rejected", "hash": "a" * 64}]))
+        self.assertEqual([row["what"] for row in rows], ["the proposal"])
+        self.assertIn("declined", rows[0]["why"])
 
 
 if __name__ == "__main__":

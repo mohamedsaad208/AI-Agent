@@ -22,7 +22,7 @@ import time
 import threading
 import uuid
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from ..catalog import LIVE, models_for
@@ -31,16 +31,19 @@ from ..chat import (context_block, context_use, create_chat, load_chat, project_
 from .. import config
 from ..config import Settings
 from ..engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, diff_size,
-                      load_session, plan, project_key, propose_block, read_plan_reference, rollback)
+                      load_session, plan, project_key, proposal_rejected, propose_block,
+                      read_plan_reference, reopen_proposal, rollback)
+from ..engine import event as record_event    # `event` is a parameter name in `stream()` below
 from ..errors import AgentError, PolicyError
-from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, STEP_FIELDS, TONE, UNVERIFIED_STATES,
-                      applied_line, applied_note, artifact_card, batch_summary_line,
+from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIELDS, TONE,
+                      UNVERIFIED_STATES,
+                      applied_line, applied_note, artifact_card, asked_of, batch_summary_line,
                       branch_started, branch_switched,
                       catalog_status_line, checkpoint_note, detail_section, executed_line,
                       executing_line, friendly_error, fix_offers_off_line, is_arabic,
-                      log_dropped_line,
-                      no_branch_note,
-                      no_checkpoint_note, queue_notes,
+                      log_dropped_line, log_line,
+                      no_branch_note, no_checkpoint_note,
+                      queue_notes, quote_reference, rejected_note,
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
                       say, state_label,
                       status_text, step_has_detail, step_line, step_missing_line,
@@ -181,6 +184,16 @@ def asks_for_a_change(text: str) -> bool:
 
 def _clock() -> str:
     return datetime.now().strftime("%H:%M")
+
+
+def _queued_request(item: dict) -> tuple[str, str]:
+    """Keep structured requests intact; decode the composed text of older queues."""
+    text = item.get("text", "")
+    asked, reference = item.get("asked"), item.get("reference")
+    if isinstance(asked, str) and isinstance(reference, str) and reference + asked == text:
+        return asked, reference
+    asked = asked_of(text)
+    return asked, text[:-len(asked)] if asked else ""
 
 
 class LineFeed:
@@ -408,8 +421,11 @@ class AgentController:
                     self.icons[key] = icon
             if isinstance(registry.get("ui"), dict):
                 self._saved_ui = registry["ui"]
+                self._removed_projects = set(self._saved_ui.get("removed_projects", []))
         except (OSError, ValueError, KeyError, TypeError):
-            self.projects, self.icons = {}, {}
+            self.projects, self.icons, self._removed_projects = {}, {}, set()
+        if not hasattr(self, "_removed_projects"):
+            self._removed_projects = set()
         self.chained = bool(self._saved_ui.get("plan_chained"))
         # The container choice belongs to the machine, never to the project: a repository must not get
         # to name the image the tool builds that repository inside.
@@ -438,7 +454,10 @@ class AgentController:
             for item in saved_queue[:20]:
                 if (isinstance(item, dict) and isinstance(item.get("text"), str)
                         and item["text"].strip() and len(item["text"]) <= MAX_TASK_CHARS):
-                    self.queue.append({**item, "restored": True})
+                    # Migrate older queues whose text already contains the frozen quotation.
+                    asked, reference = _queued_request(item)
+                    self.queue.append({**item, "asked": asked, "reference": reference,
+                                       "restored": True})
             self._queue_held = bool(self.queue)
         last = self._saved_ui.get("last_project")
         if isinstance(last, str) and last and Path(last).is_dir():
@@ -638,7 +657,7 @@ class AgentController:
         job.start()
 
     # ------------------------------ queue ------------------------------
-    def queue_add(self, text: str) -> None:
+    def queue_add(self, text: str, quote_of: object = None, *, reference: str = "") -> None:
         """Hold a message typed during a running task, and start it when that task ends.
 
         The click that queues is the approval: the user chose both the text and the moment, so
@@ -646,9 +665,14 @@ class AgentController:
         folder's own rules that run — Change mode proposes, Auto-Apply writes, Chat answers in
         prose — and **Stop** holds the queue, because a stop that is followed instantly by the
         next message is not a stop.
+
+        A reference is resolved here, at the click, and the composed message is what the queue holds:
+        by the time the queue drains the thread may have grown, and an index kept that long would
+        point at a different row.
         """
-        task = (text or "").strip()
-        if not task:
+        asked = (text or "").strip()
+        task = reference + asked if reference else self.with_quote(asked, quote_of)
+        if not asked:
             return
         if len(task) > MAX_TASK_CHARS:
             self._add("tool", "Tool", say(self.arabic,
@@ -659,7 +683,8 @@ class AgentController:
         if any(item.get("text") == task and item.get("chat") == self.chat_id for item in self.queue):
             self._queue_held = False
             return                       # the same message twice in a row is one queue line
-        self.queue.append({"id": uuid.uuid4().hex[:8], "text": task, "chat": self.chat_id,
+        self.queue.append({"id": uuid.uuid4().hex[:8], "text": task, "asked": asked,
+                           "reference": task[:-len(asked)], "chat": self.chat_id,
                            "branch": str(self.branch.get("key") or ""),
                            "project": self.repo, "at": _clock()})
         self._queue_held = False
@@ -677,7 +702,11 @@ class AgentController:
         for item in self.queue:
             if item.get("id") == item_id:
                 item["text"] = (text or "").strip()[:MAX_TASK_CHARS]
+                item["asked"] = asked_of(item["text"])
+                item["reference"] = (item["text"][:-len(item["asked"])]
+                                     if item["asked"] else "")
         self._queue_held = False
+        self._save_state()
         self._emit({"kind": "state", "data": self.snapshot()})
 
     def queue_drop(self, item_id: str) -> None:
@@ -735,6 +764,13 @@ class AgentController:
         the queue cannot fix — no model selected, the folder is gone, the message too long — and a
         drain that popped first lost the typed message with nothing but a status line to show for it;
         two create tasks disappeared that way in the ecommerce run.
+
+        The reading of `busy` and the claim of a row are one step under the lock, because two jobs
+        ending in the same tick both found an idle window here and both reached for the same row. The
+        one that lost the job then re-queued the text the winner had already taken out of the queue,
+        and the message ran twice — seen in the trace of `test_a_queued_batch_says_what_it_landed_
+        when_it_ends` under load, as a batch that reported two tasks for one typed row. Only the
+        decision is locked: `start_plan` takes this same lock itself, so the work stays outside it.
         """
         # The queue is stored in the same file as the rest of the window's state, and this is the one
         # place every mutation path passes through -- except an edit, which saves for itself.
@@ -742,19 +778,23 @@ class AgentController:
         # A row that came back with the restart does not run on its own accord: the operator pressing
         # ▶ (or queueing something new beside it) is the approval, and until then the strip shows it
         # with the sentence that says it was typed in an earlier session.
-        runnable = next((item for item in self.queue if not item.get("restored")), None)
-        if self.busy or self._loading_session or self._queue_held or not self.queue:
-            if not self.queue and not self.busy and self._batch:
-                # Cleared when the batch it belongs to actually ends. A task with an empty queue is
-                # not a batch of one that just closed: the flag has to outlast it, or "don't ask
-                # again for this batch" would mean "not for the next two minutes".
-                self._batch_fixes_off = False
-                self._close_batch()
+        item, closing = None, False
+        with self._state:
+            if self._draining or self.busy or self._loading_session or self._queue_held or not self.queue:
+                closing = not self._draining and not self.busy and not self.queue and bool(self._batch)
+            else:
+                item = next((row for row in self.queue if not row.get("restored")), None)
+                if item is not None:
+                    self._draining = True
+        if closing:
+            # Cleared when the batch it belongs to actually ends. A task with an empty queue is
+            # not a batch of one that just closed: the flag has to outlast it, or "don't ask
+            # again for this batch" would mean "not for the next two minutes".
+            self._batch_fixes_off = False
+            self._close_batch()
             return
-        if runnable is None:
+        if item is None:
             return
-        item = runnable
-        self._draining = True
         try:
             if item.get("detached"):
                 key = item.get("branch") or ""
@@ -764,22 +804,29 @@ class AgentController:
                     self.new_chat()
                 if self.busy:
                     return              # the switch starts nothing on its own; send below
-                self.start_plan(item.get("text", ""))
+                self._start_queued(item)
                 if self._job_started:
                     self.queue.remove(item)
                     self._open_batch_row(item)
                 return
             if item.get("chat") == self.chat_id:
-                self.start_plan(item.get("text", ""))
+                self._start_queued(item)
                 if self._job_started:
                     self.queue.remove(item)
                     self._open_batch_row(item)
         finally:
             self._draining = False
 
+    def _start_queued(self, item: dict) -> None:
+        asked, reference = _queued_request(item)
+        if reference:
+            self.start_plan(asked, reference=reference)
+        else:
+            self.start_plan(asked)
+
     def _open_batch_row(self, item: dict) -> None:
         """Start recording the queued task that was just taken out of the queue."""
-        first = ((item.get("text") or "").strip().splitlines() or [""])
+        first = (_queued_request(item)[0].strip().splitlines() or [""])
         self._batch_row = {"task": (first[0] if first else "")[:60], "paths": []}
         self._batch.append(self._batch_row)
 
@@ -854,8 +901,11 @@ class AgentController:
         # being flattened into the event — flattened, the two kinds collided.
         self._emit({"kind": "log", "entry": entry})
 
-    def _add(self, role: str, author: str, text: str, step: dict | None = None) -> None:
+    def _add(self, role: str, author: str, text: str, step: dict | None = None,
+             *, quote_of: object = None) -> None:
         message = {"role": role, "author": author, "text": text, "time": _clock()}
+        if role == "user" and self.quoted(quote_of):
+            message["replyTo"] = int(quote_of)
         if step:
             # A step row is a message with a handle on its own record: the sentence is what the row
             # says, and `step` is what lets it be opened again after a reload or a reopen.
@@ -904,10 +954,10 @@ class AgentController:
         the user typed, because a status line set before any session exists still answers to that
         person. Anything with no text of theirs to look at stays English.
         """
-        task = (self.session or {}).get("task") or ""
+        task = asked_of((self.session or {}).get("task") or "")
         if not task:
-            task = next((m.get("text", "") for m in reversed(self.messages)
-                         if m.get("role") == "user"), "")
+            task = asked_of(next((m.get("text", "") for m in reversed(self.messages)
+                                  if m.get("role") == "user"), ""))
         return is_arabic(task)
 
     def _banner(self) -> dict:
@@ -960,7 +1010,7 @@ class AgentController:
             "declared": self._declared_info(),
             "plan": plan_info,
             "provider": {"mode": self.mode, "modes": list(MODES), "model": self.model,
-                         "models": self.visible_models()},
+                         "models": self.visible_models(), "metrics": self._metrics_info()},
             # The whole connection row: a drawer that offered a provider without saying where it
             # points, or whether it wants a key, could only be filled by trial and error.
             "connection": self.connection_info(),
@@ -1009,8 +1059,11 @@ class AgentController:
     def action(self, type: str, payload: dict, emit) -> dict | None:
         self._emit = emit
         handlers = {
-            "send": lambda: self.start_plan(payload.get("text", "")),
-            "queue_add": lambda: self.queue_add(payload.get("text", "")),
+            "send": lambda: self.start_plan(payload.get("text", ""), payload.get("quote_of"),
+                                            step_id=payload.get("step_id")),
+            "complete_step": lambda: self.complete_step(int(payload.get("step_id") or 0)),
+            "reopen": self.reopen,
+            "queue_add": lambda: self.queue_add(payload.get("text", ""), payload.get("quote_of")),
             "queue_edit": lambda: self.queue_edit(str(payload.get("id", "")),
                                                    payload.get("text", "")),
             "queue_drop": lambda: self.queue_drop(str(payload.get("id", ""))),
@@ -1018,6 +1071,7 @@ class AgentController:
             "queue_chat": lambda: self.queue_detached(str(payload.get("id", ""))),
             "queue_resume": self.queue_resume,
             "stop": self.stop, "apply": self.apply, "rollback": self.undo,
+            "reject": self.reject,
             "git_branch": lambda: self.git_branch(str(payload.get("back", ""))),
             "git_restore": self.git_restore,
             "apply_block": lambda: self.offer_block(payload),
@@ -1049,6 +1103,7 @@ class AgentController:
             "set_icon": lambda: self.set_icon(payload.get("project", ""), payload.get("value", "")),
             "new_chat_in": lambda: self.new_chat_in(payload.get("project", "")),
             "reveal": lambda: self.reveal(payload.get("project", "")),
+            "remove_project": lambda: self.remove_project(payload.get("project", "")),
             "pick_plan": self.browse_plan, "clear_plan": self.clear_plan,
             "set_mode": lambda: self.set_mode(payload.get("value", "")),
             "set_model": lambda: self.set_model(payload.get("value", "")),
@@ -1085,8 +1140,10 @@ class AgentController:
                 if entry.is_dir():
                     if not _hidden(entry) and not ignore.picker_dir(entry.name):
                         dirs.append(entry)
-                elif want_files and entry.suffix.lower() in {str(s) for s in want_files}:
-                    files.append(entry)
+                elif want_files:
+                    want_set = {str(s).lower() if str(s).startswith(".") else "." + str(s).lower() for s in want_files}
+                    if entry.suffix.lower() in want_set:
+                        files.append(entry)
             except OSError:
                 continue
         # A drive root has no parent, so without the drive list the picker is a dead end on C: and
@@ -1452,13 +1509,23 @@ class AgentController:
             self.status = friendly_error(exc)
             return
         self.plan_file = str(Path(self.repo) / reference["path"])
+        self.refresh_plan_status()
+        if not self.ledger:
+            try:
+                planbook.open_book(self.plans, Workspace(Path(self.repo)), self.plan_file)
+            except (AgentError, OSError) as exc:
+                self.plan_file = ""
+                self._save_state()
+                message = friendly_error(exc)
+                self.say(message)
+                self._emit({"kind": "toast", "text": message, "level": "bad"})
+                return
         # Attaching a plan is a decision to implement it, so this is the one path that selects
         # Change mode on the user's behalf instead of leaving prose as the default.
         self.set_composer(CHANGE_COMPOSER)
         self._save_state()
         self.status = shared_note("plan_attached_chained" if self.chained
                                   else "plan_attached_plain", arabic=self.arabic)
-        self.refresh_plan_status()
 
     def clear_plan(self) -> None:
         self.plan_file = ""
@@ -1816,6 +1883,15 @@ class AgentController:
         saved = self._project_notes()
         return f"{len(saved)} chars saved · {memory_store.key_for(self.repo)}.md · sent with every task here"
 
+    def _metrics_info(self) -> dict:
+        """The token counts the provider measured for the task on screen, if it measured any.
+
+        An empty dict rather than zeros, in both directions: before a task has run, and after a provider
+        that reports nothing. The drawer has to be able to tell "the model cost nothing" from "nobody
+        said what it cost", and only the absence of a number keeps that honest.
+        """
+        return dict((self.session or {}).get("metrics") or {})
+
     def project_info(self, key: str) -> dict:
         """Everything the per-project drawer shows, for any folder the user has granted.
 
@@ -1917,6 +1993,21 @@ class AgentController:
             return
         self.status = "Opened " + path.name + " in the file manager."
 
+    def remove_project(self, key: str) -> None:
+        """Remove a project from the sidebar list."""
+        if not key:
+            return
+        with self._state:
+            folder = self.projects.pop(key, None)
+            if not hasattr(self, "_removed_projects"):
+                self._removed_projects = set()
+            self._removed_projects.add(key)
+            self._saved_ui["removed_projects"] = list(self._removed_projects)
+            if self.repo and (self.branch.get("key") == key or (folder and str(Path(self.repo).resolve()) == str(Path(folder).resolve()))):
+                self._select_branch(BRANCH_CHAT, "")
+            self._save_state()
+            self.status = "Removed project from the sidebar."
+
     def save_memory(self, text: str) -> None:
         if not self.repo:
             self.status = status_text("need_folder_notes", arabic=self.arabic)
@@ -1930,15 +2021,54 @@ class AgentController:
         self._note("memory", "Project notes updated.")
 
     # ------------------------------- planning -------------------------------
-    def start_plan(self, text: str) -> None:
+    def quoted(self, index: object) -> tuple[str, str] | None:
+        """The message the next one answers, read out of this window's own record.
+
+        Resolved here rather than sent as text on purpose: a quotation has to be what was actually
+        said, and a payload can carry any words the sender likes. An index this thread does not have —
+        a message that arrived after the click, a task that was switched out from under it — answers as
+        no reference at all, so the message still sends.
+        """
+        try:
+            position = int(index)
+        except (TypeError, ValueError):
+            return None
+        rows = self.messages
+        if not 0 <= position < len(rows):
+            return None
+        words = " ".join(str(rows[position].get("text", "")).split())
+        if not words:
+            return None
+        return str(rows[position].get("role", "assistant")), words[:QUOTE_CHARS]
+
+    def with_quote(self, asked: str, index: object) -> str:
+        """The message the model will read: the reference block, then what was typed.
+
+        The block is written in the language of the message being sent, not of the session still on
+        screen — `self.arabic` reads the latter until this turn exists, and a sentence the operator is
+        about to answer belongs to the question they just asked.
+        """
+        quoted = self.quoted(index)
+        if not quoted:
+            return asked
+        return quote_reference(is_arabic(asked), quoted[0], quoted[1]) + asked
+
+    def start_plan(self, text: str, quote_of: object = None, *, reference: str = "",
+                   step_id: int | None = None) -> None:
         if self.busy:
             # Not a mistake to swallow. The window's own busy flag is a race when two clicks land in
             # one tick — a second Send then reaches the server while the first is still starting — and
             # dropping it loses a written prompt with no message and no trace. The queue is the
             # mechanism that already means "said while a task was running".
-            self.queue_add(text)
+            self.queue_add(text, quote_of, reference=reference)
             return
-        repo, task = self.repo.strip(), (text or "").strip()
+        repo, asked = self.repo.strip(), (text or "").strip()
+        # Composed before anything measures it, so the length ceiling covers what the model reads.
+        # `asked` stays the operator's own words for the two questions that are only about those words:
+        # whether there is a message at all, and whether it asks for a change — a quoted "fix add" must
+        # not turn a question about that old task into a new change request.
+        task = reference + asked if reference else self.with_quote(asked, quote_of)
+        queued_reference = task[:-len(asked)] if asked else ""
         plan_file = self.plan_file.strip() or None
         entry = self.selected_entry()
         cloud, paid = self.cloud_choice()
@@ -1952,8 +2082,8 @@ class AgentController:
             # A Send by hand is a new batch, even with an empty queue: "don't ask again" was answered
             # against work the operator was watching, and it does not travel to the next one.
             self._batch_fixes_off = False
-        chained_plan = bool(repo and plan_file and self.chained)
-        if (not task and not chained_plan) or len(task) > MAX_TASK_CHARS or not self.model:
+        chained_plan = bool(repo and plan_file and (self.chained or step_id is not None))
+        if (not asked and not chained_plan) or len(task) > MAX_TASK_CHARS or not self.model:
             self.status = status_text("too_long", arabic=self.arabic)
             return
         if entry is None:
@@ -1972,15 +2102,16 @@ class AgentController:
         # imperative here gets the analysis it is allowed, and the row above the answer says why no
         # diff follows it.
         if self.reading_only():
-            self.start_chat(task, settings, cloud, paid, key, intent.no_proposal(arabic=self.arabic))
+            self.start_chat(task, settings, cloud, paid, key, intent.no_proposal(arabic=self.arabic),
+                            asked=asked, quote_of=quote_of)
             return
         # A bound project answers in prose by default: bound means it may *read* that project,
         # never that a greeting became a change request. A message that opens with "add" or
         # "صلح" is a different thing, and it is planned as a change — for this message only,
         # because remembering the route would turn the next "thanks" into a rejected diff.
-        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(task)
+        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked)
         if not repo or (self.composer == CHAT_COMPOSER and not as_change):
-            self.start_chat(task, settings, cloud, paid, key)
+            self.start_chat(task, settings, cloud, paid, key, asked=asked, quote_of=quote_of)
             return
         if plan_file:
             try:
@@ -1988,15 +2119,19 @@ class AgentController:
             except (AgentError, OSError) as exc:
                 self.status = friendly_error(exc)
                 return
-        step_id = None
         if chained_plan:
             try:
                 ledger_path, book = planbook.open_book(self.plans, Workspace(Path(repo)), plan_file)
-                row = planbook.current(book)
-                if row is None:
-                    raise PolicyError("Every step of this plan is already verified by a passing run.")
-                step_id = row["id"]
-                task = planbook.task_for(book, row, task)
+                if step_id is not None:
+                    row = planbook.step(book, int(step_id))
+                    if row is None:
+                        raise PolicyError(f"Plan step {step_id} not found.")
+                else:
+                    row = planbook.current(book)
+                    if row is None:
+                        raise PolicyError("Every step of this plan is already verified by a passing run.")
+                    step_id = row["id"]
+                task = planbook.task_for(book, row, task if (task and task != row.get("title")) else "")
             except (AgentError, OSError) as exc:
                 self.status = friendly_error(exc)
                 return
@@ -2015,8 +2150,8 @@ class AgentController:
             else:
                 self._add("tool", "Tool", note + shared_note("prior_stacked", arabic=self.arabic))
                 self.status = status_text("prior_unverified", arabic=self.arabic)
-        self.title = task.replace("\n", " ")[:45]
-        self._add("user", "You", task)
+        self.title = asked.replace("\n", " ")[:45]
+        self._add("user", "You", task, quote_of=quote_of)
         if as_change:
             self._add("tool", "Tool", "This branch is in Chat mode, so the answer would have been "
                                       "prose. The message asks for a change, so it is planned as a "
@@ -2065,7 +2200,8 @@ class AgentController:
         # rides along as the running line — which is also the entry the log keeps.
         running = ("⚡ Switched to Change mode to propose and write file edits…" if as_change
                    else "Connecting to the model and preparing changes…")
-        self.run_job(work, done, running, cancellable=True, on_busy=lambda: self.queue_add(task))
+        self.run_job(work, done, running, cancellable=True,
+                     on_busy=lambda: self.queue_add(asked or task, reference=queued_reference))
 
     def _progress(self, line: str, *, record: bool = True) -> None:
         self.pending = line
@@ -2275,20 +2411,23 @@ class AgentController:
             self._stream(text, "token")
 
     def start_chat(self, task: str, settings, cloud: bool, paid: bool, key: str | None,
-                   note: str = "") -> None:
+                   note: str = "", asked: str = "", *, quote_of: object = None) -> None:
         """Prose answer. With a bound project it may read that folder's map; never write to it.
 
         `note` is a line the *mode* puts above its own answer. Read-only uses it for the refusal, which
         has to be part of the transcript — a status line is replaced by the next click, and "this
         conversation builds no proposal" is something the operator reads back afterwards.
+
+        `asked` is the same message without its reference block. The chat is titled from it, because a
+        conversation called `> [In reference to your earlier message: …` has stopped naming the question.
         """
         if self.chat is None or self.chat.get("id") != self.chat_id:
             self.chat = create_chat(self.model or Settings().model, self.chat_id,
                                     project=self._chat_project())
         chat = self.chat
         self.session = self.session_path = None
-        self.title = chat.get("title") or task.replace("\n", " ")[:45]
-        self._add("user", "You", task)
+        self.title = chat.get("title") or (asked or task).replace("\n", " ")[:45]
+        self._add("user", "You", task, quote_of=quote_of)
         if note:
             self.line("tool", "Tool", note)
         repo = self.repo
@@ -2316,7 +2455,10 @@ class AgentController:
                            if repo else
                            "Answered. Choose a project when you want reviewed changes to real files.")
 
-        self.run_job(work, done, "Thinking…", on_busy=lambda: self.queue_add(task))
+        typed = asked or asked_of(task)
+        reference = task[:-len(typed)] if typed else ""
+        self.run_job(work, done, "Thinking…",
+                     on_busy=lambda: self.queue_add(typed, reference=reference))
 
     def _chat_project(self) -> dict | None:
         """What a new chat records as its home: the selected project, or nothing at all."""
@@ -2412,6 +2554,11 @@ class AgentController:
             # A proposal built before the badge moved is still on the screen, and the mode is a
             # position about this folder — not about whether a diff happens to be rendered right now.
             self.say(self.write_refusal("Apply"))
+            return
+        if self.rejected():
+            self.say(say(self.arabic,
+                         en="This proposal was declined. Reopen it for review before applying it.",
+                         ar="رُفض هذا المقترح. أعد فتحه للمراجعة قبل تطبيقه."))
             return
         changes = self.session.get("changes", [])
         again = ""
@@ -2535,6 +2682,65 @@ class AgentController:
                                         else "syntax_clean", arabic=self.arabic)
 
         self.run_job(lambda: verify(path), done, "Checking syntax in changed files…")
+
+    def rejected(self) -> bool:
+        """Whether this window has already declined the proposal on screen.
+
+        Read off the session's own events rather than kept in a flag beside them: a refusal belongs to
+        one proposal hash, so a repair round that authors a different change is answerable again, and
+        a task reopened after a restart brings its refusal back rather than offering Apply anew.
+        """
+        return proposal_rejected(self.session or {})
+
+    def reopen(self) -> None:
+        """Reopen for review only: even Auto-Apply must wait for another decision."""
+        if self.busy or not self.session or not self.session_path or not self.rejected():
+            return
+        if self.reading_only():
+            self.say(self.write_refusal("Reopen"))
+            return
+        self.session = reopen_proposal(self.session_path, self.session["proposal_hash"])
+        self.line("tool", "Tool", say(self.arabic,
+                  en="Proposal reopened for review. Nothing was written.",
+                  ar="أُعيد فتح المقترح للمراجعة. لم تُكتب أي ملفات."))
+        self.say(say(self.arabic, en="Review the proposal before applying it.",
+                     ar="راجع المقترح قبل تطبيقه."))
+
+    def reject(self) -> None:
+        """Decline a proposal without discarding the work behind it.
+
+        Nothing is written, so nothing needs rolling back — but the answer is recorded in the task's
+        session, because "no" is a fact about the run that an exported session should carry, and
+        because the refusal has to outlive the click that made it. The files are untouched either way,
+        which is the whole promise this window has always made about a proposal.
+        """
+        if self.busy:
+            return
+        if self.reading_only():
+            # Declining a write is not itself a write, and yet a sealed folder gets the same answer as
+            # every other verb here: the mode is a position about this folder, not about whichever
+            # diff happens to be on screen.
+            self.say(self.write_refusal("Reject"))
+            return
+        changes = (self.session or {}).get("changes") or []
+        if not changes:
+            self.say(shared_note("proposal_reject_nothing", arabic=self.arabic))
+            return
+        if self.rejected():
+            self.say(shared_note("proposal_reject_twice", arabic=self.arabic))
+            return
+        with self._state:
+            record_event(self.session, "proposal_rejected",
+                         hash=str(self.session.get("proposal_hash", "")))
+            if self.session_path:
+                atomic_json(self.session_path, self.session)
+        text = rejected_note(arabic=self.arabic, count=len(changes))
+        # `line` rather than `_add`, and no log row of its own: the thread and the card carry the answer,
+        # and a reopened task shows it in the raw block from the record this just wrote. Every sink this
+        # window speaks through is capped on purpose (tests/test_host.py).
+        self.line("tool", "Tool", text)
+        self.say(say(self.arabic, en="Proposal declined. Nothing was written.",
+                     ar="رُفض المقترح. لم تُكتَب أي ملفات."))
 
     def undo(self) -> None:
         if self.busy:
@@ -3075,6 +3281,26 @@ class AgentController:
         self.start_plan(planbook.task_for(book, nxt))
         return True
 
+    def complete_step(self, step_id: int = 0) -> None:
+        """Mark a plan step verified in the ledger when sequentially executed."""
+        if not self.ledger or not self.ledger_path:
+            self.refresh_plan_status()
+        if not self.ledger or not self.ledger_path:
+            return
+        if not step_id:
+            curr = planbook.current(self.ledger)
+            step_id = curr["id"] if curr else 0
+        if not step_id:
+            return
+        row = planbook.step(self.ledger, step_id)
+        if row is None:
+            return
+        row.update(status="verified", verified_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        atomic_json(self.ledger_path, self.ledger)
+        self.refresh_plan_status()
+        self.status = f"Plan step {step_id} verified."
+        self._add("tool", "Tool", f"Plan step {step_id}: {row.get('title', '')} verified.")
+
     def refresh_plan_status(self) -> None:
         repo, plan_file = self.repo.strip(), self.plan_file.strip()
         if not repo or not plan_file or not Path(repo).is_dir():
@@ -3140,7 +3366,8 @@ class AgentController:
         Filtering is the client's own — it happens on every keystroke, and a round trip per
         keystroke would make the box lag behind the typing.
         """
-        groups: dict[str, dict[str, list]] = {key: {} for key in self.projects}
+        removed = getattr(self, "_removed_projects", set())
+        groups: dict[str, dict[str, list]] = {key: {} for key in self.projects if key not in removed}
         # A chat that was dropped onto a project belongs to that project's node, so it is listed
         # beside the tasks instead of in the standalone column.
         bound: dict[str, list] = {}
@@ -3151,7 +3378,7 @@ class AgentController:
                 continue
             root = str(project.get("key", ""))
             folder = str(project.get("path", ""))
-            if not root or not folder:
+            if not root or not folder or root in removed:
                 continue
             self.projects.setdefault(root, folder)
             groups.setdefault(root, {})
@@ -3165,6 +3392,8 @@ class AgentController:
                 continue
             try:
                 root = project_key(session["root"])
+                if root in removed:
+                    continue
                 self.projects.setdefault(root, str(Path(session["root"]).resolve()))
                 groups.setdefault(root, {}).setdefault(session.get("chat_id", session["id"]), []).append((path, session))
             except (KeyError, TypeError, ValueError, OSError):
@@ -3249,7 +3478,7 @@ class AgentController:
         A `run` event has no step row of its own — the command was announced by the window, not the
         loop — so it becomes one here, in the past tense, matched to its stored record in order.
         """
-        arabic = is_arabic(turn.get("task", ""))
+        arabic = is_arabic(asked_of(turn.get("task", "")))
         records = turn.get("runs") or []
         rows: list[dict] = []
         seen_runs = 0
@@ -3290,7 +3519,7 @@ class AgentController:
         self.session, self.session_path = session, path
         self.review_file = 0
         if select:
-            self.title = session.get("task", "Saved task").replace("\n", " ")[:45]
+            self.title = asked_of(session.get("task", "Saved task")).replace("\n", " ")[:45]
             self.chat_id = session.get("chat_id", session["id"])
             self._loading_session = True
             try:
@@ -3311,9 +3540,15 @@ class AgentController:
             if len(events) > MAX_LOG_ENTRIES:
                 self.log_dropped = len(events) - MAX_LOG_ENTRIES
                 events = events[self.log_dropped:]
+            # Said, not printed: the records are audit rows, and a reopened list of
+            # `tool name=read_file path=pom.xml sha256=…` is the engine's notebook on the screen.
+            replay = is_arabic(asked_of(str(session.get("task", ""))))
             for entry in events:
+                # `audit` is what the client sorts by: these are records of what the task did, and the
+                # thread already carries each one as a row. The Activity list keeps the sentences about
+                # the task instead, and the reopened records go into the block under it.
                 self.log.append({"ts": str(entry.get("at", ""))[-8:], "kind": entry.get("kind", ""),
-                                 "text": " ".join(f"{k}={v}" for k, v in entry.items() if k not in {"at", "kind"})})
+                                 "text": log_line(replay, entry), "audit": True})
             reference = session.get("plan_reference")
             self.plan_file = str(Path(session["root"]) / reference["path"]) if reference else ""
             self.messages = []
@@ -3398,32 +3633,62 @@ class AgentController:
                              project=Path(self.session["root"]).name if self.session else "",
                              summary=(self.session or {}).get("summary") or "",
                              written=bool(changes) and state in MUTABLE_STATES | INTERRUPTED_STATES,
-                             has_project=bool(self.repo))
+                             has_project=bool(self.repo),
+                             rejected=bool(changes) and self.rejected())
 
     def _review(self) -> dict:
         session = self.session or {}
         changes = session.get("changes", [])
         state = session.get("state")
+        declined = self.rejected()
         files = []
         for change in changes:
             lines = _diff(change["before"] or "", change["after"] or "", change["path"])
+            added = [line[1:] for line in lines if line.startswith("+") and not line.startswith("+++")]
+            removed = [line[1:] for line in lines if line.startswith("-") and not line.startswith("---")]
+            summary = change.get("summary") or change.get("description")
+            if not summary:
+                # Describe observable edits, without guessing the model's intent or making another call.
+                names = list(dict.fromkeys(re.findall(
+                    r"^\s*(?:(?:async\s+)?def|class|function)\s+([\w$]+)",
+                    "\n".join(added + removed), re.MULTILINE)))[:3]
+                if not names:
+                    names = list(dict.fromkeys(re.findall(
+                        r"^\s*(?:export\s+)?(?:const|let|var)\s+([\w$]+)\s*=",
+                        "\n".join(added + removed), re.MULTILINE)))[:3]
+                if not names and Path(change["path"]).suffix.lower() in {".html", ".htm", ".vue", ".jsx", ".tsx"}:
+                    names = list(dict.fromkeys(re.findall(
+                        r"<([A-Za-z][\w-]*)\b", "\n".join(added + removed))))[:3]
+                action = "Removed" if change.get("delete") else "Added" if change["before"] is None else "Updated"
+                summary = (f"{action} {', '.join(names)}" if names else
+                           f"{action} file content: {len(added)} lines added, {len(removed)} removed")
             files.append({"path": change["path"],
+                          "summary": " ".join(str(summary).split())[:160],
                           "kind": ("D" if change.get("delete")
                                    else "A" if change["before"] is None else "M"),
                           "add": sum(1 for line in lines if line.startswith("+") and not line.startswith("+++")),
                           "del": sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))})
         chosen = changes[min(self.review_file, len(changes) - 1)] if changes else None
         return {
+            "id": str(session.get("id", "")) + ":" + str(session.get("proposal_hash", "")),
+            "pending": state == "WAITING_APPROVAL",
             "state": state_label(state), "tone": TONE.get(state or "", ""),
-            "title": session.get("task", "No proposal yet")[:120],
+            "title": asked_of(session.get("task", "No proposal yet"))[:120],
             "detail": (f"{len(changes)} file(s)"
                        + (" · attached plan " + session["plan_reference"]["path"] if session.get("plan_reference") else "")
                        + (" · proposal " + str(session.get("proposal_hash", ""))[:4] + "…"
                           + str(session.get("proposal_hash", ""))[-4:] if session.get("proposal_hash") else "")),
-            "canApply": state == "WAITING_APPROVAL" and not self.busy and not self.reading_only(),
+            "canApply": (state == "WAITING_APPROVAL" and not self.busy and not self.reading_only()
+                         and not declined),
             "canMutate": state in MUTABLE_STATES and not self.busy,
             "canRollback": (state in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"})
                            and not self.busy and not self.reading_only(),
+            # The answer to a question this window already asked: a declined proposal keeps its files
+            # listed and its diff readable, and loses the offer to write them.
+            "rejected": declined,
+            "canReopen": (state == "WAITING_APPROVAL" and declined and not self.busy
+                          and not self.reading_only()),
+            "reopenLabel": say(self.arabic, en="Reopen for review", ar="إعادة الفتح للمراجعة"),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
             "view": {
@@ -3496,6 +3761,8 @@ class AgentController:
             ui["queue"] = [dict(item) for item in self.queue[:20]]
         if self.model or self._pending_model:
             ui["model"] = self.model or self._pending_model
+        if hasattr(self, "_removed_projects"):
+            ui["removed_projects"] = list(self._removed_projects)
         self._saved_ui = ui
         try:
             atomic_json(self.app_dir / ".agent-projects.json", {

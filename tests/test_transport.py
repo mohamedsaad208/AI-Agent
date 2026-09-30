@@ -21,8 +21,9 @@ import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer.errors import ProviderError
-from ai_code_engineer.providers import NoRedirect, request_json
+from ai_code_engineer.errors import ProviderError, ProviderUnavailable
+from ai_code_engineer.providers import (NoRedirect, read_stream, request_json,
+                                         request_probe_with_retry)
 
 # Credential-shaped on purpose: the 401 body echoes it back, so a leak is visible as text.
 KEY = "sk-proj-a-synthetic-key-for-tests-0123456789"
@@ -82,6 +83,16 @@ class Probe(BaseHTTPRequestHandler):
         elif path == "/slow":
             time.sleep(3)
             self._send(200, json.dumps({"answer": "late"}))
+        elif path == "/flakey":
+            if self.server.hits.count(path) == 1:
+                # A daemon that is still coming up: the socket opens, no status is ever written, and
+                # the connection ends. There is no HTTP error to read here, which is exactly the class
+                # of failure a metadata probe may be asked again for — and a generation may not.
+                self.close_connection = True
+            else:
+                self._send(200, json.dumps({"answer": "second time"}))
+        elif path == "/silent":
+            self.close_connection = True
         else:
             self._send(404, json.dumps({"error": "no such route"}))
 
@@ -211,6 +222,47 @@ class Wire(unittest.TestCase):
         with self.assertRaises(ProviderError) as caught:
             request_json("http://127.0.0.1:%d/ok" % dead, timeout=3)
         self.assertIn("connection failed", str(caught.exception))
+
+    # ------------------------------ what may be asked a second time ------------------------------
+    def test_a_probe_that_reached_nothing_is_asked_once_more(self):
+        answer = request_probe_with_retry(self.url("/flakey"), timeout=5, pause=0)
+        self.assertEqual(answer["answer"], "second time")
+        self.assertEqual(self.server.hits, ["/flakey", "/flakey"],
+                         "the retry was a second request, not a re-read of the first")
+
+    def test_a_probe_stops_at_two_attempts(self):
+        with self.assertRaises(ProviderUnavailable):
+            request_probe_with_retry(self.url("/silent"), timeout=5, pause=0)
+        self.assertEqual(self.server.hits.count("/silent"), 2, "a bounded retry, not a loop")
+
+    def test_an_http_refusal_is_never_asked_again(self):
+        # 401 is the provider having answered. A second attempt would be a second credential check,
+        # and the sentence that promises no retry is the contract the round before this one added.
+        with self.assertRaises(ProviderError) as caught:
+            request_probe_with_retry(self.url("/denied"), key=KEY, timeout=5, pause=0)
+        self.assertNotIsInstance(caught.exception, ProviderUnavailable)
+        self.assertIn("no automatic retry or fallback", str(caught.exception))
+        self.assertEqual(self.server.hits, ["/denied"])
+
+    def test_a_generation_is_never_restarted(self):
+        """The one call this round must not touch: a stream that failed mid-flight is a model load
+        away from starting again, and the row the user is watching would restart under it."""
+        with self.assertRaises(ProviderUnavailable):
+            read_stream(self.url("/flakey"), {"model": "test-local"}, timeout=5)
+        self.assertEqual(self.server.hits, ["/flakey"], "one attempt, as before this round existed")
+
+    def test_the_unreachable_case_is_typed_rather_than_read_out_of_a_sentence(self):
+        # A retry that decided by matching "connection failed" in English would break the day someone
+        # reworded the message. The type carries it, and callers that only know ProviderError are
+        # unchanged — the assertion above still passes through the parent class.
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        dead = spare.getsockname()[1]
+        spare.close()
+        with self.assertRaises(ProviderError) as caught:
+            request_json("http://127.0.0.1:%d/ok" % dead, timeout=5)
+        self.assertIsInstance(caught.exception, ProviderUnavailable)
+        self.assertIn("connection failed", str(caught.exception).lower())
 
 
 if __name__ == "__main__":

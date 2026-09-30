@@ -205,9 +205,93 @@ class LedgerTests(unittest.TestCase):
 
 
 class StepLimitTests(unittest.TestCase):
-    def test_a_long_plan_stops_at_the_step_limit(self):
-        text = "\n".join(f"## Phase {n}: step {n}\nbody {n}" for n in range(1, 30))
-        self.assertEqual(len(planbook.parse_steps(text)), planbook.MAX_STEPS)
+    def test_a_long_plan_is_rejected_without_silent_truncation(self):
+        text = "\n".join(f"## Phase {n}: step {n}\nbody {n}" for n in range(1, 60))
+        with self.assertRaisesRegex(PolicyError, "59 steps; the limit is 50"):
+            planbook.parse_steps(text)
+
+    def test_lists_are_sequential_and_stop_at_sections(self):
+        rows = planbook.parse_steps("# Plan\n## Tasks\n1. **Setup**\n   - Maven\n   1. Nested\n"
+                                    "7) Login\n   - API\n## Details\n7. **JWT**\n   - Tokens\nAfterword")
+        self.assertEqual([r['id'] for r in rows], [1, 2, 3])
+        self.assertEqual([r['title'] for r in rows], ['Setup', 'Login', 'JWT'])
+        self.assertIn('Nested', rows[0]['body'])
+        self.assertEqual(rows[1]['body'], '- API')
+        self.assertEqual(rows[2]['body'], '- Tokens')
+
+    def test_heading_does_not_consume_next_line(self):
+        text = "## Tasks\n1. **Setup**\n   - Maven\n"
+        self.assertEqual(list(planbook.STEP_HEADING.finditer(text)), [])
+        rows = planbook.parse_steps(text)
+        self.assertEqual(rows[0]['title'], 'Setup')
+        self.assertEqual(rows[0]['body'], '- Maven')
+        rows = planbook.parse_steps("## 1.\nBody on next line")
+        self.assertEqual(rows[0]['title'], 'step 1')
+        self.assertEqual(rows[0]['body'], 'Body on next line')
+
+    def test_one_heading_wins_over_lists_and_code_examples(self):
+        rows = planbook.parse_steps("```md\n## 9. Example\n```\n## 1. Real\n1. Detail\n2. Detail two")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['title'], 'Real')
+        self.assertIn('Detail two', rows[0]['body'])
+        self.assertEqual(len(planbook.parse_steps("1) Real\n   ```\n   2. Example\n   ```\n")), 1)
+
+    def test_solitary_year_sentence_is_plain_text(self):
+        text = '2024. was a bad year'
+        self.assertEqual(planbook.parse_steps(text)[0]['body'], text)
+
+    def test_list_limit_and_windows_newlines(self):
+        text = '\r\n'.join(f'{i}. **Task {i}**\r\n   - Work' for i in range(1, 55))
+        with self.assertRaisesRegex(PolicyError, '54 steps; the limit is 50'):
+            planbook.parse_steps(text)
+        self.assertEqual(len(planbook.parse_steps('\n'.join(f'{i}) Task' for i in range(1, 51)))), 50)
+
+
+class LegacyLedgerTests(unittest.TestCase):
+    setUp = LedgerTests.setUp
+    open = LedgerTests.open
+
+    def legacy(self, status='pending', session_id=None):
+        text = '# Plan\n## Tasks\n1. **Setup**\n   - Maven\n2. Login\n   - API'
+        (self.repo / 'plan.md').write_text(text, encoding='utf-8')
+        text = self.ws.read('plan.md')['content'].strip()
+        path, book = self.open()
+        book['steps'] = [{'id': 1, 'title': '# Plan', 'body': text,
+                          'status': status, 'session_id': session_id, 'verified_at': None}]
+        planbook.atomic_json(path, book)
+        return path, path.read_bytes()
+
+    def test_untouched_fallback_is_rebuilt_without_overwriting_old_file(self):
+        path, saved = self.legacy()
+        _, book = self.open()
+        self.assertEqual([r['title'] for r in book['steps']], ['Setup', 'Login'])
+        self.assertEqual(path.read_bytes(), saved)
+        planbook.record_session(path, book, 1, 'new-session')
+        self.assertEqual(len(self.open()[1]['steps']), 2)
+
+    def test_linked_or_verified_fallback_is_preserved_and_blocks_restart(self):
+        for status, session in [('in_progress', None), ('pending', 'session'), ('verified', None)]:
+            with self.subTest(status=status):
+                # Remove only the test fixture so each case can seed its own legacy ledger.
+                for path in self.plans.glob('*.json'):
+                    path.unlink()
+                path, saved = self.legacy(status, session)
+                with self.assertRaisesRegex(PolicyError, 'progress was preserved'):
+                    self.open()
+                self.assertEqual(path.read_bytes(), saved)
+
+    def test_cached_fallback_cannot_bypass_the_step_limit(self):
+        text = '# Plan\n' + '\n'.join(f'{i}. Task {i}' for i in range(1, 55))
+        (self.repo / 'plan.md').write_text(text, encoding='utf-8')
+        reference = self.ws.read('plan.md')
+        path = self.plans / (planbook.key_for(str(self.ws.root), reference['sha256']) + '.json')
+        planbook.atomic_json(path, {'schema': 1, 'root': str(self.ws.root),
+            'plan_sha256': reference['sha256'], 'steps': [{'id': 1, 'title': '# Plan',
+                'body': reference['content'].strip(), 'status': 'in_progress', 'session_id': 'old'}]})
+        saved = path.read_bytes()
+        with self.assertRaisesRegex(PolicyError, '54 steps; the limit is 50'):
+            self.open()
+        self.assertEqual(path.read_bytes(), saved)
 
 
 if __name__ == "__main__":

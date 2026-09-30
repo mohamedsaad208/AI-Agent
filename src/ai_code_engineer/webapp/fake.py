@@ -172,6 +172,10 @@ class FakeController:
         # refuses because something edited the files afterwards, which a scripted window has no disk
         # to reproduce — so `rollback` here raises the offer on purpose, to keep the surface reviewable.
         self.git_restore_offer = None
+        # A declined proposal keeps its diff on screen and loses the offer to write it. The preview has
+        # to answer `reject` like the real window does, or the card gets reviewed against a button the
+        # shipped thing will not press.
+        self.declined = False
         self.timeout = 300
         self.recipe = "Maven test"
         # Three modules so the monorepo picker can be reviewed here: the scripted window answers to
@@ -205,6 +209,9 @@ class FakeController:
         self.memory = "Java 17, Spring Boot 3.2. Do not add dependencies. " \
                       "Keep controllers thin; put rules in the service layer."
         self.memory_info = "412 chars saved · demo2-8f2a.md · sent with every task here"
+        # The counts a provider reports for the scripted task, in the shape the real snapshot sends.
+        # The numbers are the ones the context-window comment had to measure by hand.
+        self.metrics = {"prompt_tokens": 2050, "completion_tokens": 180}
         self.step = 2
         self.runs = 0
         self.fix_round = 0
@@ -361,7 +368,7 @@ class FakeController:
                                {"id": 4, "title": "Protect the routes", "status": "pending", "current": self.step == 4},
                                {"id": 5, "title": "Refresh-token rotation", "status": "pending", "current": self.step == 5}]},
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
-                         "models": self.visible_models()},
+                         "models": self.visible_models(), "metrics": dict(self.metrics)},
             "connection": self.connection_info(),
             "overrides": self.overrides_info(),
             "recipes": self.target_recipes(), "recipe": self.recipe,
@@ -392,7 +399,7 @@ class FakeController:
                                                      "controller maps to 409; the existing create() "
                                                      "behaviour is untouched.",
                                              written=self.state in labels.MUTABLE_STATES,
-                                             has_project=True),
+                                             has_project=True, rejected=self.declined),
             # The preview is where a card like this gets reviewed, so it has to carry the same shape the
             # real controller sends — including the counts the header prints.
             "setup": {"show": self.setup_open, "rows": self.setup_rows,
@@ -434,12 +441,14 @@ class FakeController:
             "state": STATES.get(self.state, self.state), "tone": TONE.get(self.state, ""),
             "title": "Implement step 2: register the user and reject duplicate emails",
             "detail": f"{len(FILES)} files · attached plan plan.md · proposal 8f2a…c41b",
-            "canApply": self.state == "WAITING_APPROVAL" and not reading,
+            "canApply": self.state == "WAITING_APPROVAL" and not reading and not self.declined,
             "canMutate": self.state in labels.MUTABLE_STATES,
             # Roll back answers to a wider set than the other two, because an interrupted apply is
             # exactly when the escape has to be on screen. Without this field the preview window —
             # the one the design is reviewed in — shows a button that can never light up.
             "canRollback": (self.state in labels.MUTABLE_STATES | labels.INTERRUPTED_STATES) and not reading,
+            "rejected": self.declined,
+            "canReopen": self.state == "WAITING_APPROVAL" and self.declined and not reading,
             "files": files, "selected": self._file, "tab": self.tab,
             "view": {"diff": _diff(chosen["before"] or "", chosen["after"], name),
                      "before": (chosen["before"] or "").splitlines(),
@@ -600,11 +609,33 @@ class FakeController:
             self.unset_override(payload)
             return None
         if type == "send":
-            return self._send(payload.get("text", ""), emit)
+            return self._send(payload.get("text", ""), emit, payload.get("quote_of"))
         if type == "apply":
             if self.reading_only:
                 return self._refuse(intent.no_write("Apply"))
+            if self.declined:
+                return self._refuse("This proposal was declined. Reopen it for review first.")
             return self._confirm_then("apply", emit)
+        if type == "reopen":
+            if self.reading_only:
+                return self._refuse(intent.no_write("Reopen"))
+            if self.state == "WAITING_APPROVAL" and self.declined:
+                self.declined = False
+                self.status_line = "Proposal reopened for review. Nothing was written."
+                self._note(emit, "proposal_reopened", self.status_line)
+            return None
+        if type == "reject":
+            if self.reading_only:
+                # The preview refuses a refusal for the same reason the real window does: the seal is a
+                # position about this folder, not about whichever diff is on screen.
+                return self._refuse(intent.no_write("Reject"))
+            self.declined = True
+            text = labels.rejected_note(arabic=False, count=len(FILES))
+            self.messages.append({"role": "tool", "author": "Tool", "text": text, "time": _clock()})
+            emit({"kind": "message", "message": self.messages[-1]})
+            self._note(emit, "rejected", text)
+            self.status_line = "Proposal declined. Nothing was written."
+            return None
         if type == "run":
             return self._run(payload.get("fix"), emit)
         if type == "rollback":
@@ -663,7 +694,7 @@ class FakeController:
         elif type == "select_tab":
             self.tab = str(payload.get("tab", "diff"))
         elif type == "queue_add":
-            text = str(payload.get("text", "")).strip()
+            text = self.with_quote(str(payload.get("text", "")).strip(), payload.get("quote_of"))
             if text:
                 self.queue.append({"id": "q%d" % (len(self.queue) + 3), "text": text,
                                    "at": "now", "detached": False})
@@ -802,7 +833,32 @@ class FakeController:
             emit({"kind": "toast", "text": "Not scripted in this preview: " + str(type)[:40]})
         return None
 
-    def _send(self, text: str, emit) -> None:
+    def quoted(self, index: object) -> tuple[str, str] | None:
+        """The preview's copy of the reference lookup, from its own scripted thread.
+
+        Same rule as the real window: the quotation is read out of the record rather than sent in, so
+        what the reviewed prompt shows is a message this conversation actually had.
+        """
+        try:
+            position = int(index)
+        except (TypeError, ValueError):
+            return None
+        rows = self.messages
+        if not 0 <= position < len(rows):
+            return None
+        words = " ".join(str(rows[position].get("text", "")).split())
+        if not words:
+            return None
+        return str(rows[position].get("role", "assistant")), words[:labels.QUOTE_CHARS]
+
+    def with_quote(self, text: str, index: object) -> str:
+        quoted = self.quoted(index)
+        if not quoted:
+            return text
+        return labels.quote_reference(False, quoted[0], quoted[1]) + text
+
+    def _send(self, text: str, emit, quote_of: object = None) -> None:
+        text = self.with_quote(text, quote_of)
         if not text:
             return None
         self.messages.append({"role": "user", "author": "You", "time": _clock(), "text": text})
@@ -810,6 +866,7 @@ class FakeController:
         if self.reading_only:
             return self._analyse(emit)
         self.busy = self.cancellable = True
+        self.declined = False        # a new message means a new proposal, which is answerable again
         self.pending = "connecting to the model…"
         emit({"kind": "busy", "value": True, "cancellable": True})
 
@@ -1089,8 +1146,10 @@ PREVIEW_ONLY = {
     "bind_chat": "Preview only: moving a chat onto a project is a sidebar drag.",
     "open": "Preview only: opening a saved task reads its session from disk.",
     "reveal": "Preview only: this opens Explorer on the granted folder.",
+    "remove_project": "Preview only: the real window removes the project from the sidebar.",
     "example": "Preview only: the sample fills the composer with a real task.",
     "set_icon": "Preview only: the icon is saved with that project's preferences.",
+    "complete_step": "Preview only: marks a plan step verified in the ledger.",
 }
 
 """One drawer payload per scripted project. Every key the real controller sends is here,

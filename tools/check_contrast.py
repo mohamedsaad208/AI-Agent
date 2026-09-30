@@ -58,6 +58,12 @@ PAIRS = [
     ("ink-2", "field", "file chip label"),
     ("faint", "field", "file chip view action"),
     ("ink-2", "panel", "rail file row"),
+    # UI 4.6 draws the added/removed pair on every surface that names a file, and both numbers are
+    # small mono text, so they are graded rather than assumed to inherit the diff line's numbers.
+    ("ok", "field", "file chip added count"),
+    ("bad", "field", "file chip removed count"),
+    ("ok", "panel", "card added count"),
+    ("bad", "panel", "card removed count"),
 ]
 
 # Not audited here: the per-project chip in the sidebar is coloured from the folder name by

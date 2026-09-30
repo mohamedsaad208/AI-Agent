@@ -770,6 +770,189 @@ class TheWriteCardAndTheChips(unittest.TestCase):
         self.assertIn("ARABIC_RUN.test(m.text) ? 'rtl' : 'auto'", self.flat)
 
 
+class TheCountsOnTheChangeCard(unittest.TestCase):
+    """UI 4.6: a card that names four files says how big each change is, from numbers already sent.
+
+    `review.files[].add` and `.del` have been on the wire since UI 3.1, but only the preview header
+    drew them — so the compact card in the thread listed paths and left the reader to open four round
+    trips to find out which one was three lines. One builder draws the pair now, on every surface that
+    names a file, and the badge for a write nobody asked for hangs off the same server flag as the
+    sentence beside it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.flat = " ".join(cls.js.split())
+
+    def test_one_builder_draws_the_pair_wherever_a_file_is_named(self):
+        self.assertEqual(self.js.count("function diffStat("), 1)
+        self.assertEqual(self.js.count("diffStat(f)"), 3,
+                         "one definition plus the chip and the rail row — a fourth is a second copy")
+        self.assertIn("diffStat(file)", self.flat, "the preview header")
+        self.assertNotIn('+${file.add}', self.js,
+                         "a second hand-built copy of the pair is how the two surfaces drift")
+
+    def test_the_card_totals_the_set_only_when_there_is_a_set_to_total(self):
+        self.assertIn("+ diffStat(diffTotals(r.files))", self.flat)
+        self.assertIn("add += f.add || 0", self.js)
+        self.assertNotIn("diffTotals(r.files)", self.js.split("function chipCard")[0],
+                         "the aggregate is the card's, not a second reader somewhere else")
+
+    def test_the_badge_and_the_sentence_answer_to_the_same_server_flag(self):
+        self.assertIn("const auto = DATA.banner && DATA.banner.text;", self.flat)
+        self.assertIn('class="chip-tag auto"', self.js)
+        self.assertIn("esc(DATA.banner.text)", self.flat,
+                      "the badge is chrome; the sentence about the write stays the server's")
+
+    def test_the_pair_is_coloured_once_and_never_mirrors(self):
+        self.assertEqual(self.css.count(".dstat .p"), 1)
+        self.assertNotIn(".pv-head .num .p", self.css)
+        rule = self.css.split(".dstat {", 1)[1].split("}", 1)[0]
+        self.assertIn("direction: ltr", rule, "+12 -3 must not read -3 +12 on an RTL page")
+        self.assertIn("font-family: var(--mono)", rule)
+
+
+class TheRefusalOnBothSurfaces(unittest.TestCase):
+    """UI 4.6: Reject is a verb the scripted window answers too, with the same fields the real one sends.
+
+    `--fake` is where a card gets reviewed, so a refusal that only exists in `controller.py` would be
+    reviewed as a dead button — the exact class of gap the field lists in this file exist to catch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+
+    def test_the_refusal_is_offered_in_the_same_window_as_the_offer(self):
+        block = self.js.split("function changeActions")[1].split("\n}\n")[0]
+        self.assertIn("reject.disabled = !r.canApply;", block,
+                      "Declining means the same thing about the clock that applying does")
+        self.assertIn("send('reject')", block)
+        self.assertIn("send('reopen')", block)
+        self.assertIn("reopen.disabled = !r.canReopen;", block)
+        self.assertEqual(block.count("el('button'"), 5,
+                         "Apply, Reject, Check syntax, Roll back, Reopen for review")
+
+    def test_the_preview_declines_a_proposal_the_same_way(self):
+        import time
+        controller = FakeController()
+        events = []
+        controller.action("send", {"text": "reject duplicate emails"}, events.append)
+        deadline = time.time() + 8
+        while time.time() < deadline and not controller.snapshot()["review"]["canApply"]:
+            time.sleep(0.05)
+        self.assertTrue(controller.snapshot()["review"]["canApply"], "the preview never offered Apply")
+        controller.action("reject", {}, events.append)
+        state = controller.snapshot()
+        self.assertTrue(state["review"]["rejected"])
+        self.assertFalse(state["review"]["canApply"])
+        self.assertEqual(state["artifact"]["state"], "Rejected")
+        rows = " ".join(message["text"] for message in state["messages"] if message["role"] == "tool")
+        self.assertIn("declined", rows.lower(), "the thread has to show the answer was given")
+        # The fake flattens the log entry into the event, so the row's own kind is the event's kind.
+        self.assertIn("rejected", [event.get("kind") for event in events],
+                      "a refusal that never reached the Activity list is a click nobody could audit")
+        controller.action("apply", {}, events.append)
+        self.assertEqual(controller.state, "WAITING_APPROVAL", "the preview cannot apply a declined proposal")
+        controller.action("reopen", {}, events.append)
+        self.assertTrue(controller.snapshot()["review"]["canApply"])
+        self.assertFalse(controller.snapshot()["review"]["rejected"])
+        self.assertEqual(controller.state, "WAITING_APPROVAL", "reopening does not write files")
+        self.assertFalse(any(event.get("kind") == "toast" and "Not scripted" in event.get("text", "")
+                             for event in events), "handled decisions must not report unknown actions")
+
+
+class TheCompactThread(unittest.TestCase):
+    """UI 4.6: the thread says more per screen without hiding anything to get there.
+
+    The density came from a spacing scale rather than from shrinking type: `tokens.css` had widths,
+    radii, shadows and timings but no spacing, so every padding in the app was a number of its own and
+    the chat had grown to about 45 pixels of chrome per message.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.tokens = (static / "tokens.css").read_text(encoding="utf-8")
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+
+    def test_there_is_a_spacing_scale_and_the_chat_uses_it(self):
+        import re
+        scale = dict(re.findall(r"(--sp-\d):\s*(\d+)px", self.tokens))
+        self.assertEqual(sorted(scale), ["--sp-1", "--sp-2", "--sp-3", "--sp-4", "--sp-5"],
+                         "the scale has to be one run of steps, not a pile of one-offs")
+        self.assertLess(int(scale["--sp-1"]), 8, "it starts at a hair, not at a default")
+        for rule in ("\n.thread {", "\n.body {", "\n.bub {", "\n.mhead {", "\n.scroll {"):
+            block = self.css.split(rule, 1)[1].split("}", 1)[0]
+            self.assertIn("var(--sp-", block, rule.strip() + " still carries its own magic number")
+
+    def test_the_old_chrome_is_gone_rather_than_parked_next_to_the_new(self):
+        self.assertNotIn("gap: 22px", self.css, ".thread grew back its old rhythm")
+        self.assertNotIn("padding: 12px 15px", self.css, ".bub kept its old padding beside the new one")
+        who = self.css.split(".who {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("margin-bottom", who, "the name line is inside .mhead now")
+
+    def test_the_answer_lost_its_line_and_the_prompt_lost_its_own(self):
+        self.assertIn(".mhead { display: flex; align-items: baseline;", self.css)
+        self.assertIn(".mhead .macts { margin-inline-start:", self.css)
+        self.assertIn(".bubline { display: flex; align-items: flex-end;", self.css)
+        block = self.css.split("\n.bub {", 1)[1].split("}", 1)[0]
+        self.assertIn("line-height: 1.52", block, "the bubble's own rhythm is what made it tall")
+
+    def test_actions_reveal_for_pointer_and_keyboard(self):
+        self.assertIn("opacity: 0", self.css.split("\n.macts {", 1)[1].split("}", 1)[0])
+        self.assertIn(".msg:hover .macts, .msg:focus-within .macts", self.css)
+
+
+class TheQuietActivityList(unittest.TestCase):
+    """UI 4.6: Activity shows what happened to the task, and the transcript lives in a block under it.
+
+    A reopened task used to rebuild every stored record as a row in the same list, and a build streamed
+    up to three hundred lines into it — so the list a reader wanted (connections, errors, milestones)
+    was buried under the list nobody reads twice. The rows are split by a flag the server puts on them,
+    not by guessing at kind names, and a closed block costs no DOM.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.html = (static / "index.html").read_text(encoding="utf-8")
+
+    def test_the_main_list_takes_the_sentences_and_the_block_takes_the_records(self):
+        body = self.js.split("function renderLog()")[1].split("\n}\n")[0]
+        self.assertIn("for (const entry of DATA.log) if (!entry.audit) appendLog(entry);", body)
+        self.assertNotIn("for (const entry of LIVE) appendLog(entry);", body,
+                         "streamed lines no longer land in the list a reader scans")
+        appender = self.js.split("function appendLog(")[1].split("\n}\n")[0]
+        self.assertIn("if (entry.audit || entry.stream)", appender)
+
+    def test_both_sources_still_reach_the_block(self):
+        self.assertIn("function rawRows() { return DATA.log.filter((entry) => entry.audit).concat(LIVE); }",
+                      " ".join(self.js.split()))
+
+    def test_the_block_is_closed_by_default_and_out_of_the_way_when_empty(self):
+        self.assertIn('<details class="rawstream" id="raw" hidden>', self.html)
+        self.assertNotIn('<details class="rawstream" id="raw" open>', self.html)
+        self.assertIn(".rawstream > summary", self.css)
+
+    def test_a_closed_block_is_counted_rather_than_painted(self):
+        body = self.js.split("function renderLog()")[1].split("\n}\n")[0]
+        self.assertIn("if (rawOpen()) paintRaw(rows); else rawDirty = true;", body)
+        toggle = self.js.split("$('raw').addEventListener('toggle'")[1].split("\n});")[0]
+        self.assertIn("if (rawOpen() && rawDirty) paintRaw(rawRows());", toggle)
+
+    def test_a_row_that_carries_lines_keeps_them(self):
+        rule = self.css.split(".log .m {", 1)[1].split("}", 1)[0]
+        self.assertIn("white-space: pre-wrap", rule, "a traceback folded onto one line is not readable")
+
+
 class TheChangesPaneIsGone(unittest.TestCase):
     """UI 4.0: the Changes pane was deleted, not hidden — "ملهاش لازمة … عايز أشيلها خالص".
 
@@ -859,10 +1042,14 @@ class TheChangesPaneIsGone(unittest.TestCase):
         self.assertIn("SHEET = null; state.railFile = -1; renderRail();", body)
 
     def test_the_snapshot_still_sends_every_field_the_viewer_reads(self):
-        """The pane was a consumer of `review`, not its owner: deleting it must not shave a field."""
+        """The pane was a consumer of `review`, not its owner: deleting it must not shave a field.
+
+        `rejected` is the answer to UI 4.6's Refuse button, and it is in this list because the card
+        greys Apply out from it — a field only one controller sends is a button that lies on the other.
+        """
         import tempfile
         needed = {"state", "tone", "title", "detail", "canApply", "canMutate", "canRollback",
-                  "files", "selected", "tab", "view"}
+                  "rejected", "canReopen", "files", "selected", "tab", "view"}
         with tempfile.TemporaryDirectory() as temp:
             real = AgentController(Path(temp))
             self.addCleanup(real.close)
@@ -911,8 +1098,37 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
     def test_an_arriving_line_is_escaped_and_the_first_one_makes_its_own_bubble(self):
         body = self.js.split("function appendToken(")[1].split("\n}\n")[0]
         self.assertIn("renderThread();", body, "the first chunk arrives before the bubble exists")
-        self.assertIn("$('scroller').scrollTop", body)
         self.assertIn('<span class="typing-line">${esc(STREAM || DATA.pending)}</span>', self.js)
+
+    def test_an_arriving_line_follows_only_a_reader_who_was_at_the_end(self):
+        """UI 4.6: the stream used to scroll on every chunk. Reading a line higher up while a reply
+        arrived was not possible — the next token pinned you back to the bottom."""
+        body = self.js.split("function appendToken(")[1].split("\n}\n")[0]
+        self.assertIn("const stick = atBottom(scroller);", body)
+        self.assertIn("if (stick) toBottom(scroller);", body)
+        self.assertNotIn("$('scroller').scrollTop =", body,
+                         "an unconditional follow is a bulldozer, not a scroll")
+        log = self.js.split("function appendLog(")[1].split("\n}\n")[0]
+        self.assertIn("const stick = atBottom(host);", log)
+        self.assertIn("if (stick) toBottom(host);", log)
+
+    def test_the_wait_is_counted_and_the_count_outlives_the_chunks(self):
+        """One repeating timer in the whole app, and its face is a sibling of the node the stream
+        rewrites — anything inside `.typing-line` is deleted by the next arriving line, which is the
+        same reason the copy button lives outside the bubble."""
+        self.assertEqual(self.js.count("setInterval("), 1, "the app has one clock and it is this one")
+        start = self.js.index("msg.innerHTML = `")
+        template = self.js[start:self.js.index("thread.appendChild(msg);", start)]
+        self.assertIn('<span class="typing-line">${esc(STREAM || DATA.pending)}</span>', template)
+        self.assertIn('<span class="typing-clock"></span>', template)
+        self.assertLess(template.index("typing-line"), template.index("typing-clock"))
+        self.assertIn("if (busy) startClock(); else stopClock();", self.js)
+        self.assertIn("clearInterval(TICK)", self.js.split("function stopClock()")[1].split("\n}\n")[0])
+
+    def test_the_counter_reads_minutes_and_seconds(self):
+        body = self.js.split("function clockFace(")[1].split("\n}\n")[0]
+        self.assertIn("String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0')", body)
+        self.assertIn("Math.floor(seconds / 60)", body)
 
     def test_the_buffer_is_cleared_at_both_ends_of_a_job(self):
         # a stale stream would reappear under the next question, and the finished answer must not
@@ -1146,11 +1362,15 @@ class TheBranchChip(unittest.TestCase):
 
 
 class TheRowCopyButton(unittest.TestCase):
-    """Every message the server produced can be copied; the user's own rows are not offered.
+    """Every row with words in it can be copied and answered — the operator's own included.
 
     Two constraints shaped this. A row action bound inside the bubble dies the first time a reply
-    streams, because `appendToken` rewrites that node's innerHTML; and the clipboard has to receive
-    the text the server wrote, not the markup the browser built from it.
+    streams, because `appendToken` rewrites that node's innerHTML; and the clipboard has to receive the
+    text the server wrote, not the markup the browser built from it.
+
+    UI 4.6 changed one thing this class used to hold: copy used to be offered only on the server's rows,
+    on the reasoning that your own prompt is text you already have. "Answer that" does not care who said
+    it, and a prompt you typed is exactly the text you want on the clipboard somewhere else.
     """
 
     @classmethod
@@ -1159,29 +1379,46 @@ class TheRowCopyButton(unittest.TestCase):
         cls.js = (static / "app.js").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
 
-    def test_it_is_offered_on_server_rows_and_not_on_yours(self):
-        self.assertIn("if (m.role !== 'user' && (m.text || '').trim()) body.appendChild(msgActions(i));",
-                      self.flat)
-        self.assertNotIn("if (m.role === 'user') body.appendChild(msgActions", self.js)
+    def test_it_is_offered_on_every_row_that_has_words_in_it(self):
+        self.assertIn("if ((m.text || '').trim()) slot.appendChild(msgActions(i));", self.flat)
+        self.assertNotIn("if (!actions &&", self.js,
+                         "the second placement is gone; one line holds them for every row")
+        self.assertNotIn("m.role !== 'user'", self.js,
+                         "the row that excluded the operator's own messages is gone")
+
+    def test_an_answer_carries_its_actions_on_the_line_it_already_had(self):
+        """UI 4.6: the name, the minute and the row's icons are one line. They used to be two, and the
+        answer is the row an operator reads most — then the live window showed a prompt still paying for
+        a line of its own, which is what `.bubline` is for."""
+        body = self.js.split("function renderThread()")[1].split("function msgActions")[0]
+        self.assertIn("slot.appendChild(el('span', 'who'", body)
+        self.assertIn("slot = el('div', 'mhead')", body)
+        self.assertIn("slot = el('div', 'bubline')", body)
+        self.assertEqual(body.count("msgActions(i)"), 1,
+                         "placed once per row, into whichever line the row already has")
 
     def test_the_button_lives_outside_the_bubble_it_survives(self):
         """A handler attached inside `.bub` is deleted by the next streamed chunk."""
         body = self.js.split("function renderThread()")[1].split("function msgActions")[0]
-        self.assertIn("body.appendChild(msgActions(i))", body)
+        self.assertIn("slot.appendChild(msgActions(i))", body)
         self.assertNotIn("bub.appendChild(msgActions", body)
 
-    def test_the_icon_is_there_without_needing_a_hover(self):
+    def test_the_prompt_line_is_a_flex_row_and_not_a_stack(self):
         css = (Path(__file__).resolve().parents[1] /
                "src/ai_code_engineer/webapp/static/app.css").read_text(encoding="utf-8")
-        block = css.split(".macts {", 1)[1].split("}", 1)[0]
-        self.assertNotIn("opacity", block,
-                         "a copy button that only appears while the pointer crosses its row is a "
-                         "control nobody finds")
-        self.assertNotIn(".msg:hover .macts", css)
+        self.assertIn(".bubline { display: flex; align-items: flex-end;", css)
+        self.assertIn(".bubline .bub { min-width: 0 }", css,
+                      "a prompt that wraps has to wrap inside its line, not push the icons off it")
+
+    def test_touch_users_can_still_find_the_icons(self):
+        css = (Path(__file__).resolve().parents[1] /
+               "src/ai_code_engineer/webapp/static/app.css").read_text(encoding="utf-8")
+        self.assertIn("@media (hover: none) { .macts { opacity: 1 } }", css)
 
     def test_one_delegated_listener_answers_the_whole_thread(self):
         self.assertEqual(self.js.count("$('thread').addEventListener('click'"), 1)
         self.assertIn("event.target.closest('[data-copy-row]')", self.js)
+        self.assertIn("event.target.closest('[data-quote-row]')", self.js)
 
     def test_it_copies_the_message_text_rather_than_the_rendered_markup(self):
         handler = self.js.split("$('thread').addEventListener('click'")[1].split("});")[0]
@@ -1189,10 +1426,74 @@ class TheRowCopyButton(unittest.TestCase):
         self.assertNotIn("innerHTML", handler, "a copied bubble carries the markdown back out")
 
     def test_the_row_index_is_resolved_against_the_live_thread(self):
-        """A stale index would copy the wrong message; the dataset is written from the same loop
-        that renders, and read back through DATA.messages at click time."""
+        """A stale index would copy or quote the wrong message; both datasets are written from the same
+        loop that renders, and read back through DATA.messages at click time."""
         self.assertIn("copy.dataset.copyRow = index;", self.flat)
-        self.assertIn("DATA.messages[Number(hit.dataset.copyRow)]", self.flat)
+        self.assertIn("quote.dataset.quoteRow = index;", self.flat)
+        self.assertIn("DATA.messages[Number(copy.dataset.copyRow)]", self.flat)
+        self.assertIn("quoteRow(Number(quoted.dataset.quoteRow))", self.flat)
+
+    def test_the_reference_travels_as_a_row_number_and_not_as_text(self):
+        """The quotation is the server's to read. A payload carrying the words would let a browser
+        quote an exchange that never happened."""
+        self.assertIn("const quote = state.quote >= 0 ? { quote_of: state.quote } : {};", self.flat)
+        self.assertNotIn("quote_text", self.js)
+        self.assertNotIn("quoted_words", self.js, "no quoted body leaves this window")
+
+    def test_a_stale_reference_dies_with_the_thread_it_pointed_into(self):
+        self.assertIn("if (state.quote >= ((data.messages || []).length)) state.quote = -1;", self.flat)
+        self.assertIn("renderQueue(); renderSetup(); renderQuote();", self.flat)
+
+
+class TheReferenceBanner(unittest.TestCase):
+    """UI 4.6: what the next message answers is shown above the box it is sent from, and costs nothing
+    when there is nothing quoted.
+
+    The composer's own card is `[textarea][chip bar]`, so the banner is a sibling above it in the dock —
+    the same `:empty` trick the first-run card uses to stay out of the layout. Its text is escaped: a
+    quoted message is untrusted words the model wrote, and this row is inside the page's DOM.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.html = (static / "index.html").read_text(encoding="utf-8")
+        cls.flat = " ".join(cls.js.split())
+
+    def test_it_sits_above_the_textarea_and_is_a_region_of_its_own(self):
+        dock = self.html.split('<div class="dock">')[1].split('</div>\n      </section>')[0]
+        self.assertLess(dock.index('id="queue"'), dock.index('id="quote"'),
+                        "the reference belongs above what it answers, not below it")
+        self.assertLess(dock.index('id="quote"'), dock.index('id="composer"'))
+        self.assertIn('aria-label="Message being answered"', self.html)
+
+    def test_an_empty_banner_takes_no_line(self):
+        self.assertIn(".quotebar:empty { display: none }", self.css)
+
+    def test_the_row_being_answered_says_so_on_its_own_button(self):
+        """Nothing rebuilds the thread when a row is picked, so the pressed state has to be written onto
+        the buttons already in the DOM — a control that keeps insisting it was not used is a control the
+        operator presses again. Live in the scripted window: after a click the banner was filled while
+        `aria-pressed` stayed `false`."""
+        body = self.js.split("function renderQuote()")[1].split("\n}\n")[0]
+        self.assertIn("querySelectorAll('#thread [data-quote-row]')", body)
+        self.assertIn("aria-pressed", body)
+
+    def test_the_quoted_words_are_escaped_and_short(self):
+        body = self.js.split("function renderQuote()")[1].split("\n}\n")[0]
+        self.assertIn("replyPill(shown, state.quote)", body)
+        self.assertIn("esc(preview)", self.js.split("function replyPill(")[1].split("function renderQuote")[0])
+        self.assertNotIn("innerHTML = `<", body, "a banner built from markup carries the row back out")
+        self.assertIn("words.slice(0, 180)", body)
+
+    def test_closing_the_banner_clears_the_reference_it_stood_for(self):
+        body = self.js.split("function renderQuote()")[1].split("\n}\n")[0]
+        self.assertIn("state.quote = -1; renderQuote();", body)
+        self.assertIn("state.quote = -1; renderQuote();", self.js.split("function submit()")[1]
+                      .split("function autosize")[0],
+                      "a reference that outlived its own Send would quote the next message too")
 
 
 class TheModelSheetFilter(unittest.TestCase):

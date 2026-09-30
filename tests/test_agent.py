@@ -85,6 +85,45 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(session["state"], "WAITING_APPROVAL")
         self.assertEqual((self.root / "app.py").read_text(), "answer = 1\n")
 
+    def test_declined_proposal_requires_explicit_reopening(self):
+        path = self.draft()
+        session = load_session(path)
+        approved = session["proposal_hash"]
+        engine.event(session, "proposal_rejected", hash=approved)
+        atomic_json(path, session)
+        with self.assertRaisesRegex(PolicyError, "declined"):
+            apply_proposal(path, approved)
+        self.assertEqual((self.root / "app.py").read_text(), "answer = 1\n")
+        with self.assertRaises(PolicyError):
+            engine.reopen_proposal(path, "wrong")
+        reopened = engine.reopen_proposal(path, approved)
+        self.assertFalse(engine.proposal_rejected(reopened))
+        self.assertEqual(reopened["state"], "WAITING_APPROVAL")
+        self.assertEqual((self.root / "app.py").read_text(), "answer = 1\n")
+        self.assertEqual(apply_proposal(path, approved)["state"], "APPLIED_UNVERIFIED")
+
+    def test_reopening_does_not_bypass_stale_file_checks(self):
+        path = self.draft()
+        session = load_session(path)
+        approved = session["proposal_hash"]
+        engine.event(session, "proposal_rejected", hash=approved)
+        atomic_json(path, session)
+        (self.root / "app.py").write_text("answer = 99\n")
+        engine.reopen_proposal(path, approved)
+        with self.assertRaisesRegex(PolicyError, "changed since planning"):
+            apply_proposal(path, approved)
+        self.assertEqual((self.root / "app.py").read_text(), "answer = 99\n")
+
+    def test_latest_decision_is_scoped_to_the_proposal_hash(self):
+        session = {"proposal_hash": "new", "events": []}
+        engine.event(session, "proposal_rejected", hash="old")
+        self.assertFalse(engine.proposal_rejected(session))
+        engine.event(session, "proposal_rejected", hash="new")
+        engine.event(session, "proposal_reopened", hash="new")
+        self.assertFalse(engine.proposal_rejected(session))
+        engine.event(session, "proposal_rejected", hash="new")
+        self.assertTrue(engine.proposal_rejected(session))
+
     def test_a_delete_lands_and_rollback_brings_the_file_back(self):
         """D31: the workspace had no delete verb, so the only way a file left the project was a
         rollback of a create. The undo has to key off the entry's own flag, because for a removal
@@ -1459,6 +1498,40 @@ class TheSymbolVerbs(unittest.TestCase):
         self.assertIn('"call"', told)
         self.assertIn("src/caller.py", told)
 
+    def test_an_answer_cut_at_the_cap_says_it_was_cut(self):
+        """40 sites returned is either the whole truth or the ceiling, and the model cannot tell which.
+
+        `list_files` already answers with a `truncated` field; these two verbs used to answer without
+        one, which is how a small model concludes "this name is used 40 times" and stops looking.
+        """
+        for number in range(8):
+            body = "\n".join(f"add({number}, {slot})" for slot in range(8))
+            (self.ws.root / f"many{number}.py").write_text(body + "\n", encoding="utf-8", newline="\n")
+        session, told = self.ask({"action": "find_references", "query": "add"})
+        self.assertIn('"truncated": true', told)
+        self.assertIn("truncated at 40 matches; more references exist in the repository", told)
+        # The per-file ceiling is a rule the answer always obeys, so it is stated rather than inferred:
+        # one file with twenty uses reports six and would otherwise look complete.
+        self.assertIn('"per_file": 6', told)
+        rows = [row for row in session["events"]
+                if row["kind"] == "tool" and row["name"] == "find_references"]
+        self.assertEqual([row["truncated"] for row in rows], [True], "the record says it too")
+        self.assertEqual(rows[0]["count"], 40, "what was shown is 40, what existed was more")
+
+    def test_a_complete_answer_says_it_is_complete(self):
+        """`truncated: false` is the half that makes the flag worth reading — absence is not a no."""
+        _session, told = self.ask({"action": "find_references", "query": "add"})
+        self.assertIn('"truncated": false', told)
+        self.assertNotIn("truncated at", told)
+
+    def test_a_declaration_list_cut_at_the_cap_says_it_was_cut(self):
+        for number in range(45):
+            (self.ws.root / f"d{number}.py").write_text("def thing():\n    return 1\n",
+                                                        encoding="utf-8", newline="\n")
+        _session, told = self.ask({"action": "find_symbol", "query": "thing"})
+        self.assertIn('"truncated": true', told)
+        self.assertIn('"declarations"', told)
+
     def test_a_name_the_project_does_not_declare_is_answered_as_an_answer(self):
         """Empty is information. The guidance that follows is what stops a small model searching for the
         same name again instead of proposing the file the plan asks for."""
@@ -1474,6 +1547,33 @@ class TheSymbolVerbs(unittest.TestCase):
         _session, told = self.ask({"action": "find_references", "query": "register"})
         self.assertIn('"sites": []', told)
         self.assertNotIn("register-with-eureka", told)
+
+    def test_the_counts_of_every_turn_land_on_the_record(self):
+        """What one task cost, summed over its turns, from the numbers the server measured.
+
+        The tool has always been able to guess a prompt's size with `estimate_tokens`; only the
+        provider knows how many tokens it actually read, and that is the reading that shows a context
+        was cut in half — which has looked, until now, like a model that could not code.
+        """
+        class Counting(RecordingProvider):
+            def generate(self, messages):
+                self.metrics = {"prompt_tokens": 100 * (len(self.prompts) + 1),
+                                "completion_tokens": 5}
+                return super().generate(messages)
+
+        provider = Counting([{"action": "find_symbol", "query": "add"},
+                             {"action": "read_file", "path": "src/main.py"}, self.proposal()])
+        path = plan(self.ws, "fix add", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        self.assertEqual(load_session(path)["metrics"],
+                         {"prompt_tokens": 600, "completion_tokens": 15},
+                         "three turns: 100 + 200 + 300 prompt tokens")
+
+    def test_a_provider_that_measured_nothing_leaves_the_number_absent(self):
+        """`RecordingProvider` owns no transport, so the record says nothing about cost — rather than
+        a zero that reads as "this answer was free"."""
+        session, _told = self.ask({"action": "find_symbol", "query": "add"})
+        self.assertNotIn("metrics", session)
 
     def test_a_query_with_the_wrong_fields_is_refused_with_the_shape_named(self):
         _session, told = self.ask({"action": "find_symbol", "path": "src/main.py"},

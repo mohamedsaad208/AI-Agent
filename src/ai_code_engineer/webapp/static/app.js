@@ -18,6 +18,13 @@ const esc = (s) => String(s == null ? '' : s)
 const TONES = new Set(['idle', 'ok', 'warn', 'bad']);
 const tone = (name) => (TONES.has(name) ? ` ${name}` : '');
 
+/* One rule for every surface that follows its own end: follow only when the reader was already there.
+   `renderThread` measured this before rebuilding; the arriving stream and the Activity list scrolled
+   unconditionally on every chunk, so a line higher up could not be read while a job was printing. */
+const BOTTOM = 80;
+function atBottom(host) { return host.scrollTop + host.clientHeight >= host.scrollHeight - BOTTOM; }
+function toBottom(host) { host.scrollTop = host.scrollHeight; }
+
 const ICON = {
   file: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3v5h5"/><path d="M6 3h8l5 5v13H6z"/></svg>',
   plus: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>',
@@ -27,6 +34,7 @@ const ICON = {
   spark: '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>',
   branch: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="17.5" cy="8" r="2.2"/><path d="M6 7.7v10.8M17.5 10.2c0 3.2-2.4 4.6-5 5.1-1.9.4-3.3.9-4.3 1.6"/></svg>',
   copy: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5.5H6a1.5 1.5 0 0 0-1.5 1.5v9"/></svg>',
+  reply: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5 4 10l5 5"/><path d="M4 10h9a6 6 0 0 1 6 6v3"/></svg>',
   lock: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>',
 };
 
@@ -36,11 +44,19 @@ const state = {
   // Which change the rail is previewing (an index into review.files, because the server's own
   // selection is what carries the diff), and which of its tabs is showing.
   railFile: -1, railTab: 'diff',
+  railSection: '',
+  unread: { changes: false, tasks: false, activity: false },
+  lastFilesCount: -1, lastPlanStep: -1, lastLogLen: -1,
+  sequential: false, seqStepId: null, seqTimer: null, wasBusy: false, planStepId: null,
   // An open "come and look" intent waiting for the snapshot that carries the change set.
   previewWant: '',
   // The one step row the thread has open. Held here rather than in the DOM because `renderThread`
   // rebuilds every row on each state push — and because the server holds what is inside it.
   openStep: '',
+  // Which message the next one answers. An index, like the copy button's row, because the quotation
+  // is read out of the server's own record — this window only says which message it meant.
+  quote: -1,
+  expandedProposal: '',
 };
 
 /* True when the user's hands are on something: a field with text in it, or an open dialog.
@@ -160,11 +176,29 @@ function render(data) {
   /* A new task, a rollback or a switch of project empties the file list, and a preview holding an
      index into it would be pointing at nothing. */
   if (state.railFile >= (((data.review || {}).files) || []).length) state.railFile = -1;
+  /* A reference is an index into this thread, so a new task, a rolled-back one or a switched project
+     empties it — a banner quoting a message that is no longer on screen would quote the wrong thing. */
+  if (state.quote >= ((data.messages || []).length)) state.quote = -1;
   /* A row opened because it was *running* has nothing to show once the job ends and nobody has fetched
      its stored block: it closes rather than sitting open and empty. */
   if (state.openStep && !data.busy && !(data.step_detail && data.step_detail.id === state.openStep)) {
     state.openStep = '';
   }
+  const filesCount = (((data.review || {}).files) || []).length;
+  if (state.lastFilesCount >= 0 && filesCount > state.lastFilesCount && state.railSection !== 'changes') {
+    state.unread.changes = true;
+  }
+  state.lastFilesCount = filesCount;
+  const planStep = (data.plan || {}).step;
+  if (state.lastPlanStep >= 0 && planStep !== state.lastPlanStep && state.railSection !== 'tasks') {
+    state.unread.tasks = true;
+  }
+  state.lastPlanStep = planStep;
+  const logLen = (data.log || []).length;
+  if (state.lastLogLen >= 0 && logLen > state.lastLogLen && state.view !== 'details') {
+    state.unread.activity = true;
+  }
+  state.lastLogLen = logLen;
   /* A question opened before this page connected — or before the UI was restarted — arrives here
      rather than as an event, and it is still holding a worker. */
   for (const ask of (data.asks || [])) drawAsk(ask);
@@ -175,13 +209,39 @@ function render(data) {
   offerIcon(data);
   // Style and theme are the window's own choice, applied before first paint by the boot
   // script; a state push from the server must not snap them back.
+  if (state.openStep) state.lockScroll = true;
   renderThemePick(); renderNav(); renderHeader(); renderThread(); renderComposer();
-  renderQueue(); renderSetup();
+  renderQueue(); renderSetup(); renderQuote();
   renderRail(); renderLog();
   syncSettings();
   // A proposal that arrived on this snapshot was already asked to show itself.
   takePreviewOffer();
   setBusy(data.busy, data.cancellable);
+
+  const wasBusy = !!state.wasBusy;
+  state.wasBusy = !!data.busy;
+  if (state.sequential && wasBusy && !data.busy) {
+    const doneId = state.seqStepId;
+    if (doneId) {
+      send('complete_step', { step_id: doneId });
+    }
+    if (state.seqTimer) clearTimeout(state.seqTimer);
+    state.seqTimer = setTimeout(() => {
+      if (!state.sequential) return;
+      const steps = (DATA && DATA.plan && DATA.plan.steps) || [];
+      const next = steps.find(s => s.id !== doneId && s.status !== 'verified');
+      if (next) {
+        state.seqStepId = next.id;
+        toast(`الخطوة التالية (${next.id}/${DATA.plan.total}): ${next.title}`);
+        runPlanStep(next);
+      } else {
+        state.sequential = false;
+        state.seqStepId = null;
+        toast('🎉 اكتملت جميع خطوات الخطة بنجاح!', 'good');
+        renderRail();
+      }
+    }, 1500);
+  }
 }
 
 /* The server owns the draft only when it puts one there itself — "Try sample project"
@@ -354,6 +414,7 @@ function projectMenu(group) {
     ['Choose project mark…', () => iconPicker(group)],
   ];
   if ((DATA.branch || {}).key === group.key) rows.push(['Leave the project (standalone chat)', () => send('new_chat')]);
+  rows.push(['Remove project from list…', () => removeProjectConfirm(group)]);
   for (const [label, run] of rows) {
     const b = el('button', 'cmd', `<span>${esc(label)}</span><span class="g"></span>`);
     b.onclick = () => { close(); run(); };
@@ -361,6 +422,22 @@ function projectMenu(group) {
   }
   s.appendChild(list);
   const close = modal(s);
+}
+
+function removeProjectConfirm(group) {
+  const s = sheet('Remove project', 'Remove "' + group.name + '" from the sidebar? Your files on disk will NOT be deleted.');
+  const foot = el('footer');
+  const cancel = el('button', 'line-btn', 'Cancel');
+  const removeBtn = el('button', 'solid', 'Remove from sidebar');
+  const close = modal(s);
+  cancel.onclick = () => close();
+  removeBtn.onclick = () => {
+    close();
+    send('remove_project', { project: group.key });
+    toast('Removed ' + group.name + ' from project list');
+  };
+  foot.append(cancel, removeBtn);
+  s.appendChild(foot);
 }
 
 /* -------------------------------- project drawer ------------------------------- */
@@ -659,11 +736,14 @@ function mdToHtml(text) {
   return out;
 }
 function inline(chunk) {
-  return esc(chunk).trim().split(/\n{2,}/).map((block) => {
+  // ATX headings end at their newline, even without a blank line before the next list.
+  const blocks = chunk.replace(/\r\n/g, '\n')
+    .replace(/^[ \t]{0,3}(#{1,6}[ \t]+[^\n]*)$/gm, '\n\n$1\n\n');
+  return esc(blocks).trim().split(/\n{2,}/).map((block) => {
     const lines = block.split('\n');
-    if (/^\s*[-*]\s+/.test(lines[0]) || /^\s*\d+\.\s+/.test(lines[0])) {
-      const tag = /^\s*\d+\./.test(lines[0]) ? 'ol' : 'ul';
-      return `<${tag}>` + lines.filter(Boolean).map((l) => `<li>${rich(l.replace(/^\s*(?:[-*]|\d+\.)\s+/, ''))}</li>`).join('') + `</${tag}>`;
+    if (/^\s*[-*]\s+/.test(lines[0]) || /^\s*\d+[.)]\s+/.test(lines[0])) {
+      const tag = /^\s*\d+[.)]/.test(lines[0]) ? 'ol' : 'ul';
+      return `<${tag}>` + lines.filter(Boolean).map((l) => `<li>${rich(l.replace(/^\s*(?:[-*]|\d+[.)])\s+/, ''))}</li>`).join('') + `</${tag}>`;
     }
     if (/^#{1,6}\s/.test(lines[0])) return `<h3>${rich(lines[0].replace(/^#{1,6}\s+/, ''))}</h3>`;
     return `<p>${rich(block)}</p>`;
@@ -690,38 +770,75 @@ function hl(code) {
 const ARABIC_RUN = /[؀-ۿ]/;
 
 function renderThread() {
+  const scroller = $('scroller');
+  const savedScroll = scroller ? scroller.scrollTop : 0;
+  const stick = atBottom(scroller);
   const thread = $('thread'); thread.innerHTML = '';
-  const stick = $('scroller').scrollTop + $('scroller').clientHeight >= $('scroller').scrollHeight - 80;
-  /* The chips belong under the last tool note, because that is the message that says "this
-     happened" — and the file list itself comes from the live review block rather than from the
-     message, since only the session carries paths the user can still click on. */
+  // One live card replaces the current task's proposal/apply rows; its files come from the session.
   const files = (DATA.review || {}).files || [];
-  const chipAt = files.length ? DATA.messages.reduce((last, m, i) => (m.role === 'tool' ? i : last), -1) : -1;
+  const lastUser = DATA.messages.reduce((last, m, i) => m.role === 'user' ? i : last, -1);
+  const decisions = DATA.messages.map((m, i) => i > lastUser && m.step &&
+    ['propose', 'applied'].includes(m.step.action) ? i : -1).filter(i => i >= 0);
+  const chipAt = files.length ? (decisions.length ? decisions[decisions.length - 1]
+    : DATA.messages.reduce((last, m, i) => (m.role === 'tool' ? i : last), DATA.messages.length - 1)) : -1;
   // Only the newest step row is "the running one", and only while a job is live.
   const lastStep = DATA.messages.reduce((last, m, i) => (m.step ? i : last), -1);
   DATA.messages.forEach((m, i) => {
+    // The current proposal changes state in one card. Earlier tasks keep their audit rows.
+    if (files.length && decisions.includes(i) && i !== chipAt) return;
     const msg = el('div', 'msg ' + (m.role === 'user' ? 'me' : m.role === 'tool' ? 'sys' : ''));
+    msg.id = 'message-' + i;
     const pic = el('div', 'pic', m.role === 'user' ? 'Y' : m.role === 'tool' ? '⚙' : 'A');
     const body = el('div', 'body');
-    if (m.step) {
-      body.appendChild(stepRow(m, i === lastStep));
+    /* The row's two actions join a line that already exists rather than opening one of their own: an
+       answer has its name and minute above the bubble, a prompt has the bubble itself, and only a tool
+       note has nothing to join. Placed once, into `slot`, so a row cannot get the icons twice — which
+       is also why they sit beside the bubble instead of inside it: `appendToken` rewrites the bubble's
+       innerHTML on every streamed chunk, and a handler in there would be deleted by the next one. */
+    let slot = body;
+    if (i === chipAt && decisions.includes(i)) {
+      // The card header below owns this row's actions.
+    } else if (m.step) {
+      const step = stepRow(m, i === lastStep);
+      slot = step.querySelector('.st-line');
+      body.appendChild(step);
     } else if (m.role === 'tool') {
-      const note = el('div', '', `<span class="tool"><b>${esc(m.author)}</b> ${esc(m.text)}</span>`);
+      const note = el('div', 'tool-line', `<span class="tool"><b>${esc(m.author)}</b> ${esc(m.text)}</span>`);
+      slot = note;
       note.dir = ARABIC_RUN.test(m.text) ? 'rtl' : 'auto';
       body.appendChild(note);
     } else {
-      if (m.role === 'assistant') body.appendChild(el('div', 'who', `${esc(m.author)} · ${esc(m.time || '')}`));
       // dir="auto" lets the browser choose from the first strong character, so an Arabic answer
       // reads right-to-left while an English one is untouched — no per-message detection in JS.
-      const bub = el('div', 'bub', mdToHtml(m.text));
+      const reply = splitReply(m.text);
+      const bub = el('div', 'bub', mdToHtml(reply.text));
+      if (reply.preview) bub.prepend(replyPill(reply.preview,
+        Number.isInteger(m.replyTo) && m.replyTo >= 0 && m.replyTo < i ? m.replyTo : replyTarget(reply.preview, i)));
       bub.dir = 'auto';
-      body.appendChild(bub);
+      if (m.role === 'assistant') {
+        slot = el('div', 'mhead');
+        slot.appendChild(el('span', 'who', `${esc(m.author)} · ${esc(m.time || '')}`));
+        body.append(slot, bub);
+      } else {
+        slot = el('div', 'bubline');
+        slot.appendChild(bub);
+        body.appendChild(slot);
+      }
     }
-    if (i === chipAt) body.appendChild(chipCard(DATA.review));
-    /* Copy belongs to what the server produced — the answer and the notices — and not to the
-       user's own row, which is text they already have. It sits beside the bubble rather than in
-       it because appendToken rewrites the bubble's innerHTML on every streamed chunk. */
-    if (m.role !== 'user' && (m.text || '').trim()) body.appendChild(msgActions(i));
+    if (i === chipAt) {
+      const card = chipCard(DATA.review);
+      body.appendChild(card);
+      for (const index of decisions.filter(index => index !== chipAt)) {
+        const anchor = el('span', 'reply-anchor');
+        anchor.id = 'message-' + index;
+        card.prepend(anchor);
+      }
+      if (decisions.includes(i)) slot = card.querySelector('.chat-task-head');
+    }
+    /* Offered on every row that has words in it, the operator's own included: "answer that" does not
+       care who said it, and a prompt you typed is exactly the text you want on the clipboard somewhere
+       else. */
+    if ((m.text || '').trim()) slot.appendChild(msgActions(i));
     msg.append(pic, body); thread.appendChild(msg);
   });
   if (DATA.pending || STREAM) {
@@ -732,8 +849,10 @@ function renderThread() {
        before there is — which is what lets a stream show an answer without claiming a job is running. */
     msg.innerHTML = `<div class="pic">A</div><div class="body"><div class="bub" dir="auto">`
       + `<span class="typing"><i></i><i></i><i></i> `
-      + `<span class="typing-line">${esc(STREAM || DATA.pending)}</span></span></div></div>`;
+      + `<span class="typing-line">${esc(STREAM || DATA.pending)}</span>`
+      + `<span class="typing-clock"></span></span></div></div>`;
     thread.appendChild(msg);
+    paintClock();
   }
   thread.querySelectorAll('[data-copy]').forEach((b) => {
     b.onclick = () => { navigator.clipboard.writeText(b.closest('.code').querySelector('pre').innerText); toast('Copied to clipboard'); };
@@ -749,8 +868,34 @@ function renderThread() {
       toast('Proposing ' + b.dataset.block + ' — review the diff, then Apply');
     };
   });
-  if (stick) $('scroller').scrollTop = $('scroller').scrollHeight;
+  if (state.lockScroll) {
+    if (scroller) scroller.scrollTop = savedScroll;
+    state.lockScroll = false;
+  } else if (stick) {
+    toBottom(scroller);
+  }
 }
+
+/* The wait, counted. This is the app's only repeating timer, and it measures this window's own wait:
+   the request left here and the answer has not come back. Nothing server-side is redrawn per second,
+   which is what keeps a long build from costing snapshots, and it stops with the job that started it. */
+let TICK = null, WAITED = 0;
+function clockFace(seconds) {
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+function paintClock() {
+  const face = document.querySelector('.typing-clock');
+  // The clock is a sibling of the line the stream rewrites, for the same reason the copy button is:
+  // anything inside `.typing-line` is deleted by the next arriving chunk.
+  if (face) face.textContent = '⏱ ' + clockFace(WAITED);
+}
+function startClock() {
+  stopClock();
+  WAITED = 0;
+  TICK = setInterval(() => { WAITED += 1; paintClock(); }, 1000);
+}
+function stopClock() { if (TICK !== null) { clearInterval(TICK); TICK = null; } }
 
 /* The answer that is arriving right now, whole lines from the server, kept out of DATA.messages for
    the same reason LIVE is: a snapshot goes out on every other event, and a half-finished reply must
@@ -758,14 +903,15 @@ function renderThread() {
 let STREAM = '';
 const STREAM_MAX = 20000;
 function appendToken(text) {
+  const scroller = $('scroller');
+  const stick = atBottom(scroller);          // measured before the line grows, as renderThread measures it
   STREAM = (STREAM ? STREAM + '\n' + text : text).slice(-STREAM_MAX);
   if (!document.querySelector('.typing-line')) {
     renderThread();                                  // the first chunk has to create its own bubble
     return;
   }
-  const line = document.querySelector('.typing-line');
-  line.textContent = STREAM;
-  $('scroller').scrollTop = $('scroller').scrollHeight;
+  document.querySelector('.typing-line').textContent = STREAM;
+  if (stick) toBottom(scroller);
 }
 
 function msgActions(index) {
@@ -774,8 +920,75 @@ function msgActions(index) {
   copy.dataset.copyRow = index;
   copy.title = 'Copy this message';
   copy.setAttribute('aria-label', 'Copy this message');
-  row.appendChild(copy);
+  const quote = el('button', 'mact', ICON.reply);
+  quote.dataset.quoteRow = index;
+  quote.title = 'Answer this message';
+  quote.setAttribute('aria-label', 'Answer this message');
+  quote.setAttribute('aria-pressed', state.quote === index ? 'true' : 'false');
+  row.append(copy, quote);
   return row;
+}
+
+/* The message the next one answers, shown above the box it will be sent from. The row keeps only the
+   index: the server reads the quotation out of its own record, so a reference can say what was
+   actually said rather than what this window happens to hold. */
+const QUOTE_WHO = { user: 'you', assistant: 'the agent', tool: 'a notice from the tool' };
+
+function splitReply(text) {
+  const match = String(text || '').match(/^> \[(?:In reference to |بالإشارة إلى )[^\n]*?: "([^\n]*)"\]\s*\n/);
+  return match ? { text: text.slice(match[0].length), preview: match[1] }
+    : { text: text || '', preview: '' };
+}
+
+function replyTarget(preview, before) {
+  const words = preview.replace(/…$/, '').replace(/\s+/g, ' ').trim();
+  for (let i = before - 1; i >= 0; i--) {
+    if (words && String(DATA.messages[i].text || '').replace(/\s+/g, ' ').trim().startsWith(words)) return i;
+  }
+  return -1;
+}
+
+function replyPill(preview, index) {
+  const pill = el('button', 'reply-pill', `↩ <span dir="auto">${esc(preview)}</span>`);
+  pill.title = index >= 0 ? 'Go to original message' : 'Original message is not in this conversation';
+  pill.disabled = index < 0;
+  pill.onclick = () => {
+    const target = $('message-' + index);
+    if (target) {
+      target.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' });
+      target.animate([{ background: 'var(--hover)' }, { background: 'transparent' }], { duration: 900 });
+    }
+  };
+  return pill;
+}
+
+function renderQuote() {
+  const box = $('quote');
+  box.innerHTML = '';
+  const message = state.quote >= 0 ? (DATA.messages || [])[state.quote] : null;
+  if (!message) state.quote = -1;
+  /* The row that is being answered says so. Nothing rebuilds the thread here — the banner is the only
+     thing that changes when you pick a row — so the pressed state is written onto the buttons that are
+     already in the DOM, or the control would keep insisting it had not been used. */
+  for (const button of document.querySelectorAll('#thread [data-quote-row]')) {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.quoteRow) === state.quote));
+  }
+  if (!message) {
+    return;
+  }
+  const words = (message.text || '').replace(/\s+/g, ' ').trim();
+  const shown = words.length > 180 ? words.slice(0, 180) + '…' : words;
+  box.appendChild(replyPill(shown, state.quote));
+  const close = el('button', 'quote-off', '✕');
+  close.title = 'Stop referring to this message';
+  close.onclick = () => { state.quote = -1; renderQuote(); };
+  box.appendChild(close);
+}
+
+function quoteRow(index) {
+  state.quote = state.quote === index ? -1 : index;
+  renderQuote();
+  if (state.quote >= 0) $('prompt').focus();
 }
 
 /* One thing the agent did, as a row that can be opened. The sentence and its glyph are the server's
@@ -795,12 +1008,15 @@ function stepRow(m, isLast) {
   head.title = (open || live || step.detail)
     ? 'What this step has behind it' : '';
   head.onclick = () => toggleStep(step.id, live);
-  row.appendChild(head);
+  const line = el('div', 'st-line');
+  line.appendChild(head);
+  row.appendChild(line);
   if (open) row.appendChild(stepBody(step, live));
   return row;
 }
 
 function toggleStep(id, live) {
+  state.lockScroll = true;
   if (state.openStep === id) {
     state.openStep = '';
     if (!live) sendQuiet('step_detail', { id: '' });   // the server stops carrying the block
@@ -859,12 +1075,16 @@ function stepFileRow(path) {
    the dataset and resolved against DATA.messages, so what lands on the clipboard is the message
    text the server wrote — never the rendered markup, and never a stale row. */
 $('thread').addEventListener('click', (event) => {
-  const hit = event.target.closest('[data-copy-row]');
-  if (!hit) return;
-  const message = DATA.messages[Number(hit.dataset.copyRow)];
-  if (!message) return;
-  navigator.clipboard.writeText(message.text || '');
-  toast('Copied to clipboard');
+  const copy = event.target.closest('[data-copy-row]');
+  if (copy) {
+    const message = DATA.messages[Number(copy.dataset.copyRow)];
+    if (!message) return;
+    navigator.clipboard.writeText(message.text || '');
+    toast('Copied to clipboard');
+    return;
+  }
+  const quoted = event.target.closest('[data-quote-row]');
+  if (quoted) quoteRow(Number(quoted.dataset.quoteRow));
 });
 
 /* The last thing you sent, back in the box. A model that stalls or answers nonsense is answered by
@@ -940,7 +1160,7 @@ function renderComposer() {
        a test, a macro, an assistive tool — presses Stop and cancels a model turn. */
     const s = el('button', 'send stop', 'Stop');
     s.id = 'stop';
-    s.onclick = () => send('stop'); add(s);
+    s.onclick = () => { if (state.sequential) stopSequential(); else send('stop'); }; add(s);
   }
   const sendBtn = el('button', 'send', (DATA.busy ? 'Queue ' : 'Send ') + ICON.up);
   sendBtn.id = 'send';
@@ -1099,18 +1319,26 @@ function submit() {
   // settings block carries. A top-level flag of that name never arrives from the server, and
   // reading it here silently disabled the gesture.
   if (!text && !((DATA.settings || {}).chained)) return;
+  /* A reference travels as a row number and nothing else: the server pulls the quoted words out of
+     its own record. A queued message resolves it now, while the thread the index points into is the
+     one on screen, rather than whenever the queue happens to drain. */
+  const quote = state.quote >= 0 ? { quote_of: state.quote } : {};
+  const step = state.planStepId ? { step_id: state.planStepId } : {};
+  state.planStepId = null;
   if (DATA.busy) {
     /* A running task used to swallow this: start_plan returned with no message and the typed text
        was gone. Now it queues, and the strip above the composer shows it as one line. The
        confirmation is the server's toast, because that is the side that knows the language. */
-    send('queue_add', { text });
+    send('queue_add', { text, ...quote, ...step });
     $('prompt').value = '';
     autosize();
+    state.quote = -1; renderQuote();
     return;
   }
-  send('send', { text });
+  send('send', { text, ...quote, ...step });
   $('prompt').value = '';
   autosize();
+  state.quote = -1; renderQuote();
 }
 function autosize() {
   const ta = $('prompt'); ta.style.height = 'auto';
@@ -1221,109 +1449,208 @@ function editQueued(row, item) {
   input.focus(); input.select();
 }
 
+function runPlanStep(s) {
+  const text = (s && s.title) || `Execute step ${(s && s.id) || ''}`;
+  const ta = $('prompt');
+  if (ta) {
+    ta.value = text;
+    autosize();
+    if (ta.focus) ta.focus();
+  }
+  state.planStepId = (s && s.id) || null;
+  submit();
+  toast('Running: ' + text);
+}
+
+function startSequential() {
+  if (!DATA || !DATA.plan || !DATA.plan.steps || !DATA.plan.steps.length) {
+    toast('لا توجد خطوات في الخطة للبدء فيها.');
+    return;
+  }
+  const pendingStep = DATA.plan.steps.find(s => s.status !== 'verified');
+  if (!pendingStep) {
+    toast('جميع خطوات الخطة مكتملة بالفعل! ✓');
+    return;
+  }
+  state.sequential = true;
+  state.seqStepId = pendingStep.id;
+  const autoOn = !!(DATA.settings && DATA.settings.auto_apply);
+  if (!autoOn) {
+    send('set_auto_apply', { value: true });
+  }
+  if (DATA.composer !== 'change') {
+    send('set_composer', { value: 'change' });
+  }
+  toast(`بدء التنفيذ التتابعي: الخطوة ${pendingStep.id}/${DATA.plan.total}`);
+  runPlanStep(pendingStep);
+  renderRail();
+}
+
+function stopSequential() {
+  state.sequential = false;
+  state.seqStepId = null;
+  if (state.seqTimer) {
+    clearTimeout(state.seqTimer);
+    state.seqTimer = null;
+  }
+  send('stop');
+  toast('تم إيقاف التنفيذ التتابعي.');
+  renderRail();
+}
+
 function renderRail() {
   const rail = $('rail'); rail.innerHTML = '';
-  const a = DATA.artifact;
+  const a = DATA.artifact || {};
   const r = DATA.review || {};
-  /* A preview takes the artifact card's place: both answer "what happened to my files", and
-     stacking them pushed the Sources card off a 322px column. */
-  if (state.railFile >= 0 && r.files && r.files[state.railFile]) {
-    rail.appendChild(railPreviewCard(r));
-  } else {
-    const art = el('div', 'card');
-    /* The status line moves on as soon as the checks run; a write nobody clicked for should
-       not disappear from the window with it. Its undo is the bar under the file list, not a second
-       button inside the sentence — one control per decision, and that bar carries the enablement. */
-    art.innerHTML = (DATA.banner && DATA.banner.text
-      ? `<div class="auto-note">${esc(DATA.banner.text)}</div>` : '') +
-      `<span class="state${tone(a.tone)}">● ${esc(a.state)}</span>
-      <div class="t">${esc(a.title)}</div><div class="d">${esc(a.detail)}</div>`;
-    /* One row per touched file, so the card answers "which files" without a trip anywhere else.
-       The row is the same control as a chip in the thread. */
-    if ((r.files || []).length) {
-      const list = el('div', 'rail-files');
-      r.files.forEach((f, i) => {
-        const row = el('button', 'rfile',
-          kindTag(f.kind) + `<code>${esc(f.path)}</code>`);
-        row.onclick = () => openFile(i);
+
+  if (!state.railSection) {
+    state.railSection = (DATA.plan && (!r.files || !r.files.length)) ? 'tasks' : 'changes';
+  }
+
+  const rtabs = el('div', 'rail-tabs');
+  const sections = [
+    ['changes', 'Changes', (r.files || []).length ? (r.files || []).length : ''],
+    ['tasks', 'Tasks', DATA.plan ? `${DATA.plan.step}/${DATA.plan.total}` : ''],
+    ['checks', 'Checks & Sources', ''],
+  ];
+  for (const [id, label, count] of sections) {
+    const active = state.railSection === id;
+    const btn = el('button', 'rail-tab' + (active ? ' on' : ''),
+      `<span>${label}</span>`
+      + (count ? `<span class="tab-badge">${count}</span>` : '')
+      + (!active && state.unread && state.unread[id] ? '<span class="unread-dot"></span>' : ''));
+    btn.onclick = () => {
+      state.railSection = id;
+      if (state.unread) state.unread[id] = false;
+      if (id !== 'changes') state.railFile = -1;
+      renderRail();
+    };
+    rtabs.appendChild(btn);
+  }
+  rail.appendChild(rtabs);
+
+  if (state.railSection === 'changes') {
+    if (state.railFile >= 0 && r.files && r.files[state.railFile]) {
+      rail.appendChild(railPreviewCard(r));
+    } else {
+      const art = el('div', 'card');
+      art.innerHTML = (DATA.banner && DATA.banner.text
+        ? `<div class="auto-note">${esc(DATA.banner.text)}</div>` : '') +
+        `<span class="state${tone(a.tone)}">● ${esc(a.state)}</span>
+        <div class="t">${esc(a.title)}</div><div class="d">${esc(a.detail)}</div>`;
+      if ((r.files || []).length) {
+        const list = el('div', 'rail-files');
+        r.files.forEach((f, i) => {
+          const row = el('button', 'rfile',
+            kindTag(f.kind) + fileCaption(f, true) + diffStat(f));
+          row.onclick = () => openFile(i);
+          list.appendChild(row);
+        });
+        art.appendChild(list);
+        art.appendChild(el('div', 'hr'));
+        changeActions(r, art);
+      } else {
+        art.appendChild(el('div', 'pv-empty-files quiet', 'No file changes proposed or written yet.'));
+        art.appendChild(el('div', 'hr'));
+        changeActions(r, art);
+      }
+      rail.appendChild(art);
+    }
+  } else if (state.railSection === 'tasks') {
+    if (DATA.plan) {
+      const p = el('div', 'card tasks-card');
+      const pct = Math.round((DATA.plan.verified / Math.max(1, DATA.plan.total)) * 100);
+      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — step ${DATA.plan.step}/${DATA.plan.total}</div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        <div class="meta"><span>${DATA.plan.verified} verified</span><span>${esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
+      const seqDiv = el('div', 'plan-seq-controls');
+      if (!state.sequential) {
+        const startBtn = el('button', 'solid plan-seq-btn', '▶ بدء التنفيذ التتابعي');
+        startBtn.title = 'تنفيذ خطوات الخطة خطوة بخطوة تلقائياً';
+        startBtn.onclick = () => startSequential();
+        seqDiv.appendChild(startBtn);
+      } else {
+        const stopBtn = el('button', 'line-btn plan-seq-btn running', '⏹ إيقاف التنفيذ التتابعي');
+        stopBtn.title = 'إيقاف التنفيذ التتابعي التلقائي';
+        stopBtn.onclick = () => stopSequential();
+        seqDiv.appendChild(stopBtn);
+      }
+      p.appendChild(seqDiv);
+      const list = el('div', 'tasks-list');
+      for (const s of DATA.plan.steps) {
+        const isDone = s.status === 'verified';
+        const isNow = !isDone && (s.current || s.id === DATA.plan.step);
+        const row = el('div', 'task-item ' + (isDone ? 'done' : isNow ? 'now' : 'pending'));
+        row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
+        row.appendChild(el('span', 'task-title', esc(s.title)));
+        if (!isDone) {
+          const exec = el('button', 'step-exec-btn', '▶ نفذ دي');
+          exec.title = 'Run this step in chat';
+          exec.onclick = (e) => { e.stopPropagation(); runPlanStep(s); };
+          row.appendChild(exec);
+        }
         list.appendChild(row);
-      });
-      art.appendChild(list);
-      /* The pane's three decisions, in the card that names the change set. Apply has to stay a
-         visible click — D31 means a delete never auto-applies, and "you review first" is only
-         true if there is somewhere on screen to do the clicking. */
-      art.appendChild(el('div', 'hr'));
-      changeActions(r, art);
+      }
+      p.appendChild(list);
+      rail.appendChild(p);
+    } else {
+      const empty = el('div', 'card empty-tasks-card');
+      empty.innerHTML = `<div class="empty-icon">📋</div>
+        <div class="t">No active plan</div>
+        <div class="d">Attach a markdown or text plan to execute steps one-by-one.</div>`;
+      const attachBtn = el('button', 'line-btn', '＋ Attach Plan');
+      attachBtn.style.marginTop = '12px';
+      attachBtn.onclick = () => send('pick_plan');
+      empty.appendChild(attachBtn);
+      rail.appendChild(empty);
     }
-    rail.appendChild(art);
-  }
-
-  if (DATA.plan) {
-    const p = el('div', 'card');
-    const pct = Math.round((DATA.plan.verified / Math.max(1, DATA.plan.total)) * 100);
-    p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — step ${DATA.plan.step}/${DATA.plan.total}</div>
-      <div class="bar"><i style="width:${pct}%"></i></div>
-      <div class="meta"><span>${DATA.plan.verified} verified</span><span>${esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
-    for (const s of DATA.plan.steps) {
-      p.appendChild(el('div', 'step ' + (s.status === 'verified' ? 'done' : s.current ? 'now' : ''),
-        `<i>${s.status === 'verified' ? '✓' : s.id}</i><span>${esc(s.title)}</span>`));
+  } else if (state.railSection === 'checks') {
+    if (DATA.recipes.length) {
+      const many = (DATA.targets || []).length > 1;
+      const sb = DATA.sandbox || {};
+      const c = el('div', 'card');
+      c.innerHTML = `<h5>Checks</h5>
+        ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
+        <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
+        <label class="switch" style="margin-top:8px"><input type="checkbox" id="sandboxOn"
+          ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker</label>
+        <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
+          ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace">
+        <div class="meta" dir="auto">${esc(sb.note || '')}</div>
+        <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
+        ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
+        <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
+        <div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>`;
+      c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
+      if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
+        DATA.targets.map(row => row.label));
+      c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
+      c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
+      c.querySelector('#run').onclick = () => send('run', { fix: false });
+      c.querySelector('#fix').onclick = () => send('run', { fix: true });
+      c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;
+      rail.appendChild(c);
     }
-    rail.appendChild(p);
-  }
 
-  if (DATA.recipes.length) {
-    /* A folder with more than one project in it gets the module named here, because "Maven test" at
-       the reactor root and "Maven test" in one module are different questions with different answers.
-       With one project there is nothing to choose, and a picker of one is noise. */
-    const many = (DATA.targets || []).length > 1;
-    const sb = DATA.sandbox || {};
-    const c = el('div', 'card');
-    c.innerHTML = `<h5>Checks</h5>
-      ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
-      <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
-      <label class="switch" style="margin-top:8px"><input type="checkbox" id="sandboxOn"
-        ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker</label>
-      <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
-        ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace">
-      <div class="meta" dir="auto">${esc(sb.note || '')}</div>
-      <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
-      ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
-      <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
-      <div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>`;
-    c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
-    if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
-      DATA.targets.map(row => row.label));
-    /* The digest is sent when the field is left, not on every keystroke: it is a name that either
-       matches or does not, and the server writes the preference on each answer. */
-    c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
-    c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
-    c.querySelector('#run').onclick = () => send('run', { fix: false });
-    c.querySelector('#fix').onclick = () => send('run', { fix: true });
-    c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;
-    rail.appendChild(c);
+    const s = el('div', 'card');
+    s.innerHTML = `<h5>Sources</h5>
+      <div class="link quiet">${ICON.file} ${esc(DATA.project ? 'Project: ' + DATA.project.name : 'This chat has no project')}</div>
+      <button class="link" id="notes">🧾 Project notes <span class="r">${esc(DATA.memory.info || '')}</span></button>
+      <div class="hr"></div>
+      <button class="link" id="settings">${ICON.gear} Settings <span class="r">›</span></button>`;
+    s.querySelector('#notes').onclick = () => openSettings('notes');
+    s.querySelector('#settings').onclick = () => openSettings();
+    if ((DATA.branch || {}).key) {
+      const group = (DATA.projects || []).find((g) => g.key === DATA.branch.key);
+      const info = el('button', 'link', '📁 Project settings & status <span class="r">›</span>');
+      info.onclick = () => projectDrawer(group || { key: DATA.branch.key, name: DATA.project.name, path: DATA.project.path });
+      s.insertBefore(info, s.querySelector('.hr'));
+      const graph = el('button', 'link', '🕸️ Dependency graph <span class="r">›</span>');
+      graph.onclick = () => graphSheet();
+      s.insertBefore(graph, s.querySelector('.hr'));
+    }
+    rail.appendChild(s);
   }
-
-  const s = el('div', 'card');
-  /* The branch label is display only: choosing, creating and leaving a project all happen in
-     the sidebar, so the right panel cannot silently repoint the window at another folder. */
-  s.innerHTML = `<h5>Sources</h5>
-    <div class="link quiet">${ICON.file} ${esc(DATA.project ? 'Project: ' + DATA.project.name : 'This chat has no project')}</div>
-    <button class="link" id="notes">🧾 Project notes <span class="r">${esc(DATA.memory.info || '')}</span></button>
-    <div class="hr"></div>
-    <button class="link" id="settings">${ICON.gear} Settings <span class="r">›</span></button>`;
-  s.querySelector('#notes').onclick = () => openSettings('notes');
-  s.querySelector('#settings').onclick = () => openSettings();
-  // The drawer is per project, so it only appears once one is in front of the window.
-  if ((DATA.branch || {}).key) {
-    const group = (DATA.projects || []).find((g) => g.key === DATA.branch.key);
-    const info = el('button', 'link', '📁 Project settings & status <span class="r">›</span>');
-    info.onclick = () => projectDrawer(group || { key: DATA.branch.key, name: DATA.project.name, path: DATA.project.path });
-    s.insertBefore(info, s.querySelector('.hr'));
-    const graph = el('button', 'link', '🕸️ Dependency graph <span class="r">›</span>');
-    graph.onclick = () => graphSheet();
-    s.insertBefore(graph, s.querySelector('.hr'));
-  }
-  rail.appendChild(s);
 }
 
 /* Unified diff lines carry no line numbers of their own; the @@ -old,+new @@ header does.
@@ -1374,6 +1701,8 @@ function openFile(index) {
      has to say that rather than return silently — a silent no-return is what made this look like a
      broken button. */
   if (!r.files || !r.files[index]) { toast('That file is no longer in the change set.', 'bad'); return; }
+  state.railSection = 'changes';
+  if (state.unread) state.unread.changes = false;
   state.railFile = index;
   state.railTab = 'diff';
   // The reply carries this file's diff, so the viewer is drawn only once the server has answered.
@@ -1475,44 +1804,97 @@ function kindTag(kind) {
   return '<span class="chip-tag modified">~ Modified</span>';
 }
 
+/* How much goes in and how much comes out. The controller already computes both for every change in
+   the set (`review.files[].add` / `.del`) and the preview header has been drawing them for one file
+   at a time; on a card that lists four files the numbers are the whole reason to read the list
+   before opening anything. */
+function diffStat(f) {
+  return `<span class="dstat"><span class="p">+${(f && f.add) || 0}</span>`
+    + `<span class="n">−${(f && f.del) || 0}</span></span>`;
+}
+
+function diffTotals(files) {
+  let add = 0, del = 0;
+  for (const f of (files || [])) { add += f.add || 0; del += f.del || 0; }
+  return { add, del };
+}
+
+function fileCaption(f, rail = false) {
+  const summary = f.summary || f.description || `${f.kind === 'A' ? 'Created' : f.kind === 'D' ? 'Removed' : 'Updated'} file content`;
+  return `<span class="file-caption"><${rail ? 'code' : 'span'} class="chip-name">${esc(f.path)}</${rail ? 'code' : 'span'}>`
+    + `<span class="file-summary" dir="auto" title="${esc(summary)}">${esc(summary)}</span></span>`;
+}
+
 function chipCard(r) {
   const card = el('div', 'chat-task-card');
   card.dir = 'auto';
   /* The state line is the server's, so an Arabic task reads Arabic here and English there is
      only ever the chrome: `+ Created` names a badge, not a sentence. */
   const a = DATA.artifact || {};
+  const auto = DATA.banner && DATA.banner.text;
+  card.title = a.title || '';
   card.appendChild(el('div', 'chat-task-head',
     `<span class="state${tone(a.tone)}">● ${esc(a.state)}</span>`
-    + `<span class="quiet">${esc(a.title)}</span>`));
+    /* A write nobody clicked for has to be legible on the card itself, not only in the amber note
+       beside the rail's file list — this is the card that sits in the conversation, and the
+       conversation is where the operator was standing when the files changed. */
+    + (auto ? '<span class="chip-tag auto">⚡ Auto-Applied</span>' : '')
+    + `<span class="file-count">${r.files.length} ${r.files.length === 1 ? 'file' : 'files'} changed</span>`
+    + diffStat(diffTotals(r.files))));
   const row = el('div', 'chat-file-chips');
-  r.files.forEach((f, i) => {
+  const key = r.id || JSON.stringify(r.files.map(f => f.path));
+  const expanded = state.expandedProposal === key;
+  r.files.slice(0, expanded ? r.files.length : 3).forEach((f, i) => {
     const chip = el('button', 'file-chip',
-      `<span class="chip-icon">${ICON.file}</span><span class="chip-name">${esc(f.path)}</span>`
-      + kindTag(f.kind)
-      + `<span class="chip-action">↗ View</span>`);
+      `<span class="chip-icon">${ICON.file}</span>` + fileCaption(f)
+      + kindTag(f.kind) + diffStat(f)
+      + `<span class="chip-action">↗ View diff</span>`);
     chip.title = (a.written ? 'Inspect what was written to this file' : 'Inspect the proposed changes to this file');
     chip.onclick = () => openFile(i);
     row.appendChild(chip);
   });
   card.appendChild(row);
+  if (r.files.length > 3) {
+    const more = el('button', 'more-files', expanded ? 'Show fewer files' : `+${r.files.length - 3} more files`);
+    more.setAttribute('aria-expanded', String(expanded));
+    more.onclick = () => { state.expandedProposal = expanded ? '' : key; state.lockScroll = true; renderThread(); };
+    card.appendChild(more);
+  }
+  changeActions(r, card, true);
   return card;
 }
 
-/* The three decisions about a change set, built once. The pane that used to hold them is gone, so the
+/* The four decisions about a change set, built once. The pane that used to hold them is gone, so the
    rail's artifact card and the preview ask for the same controls. Roll back follows `canRollback` rather
    than the pane's `canMutate`, because an interrupted apply is exactly when the escape must be on screen. */
-function changeActions(r, host) {
+function changeActions(r, host, compact = false) {
   const bar = el('div', 'pv-acts');
   const apply = el('button', 'solid', 'Apply changes');
   apply.disabled = !r.canApply;
   apply.onclick = () => send('apply');
+  /* Declining is offered in exactly the window Apply is, because it means the same thing about the
+     clock: a proposal still waiting for an answer. It writes nothing and discards nothing — the diff
+     stays on screen and the refusal goes into the task's own record. */
+  const reject = el('button', 'line-btn', 'Reject');
+  reject.disabled = !r.canApply;
+  reject.onclick = () => send('reject');
   const verify = el('button', 'line-btn', 'Check syntax');
   const undo = el('button', 'line-btn', '↩ Roll back');
   verify.disabled = !r.canMutate;
   undo.disabled = !r.canRollback;
   verify.onclick = () => send('verify');
   undo.onclick = () => send('rollback', {});
-  bar.append(apply, verify, undo);
+  if (r.rejected) {
+    apply.title = 'You declined this proposal. Reopen it for review before applying it.';
+    reject.title = 'Already declined';
+    const reopen = el('button', 'line-btn', r.reopenLabel || 'Reopen for review');
+    reopen.disabled = !r.canReopen;
+    reopen.onclick = () => send('reopen');
+    bar.appendChild(reopen);
+  }
+  if (!compact || r.pending || r.canApply || r.rejected) bar.append(apply, reject);
+  if (!compact) bar.appendChild(verify);
+  if (!compact || r.canRollback || DATA.artifact.written) bar.appendChild(undo);
   host.appendChild(bar);
 }
 
@@ -1523,7 +1905,7 @@ function railPreviewCard(r) {
   const tabs = [['diff', 'Diff'], ['now', 'Now'], ['was', 'Was'], ['checks', 'Checks']];
   card.innerHTML = `<div class="pv-head"><span class="badge ${file.kind}">${file.kind}</span>
       <code title="${esc(file.path)}">${esc(file.path)}</code>
-      <span class="num"><span class="p">+${file.add}</span><span class="n">−${file.del}</span></span></div>
+      <span class="num">${diffStat(file)}</span></div>
     <div class="pv-note">${file.kind === 'A' ? '+ Created by this task'
       : file.kind === 'D' ? '− Removed by this task. Was shows what it held.'
       : '~ Modified by this task'}
@@ -1577,25 +1959,95 @@ function pushChunk(msg) {
      fight the reader's scroll for the whole build. */
   const host = document.querySelector('.steprow.live.open .st-out');
   if (host) {
+    const stick = atBottom(host);
     host.appendChild(el('span', '', esc(msg.text)));
     while (host.children.length > LIVE_MAX) host.removeChild(host.firstChild);
-    host.scrollTop = host.scrollHeight;
+    if (stick) toBottom(host);
   }
 }
+/* Two lists, one question: is this row a thing that happened to the task, or is it transcript? The
+   system rows stay in Activity proper — a connection, an error, a cap it admitted, a turn milestone.
+   Build output as it arrives, and the audit rows a reopened task rebuilds from its own record, go into
+   the collapsed block: that is the difference between a list a reader scans and four hundred divs
+   nobody scrolls through twice.
+
+   A row is classified by a flag the server put on it, never by guessing at its kind name, so a kind
+   this window has not met still shows up — in whichever list it was marked as. */
+const RAW_MAX = 300;
+let rawDirty = false;
+
+function rawOpen() { return $('raw').open; }
+function rawRows() { return DATA.log.filter((entry) => entry.audit).concat(LIVE); }
+
+function rawNode(entry) {
+  return el('div', 'r', `<span class="ts">${esc(entry.ts || '')}</span>`
+    + `<span class="k">${esc(entry.kind || '')}</span><span class="m">${esc(entry.text || '')}</span>`);
+}
+
+function rawHead(count) {
+  $('rawhead').textContent = count
+    ? `Debug / Raw stream · ${count} line(s)` : 'Debug / Raw stream · nothing this task';
+}
+
+function paintRaw(rows) {
+  const body = $('rawbody');
+  body.innerHTML = '';
+  const held = rows.slice(-RAW_MAX);
+  for (const entry of held) body.appendChild(rawNode(entry));
+  if (rows.length > held.length) {
+    body.insertBefore(el('div', 'r', `<span class="m">… ${rows.length - held.length} earlier line(s) `
+      + 'are not held in this window</span>'), body.firstChild);
+  }
+  rawHead(held.length);
+  $('raw').hidden = !rows.length;
+  rawDirty = false;
+}
+
+function appendRaw(entry) {
+  const body = $('rawbody');
+  const stick = atBottom(body);
+  body.appendChild(rawNode(entry));
+  while (body.children.length > RAW_MAX) body.removeChild(body.firstChild);
+  rawHead(body.children.length);
+  $('raw').hidden = false;
+  if (stick) toBottom(body);
+}
+
+/* Opening the block is the only moment its contents cost anything, so a block that stayed shut while
+   forty lines arrived is painted once, here, rather than forty times on the way to being unseen. */
+$('raw').addEventListener('toggle', () => {
+  if (rawOpen() && rawDirty) paintRaw(rawRows());
+});
+
 function appendLog(entry) {
+  if (entry.audit || entry.stream) {
+    // Transcript, not a status note: the block a reader opens on purpose.
+    if (rawOpen()) appendRaw(entry); else rawDirty = true;
+    return;
+  }
   const log = $('log');
   if (!log.children.length) log.innerHTML = '';
-  const row = el('div', 'r' + (entry.stream ? ' chunk' : ''), `<span class="ts">${esc(entry.ts || '')}</span><span class="k">${esc(entry.kind || '')}</span><span class="m">${esc(entry.text || '')}</span>`);
-  log.appendChild(row); log.parentElement.scrollTop = log.parentElement.scrollHeight;
+  const host = log.parentElement;
+  const stick = atBottom(host);
+  const row = el('div', 'r', `<span class="ts">${esc(entry.ts || '')}</span><span class="k">${esc(entry.kind || '')}</span><span class="m">${esc(entry.text || '')}</span>`);
+  log.appendChild(row);
+  // A reader who scrolled up inside Activity is reading it, not watching it arrive.
+  if (stick) toBottom(host);
 }
 function renderLog() {
   const log = $('log'); log.innerHTML = '';
   /* The cap is the server's and so is the admission: a log that got shorter on its own reads as a task
      that did less than it did. */
   if (DATA.log_note) log.appendChild(el('div', 'r', `<span class="m">${esc(DATA.log_note)}</span>`));
-  for (const entry of DATA.log) appendLog(entry);
-  for (const entry of LIVE) appendLog(entry);
-  if (!DATA.log.length && !LIVE.length) log.appendChild(el('div', 'm', 'Nothing has happened yet in this task.'));
+  for (const entry of DATA.log) if (!entry.audit) appendLog(entry);
+  const rows = rawRows();
+  rawHead(Math.min(rows.length, RAW_MAX));
+  $('raw').hidden = !rows.length;
+  // A closed block is counted, not rebuilt: forty lines arriving is forty appends avoided.
+  if (rawOpen()) paintRaw(rows); else rawDirty = true;
+  if (!log.children.length && !DATA.log.length && !LIVE.length) {
+    log.appendChild(el('div', 'm', 'Nothing has happened yet in this task.'));
+  }
 }
 
 function markTabs(view) {
@@ -1603,18 +2055,27 @@ function markTabs(view) {
     const active = b.dataset.view === view;
     b.classList.toggle('on', active);
     b.setAttribute('aria-selected', String(active));
+    const dot = b.querySelector('.unread-dot');
+    if (dot) dot.remove();
+    if (!active && b.dataset.view === 'details' && state.unread && state.unread.activity) {
+      b.appendChild(el('span', 'unread-dot'));
+    }
   }
   for (const id of ['task', 'details']) $('view-' + id).classList.toggle('on', id === view);
 }
 
 function switchView(view) {
   state.view = view;
+  if (view === 'details' && state.unread) state.unread.activity = false;
   markTabs(view);
 }
 
 function setBusy(busy, cancellable) {
   state.busy = busy;
   paintStatus();
+  // The counter belongs to the in-flight request alone: started when one is, stopped when it is not.
+  // A window that opens onto a running job reaches here through the first snapshot, so it counts too.
+  if (busy) startClock(); else stopClock();
   if (busy && (LIVE.length || STREAM)) { LIVE.length = 0; STREAM = ''; renderLog(); }
   if (DATA) {
     DATA.busy = busy; DATA.cancellable = !!cancellable;
@@ -1783,7 +2244,8 @@ function askFolder(msg) {
     tree.innerHTML = '<div class="empty">Loading…</div>';
     let data;
     try {
-      data = await api('/api/fs?path=' + encodeURIComponent(path || ''));
+      const filesQ = (msg.files && msg.files.length) ? '&files=' + encodeURIComponent(msg.files.join(',')) : '';
+      data = await api('/api/fs?path=' + encodeURIComponent(path || '') + filesQ);
     } catch (e) {
       tree.innerHTML = '';
       toast('That folder could not be read', 'bad');
@@ -1811,7 +2273,7 @@ function askFolder(msg) {
       row.onclick = () => load(dir.path); tree.appendChild(row);
     }
     for (const file of (data.files || [])) {
-      const row = el('div', 'trow leaf-file', `<span class="chev"></span><span class="nm">${esc(file.name)}</span>`);
+      const row = el('div', 'trow leaf-file', `<span class="chev"></span><span class="nm">📄 ${esc(file.name)}</span>`);
       tree.appendChild(row);
       if (msg.files) row.onclick = () => { close(); api('/api/confirm', { id: msg.id, ok: true, path: file.path }); };
     }
@@ -2071,7 +2533,53 @@ function setSidebar(collapsed) {
 }
 const toggleSidebar = () => setSidebar(!sidebarCollapsed());
 
+function setupRailResizer() {
+  const saved = localStorage.getItem('rail-width');
+  if (saved) document.documentElement.style.setProperty('--rail-w', saved);
+  const resizer = $('rail-resizer');
+  if (!resizer) return;
+  let startX = 0, startW = 0, dragging = false;
+
+  resizer.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+    startX = e.clientX;
+    startW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rail-w'), 10) || 322;
+    document.body.classList.add('resizing');
+    resizer.classList.add('dragging');
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    e.preventDefault();
+  });
+
+  function onMouseMove(e) {
+    if (!dragging) return;
+    const delta = startX - e.clientX;
+    const maxW = Math.min(760, Math.floor(window.innerWidth * 0.65));
+    const newW = Math.max(260, Math.min(maxW, startW + delta));
+    document.documentElement.style.setProperty('--rail-w', newW + 'px');
+  }
+
+  function onMouseUp() {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('resizing');
+    resizer.classList.remove('dragging');
+    window.removeEventListener('mousemove', onMouseMove);
+    window.removeEventListener('mouseup', onMouseUp);
+    const finalW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rail-w'), 10) || 322;
+    localStorage.setItem('rail-width', finalW + 'px');
+  }
+
+  resizer.addEventListener('dblclick', () => {
+    document.documentElement.style.setProperty('--rail-w', '322px');
+    localStorage.removeItem('rail-width');
+    toast('Rail width reset to default');
+  });
+}
+
 /* --------------------------------- wiring -------------------------------- */
+setupRailResizer();
 $('seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) switchView(b.dataset.view); });
 $('new-chat').onclick = () => send('new_chat');
 $('collapse').onclick = toggleSidebar;

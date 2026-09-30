@@ -126,6 +126,11 @@ def refusals(session: dict) -> list[dict]:
         elif kind == "file_not_found":
             out.append({"at": entry.get("at", ""), "what": "read " + str(entry.get("path", "")),
                         "why": "not found" + ("" if entry.get("can_create") else " (creation protected)")})
+        elif kind == "proposal_rejected":
+            # The operator's own "no" belongs in the same list as the tool's refusals: a session that
+            # shows a proposal and then nothing else reads like the work was lost.
+            out.append({"at": entry.get("at", ""), "what": "the proposal",
+                        "why": "declined from the window; the files were left as they were"})
         elif kind == "stopped":
             out.append({"at": entry.get("at", ""), "what": "the task",
                         "why": entry.get("reason") or "the record does not say why it stopped"})
@@ -189,6 +194,9 @@ def summary(session: dict) -> dict:
         "rolled_back": [entry.get("path", "") for entry in session.get("events") or []
                         if entry.get("kind") == "rolled_back_file"],
         "verification": session.get("verification") or None,
+        # `None` rather than `{}` when absent: a session whose provider never reported counts is not a
+        # session that cost zero tokens, and only the reader can tell those apart.
+        "metrics": session.get("metrics") or None,
         "error": _clean(redact(session.get("error", "")))[:300],
         "runs": runs_of(session),
         "reads": reads(session),
@@ -230,7 +238,13 @@ def render_markdown(session: dict) -> str:
                          ("Files written", str(len(data["written"]))),
                          ("Files removed", str(len(data["removed"]))),
                          ("Command runs", str(len(data["runs"]))),
-                         ("Refusals/retries", str(len(data["refusals"])))):
+                         ("Refusals/retries", str(len(data["refusals"]))),
+                         # Measured by the provider, not estimated from the prompt — and said as
+                         # "not reported" when it measured nothing, because a 0 here would read as free.
+                         ("Tokens prompt/completion",
+                          "{} / {}".format(data["metrics"].get("prompt_tokens", "?"),
+                                           data["metrics"].get("completion_tokens", "?"))
+                          if data["metrics"] else "not reported")):
         parts.append("| " + label + " | `" + _line(value) + "` |\n")
 
     # The task text is what the window was given, character for character — that is the point of the

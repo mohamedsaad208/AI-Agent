@@ -9,7 +9,7 @@ import shutil
 import sys
 
 from .config import load_settings, validate
-from .engine import apply_proposal, load_session, plan, review, rollback
+from .engine import apply_proposal, load_session, plan, reopen_proposal, review, rollback
 from .errors import AgentError
 from .providers import make_provider
 from .report import export_file, find_session
@@ -30,8 +30,22 @@ def safe_print(value: str) -> None:
         print(value.encode(encoding, "replace").decode(encoding, "replace"))
 
 
+ROBOT_BANNER = r"""
+     .---------.
+    /  [o] [o]  \
+   |  <code/>   |
+    \  .-----. /
+     '---------'
+  AI Code Engineer - Autonomous Pair Programmer
+"""
+
+
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="agent", description="Review-first Python developer agent (MVP)")
+    root = argparse.ArgumentParser(
+        prog="agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=f"{ROBOT_BANNER.strip()}\n\nReview-first Python developer agent"
+    )
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Check Python, local Ollama, Docker and key presence")
     first = sub.add_parser("setup", help="Run the first checks in order, and prove the red line offline")
@@ -66,10 +80,10 @@ def parser() -> argparse.ArgumentParser:
     draft.add_argument("--runs", type=Path, default=Path(".agent-runs"))
     draft.add_argument("--allow-cloud", action="store_true")
     draft.add_argument("--data-class", choices=["restricted", "public", "synthetic"], default="restricted")
-    for name in ("review", "apply", "rollback", "verify", "status"):
+    for name in ("review", "apply", "reopen", "rollback", "verify", "status"):
         command = sub.add_parser(name)
         command.add_argument("session", type=Path)
-        if name in {"apply", "rollback"}:
+        if name in {"apply", "reopen", "rollback"}:
             command.add_argument("--approve", help="Full proposal SHA256; otherwise asks interactively")
         if name == "verify":
             command.add_argument("--recipe", choices=sorted(RECIPES))
@@ -355,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "status":
                 safe_print(json.dumps({"id": session["id"], "state": session["state"],
                                        "model": session["model"], "events": session["events"]}, indent=2))
-            elif args.command in {"apply", "rollback"}:
+            elif args.command in {"apply", "reopen", "rollback"}:
                 # Checked before anything is asked, because a hash typed for a write that was never
                 # going to happen teaches the operator that the prompts do not mean anything.
                 refuses_sealed(session.get("root", ""), args.command)
@@ -365,7 +379,8 @@ def main(argv: list[str] | None = None) -> int:
                     if not sys.stdin.isatty():
                         raise AgentError("Non-interactive mode requires --approve with the full proposal SHA256.")
                     approved = input("Type the full proposal SHA256 to " + args.command + ": ").strip()
-                operation = apply_proposal if args.command == "apply" else rollback
+                operation = {"apply": apply_proposal, "reopen": reopen_proposal,
+                             "rollback": rollback}[args.command]
                 safe_print("State: " + operation(args.session, approved)["state"])
             elif args.command == "verify":
                 result = verify(args.session, args.recipe, args.image)

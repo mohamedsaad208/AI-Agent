@@ -323,7 +323,8 @@ class CheckpointArgvTests(Scripted):
         self.answer("rev-parse HEAD", out="0123456789abcdef0123456789abcdef01234567\n")
         self.answer("add -- src/a.py src/b.py", out="")
         self.answer("add -- src/a.py", out="")
-        self.answer("commit --no-verify -m agent: fix it [session-s-1]", out="")
+        self.answer("commit --only --no-verify -m agent: fix it [session-s-1] -- src/a.py", out="")
+        self.answer("commit --only --no-verify -m agent: fix it [session-s-1] -- src/a.py src/b.py", out="")
 
     def test_a_checkpoint_stages_named_paths_and_commits_them(self):
         self.a_repository()
@@ -332,7 +333,7 @@ class CheckpointArgvTests(Scripted):
         self.assertEqual(out["hash"], "abc1234")
         self.assertEqual(out["before"], "0123456789abcdef0123456789abcdef01234567")
         self.assertIn("add -- src/a.py src/b.py", self.asked())
-        self.assertIn("commit --no-verify -m agent: fix it [session-s-1]", self.asked())
+        self.assertIn("commit --only --no-verify -m agent: fix it [session-s-1] -- src/a.py src/b.py", self.asked())
 
     def test_the_commit_never_says_add_all(self):
         """`commit -am` would sweep whatever else the developer had open into this commit."""
@@ -357,20 +358,20 @@ class CheckpointArgvTests(Scripted):
     def test_the_commit_skips_the_repositories_hooks(self):
         self.a_repository()
         git.checkpoint(self.root, "fix it", "s-1", ["src/a.py"])
-        self.assertIn("commit --no-verify -m agent: fix it [session-s-1]", self.asked())
+        self.assertIn("commit --only --no-verify -m agent: fix it [session-s-1] -- src/a.py", self.asked())
 
     def test_a_subject_is_one_line_and_names_the_session(self):
         self.a_repository()
-        self.answer("commit --no-verify -m agent: fix the thing now [session-sess-1234567]",
+        self.answer("commit --only --no-verify -m agent: fix the thing now [session-sess-1234567] -- src/a.py",
                     out="")
         git.checkpoint(self.root, "fix\n  the\u00a0thing   now", "sess-1234567890", ["src/a.py"])
-        self.assertIn("commit --no-verify -m agent: fix the thing now [session-sess-1234567]",
+        self.assertIn("commit --only --no-verify -m agent: fix the thing now [session-sess-1234567] -- src/a.py",
                       self.asked())
 
     def test_a_path_outside_the_folder_is_dropped_before_git_sees_it(self):
         self.a_repository()
         self.answer("add -- src/ok.py", out="")
-        self.answer("commit --no-verify -m agent: t [session-x]", out="")
+        self.answer("commit --only --no-verify -m agent: t [session-x] -- src/ok.py", out="")
         out = git.checkpoint(self.root, "t", "x", ["../evil.py", "C:\\evil", ".git/config",
                                                    "src/ok.py"])
         self.assertTrue(out["ok"], out)
@@ -388,7 +389,7 @@ class CheckpointArgvTests(Scripted):
     def test_a_refused_commit_reports_gits_own_line(self):
         self.a_repository()
         self.answer("add -- src/a.py", out="")
-        self.answer("commit --no-verify -m agent: fix it [session-s-1]",
+        self.answer("commit --only --no-verify -m agent: fix it [session-s-1] -- src/a.py",
                     err="fatal: Unable to create '/repo/.git/index.lock': File exists.\n", code=128)
         out = git.checkpoint(self.root, "fix it", "s-1", ["src/a.py"])
         self.assertFalse(out["ok"])
@@ -494,6 +495,55 @@ class LiveRepositoryTests(unittest.TestCase):
         self.assertFalse(info["ok"])
         self.assertTrue(info["reason"])
         self.assertFalse((outside / ".git").exists())
+
+    def test_checkpoint_preserves_unrelated_staged_and_unstaged_content(self):
+        self.commit()
+        self.write("keep.py", "staged = 1\n")
+        self.git("add", "--", "keep.py")
+        self.write("keep.py", "staged = 1\nunstaged = 2\n")
+        staged = self.git("show", ":keep.py")
+        self.write("a.py", "x = 2\n")
+        out = git.checkpoint(self.root, "fix", "s", ["a.py"])
+        self.assertTrue(out["ok"], out["reason"])
+        self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "a.py")
+        self.assertEqual(self.git("show", ":keep.py"), staged)
+        self.assertEqual((self.root / "keep.py").read_text(), "staged = 1\nunstaged = 2\n")
+        self.assertIn("AM keep.py", self.git("status", "--porcelain"))
+
+    def test_new_file_and_deletion_do_not_commit_a_staged_neighbour(self):
+        self.commit()
+        self.write("keep.py", "user = 1\n")
+        self.git("add", "--", "keep.py")
+        self.write("new.py", "new = 1\n")
+        (self.root / "a.py").unlink()
+        out = git.checkpoint(self.root, "replace", "s", ["a.py", "new.py"])
+        self.assertTrue(out["ok"], out["reason"])
+        changed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines()
+        self.assertEqual(sorted(changed), ["a.py", "new.py"])
+        self.assertIn("A  keep.py", self.git("status", "--porcelain"))
+
+    def test_checkpoint_preserves_an_unrelated_staged_deletion(self):
+        self.commit()
+        self.write("keep.py")
+        self.git("add", "--", "keep.py")
+        self.git("commit", "-q", "-m", "keep")
+        (self.root / "keep.py").unlink()
+        self.git("add", "--", "keep.py")
+        self.write("a.py", "x = 2\n")
+        out = git.checkpoint(self.root, "fix", "s", ["a.py"])
+        self.assertTrue(out["ok"], out["reason"])
+        self.assertEqual(self.git("show", "HEAD:keep.py"), "x = 1")
+        self.assertIn("D  keep.py", self.git("status", "--porcelain"))
+
+    def test_checkpoint_paths_are_literal_even_with_git_metacharacters(self):
+        self.commit()
+        self.write("file[1].py", "wanted = 1\n")
+        self.write("file1.py", "unrelated = 1\n")
+        self.git("add", "--", "file1.py")
+        out = git.checkpoint(self.root, "literal name", "s", ["file[1].py"])
+        self.assertTrue(out["ok"], out["reason"])
+        self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "file[1].py")
+        self.assertIn("A  file1.py", self.git("status", "--porcelain"))
 
     def test_a_checkpoint_that_only_named_outside_paths_stages_nothing(self):
         self.commit()

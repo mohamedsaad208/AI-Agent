@@ -201,6 +201,25 @@ class Commands(unittest.TestCase):
         self.assertIn("--approve", text)
         self.assertEqual((self.root / "calculator.py").read_text(encoding="utf-8"), CALCULATOR_BAD)
 
+    def test_cli_requires_reopening_a_declined_proposal(self):
+        from ai_code_engineer import engine
+        path = self.planned_session()
+        session = engine.load_session(path)
+        approved = session["proposal_hash"]
+        engine.event(session, "proposal_rejected", hash=approved)
+        engine.atomic_json(path, session)
+        code, text = self.run_command(["apply", str(path), "--approve", approved])
+        self.assertEqual(code, 1)
+        self.assertIn("declined", text)
+        code, text = self.run_command(["reopen", str(path), "--approve", "wrong"])
+        self.assertEqual(code, 1)
+        code, text = self.run_command(["reopen", str(path), "--approve", approved])
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.root / "calculator.py").read_text(), CALCULATOR_BAD)
+        code, text = self.run_command(["apply", str(path), "--approve", approved])
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.root / "calculator.py").read_text(), CALCULATOR_GOOD)
+
     def test_apply_with_the_wrong_hash_is_refused(self):
         session = self.planned_session()
         code, text = self.run_command(["apply", str(session), "--approve", "0" * 64])

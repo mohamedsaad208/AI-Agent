@@ -163,7 +163,13 @@ class Workspace:
         try:
             content = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise PolicyError("Only UTF-8 files are supported.") from exc
+            # The offset is the point: "not UTF-8" alone is not something anyone can act on, and a
+            # cp1252 `messages_ar.properties` is one byte per line away from a fix. There is no
+            # fallback decode here deliberately — this content can come back as a write, and
+            # re-encoding a file nobody chose to convert rewrites every non-ASCII byte in it.
+            raise PolicyError(
+                f"File '{relative}' is not valid UTF-8 (invalid byte 0x{raw[exc.start]:02x} at "
+                f"offset {exc.start}). Convert it to UTF-8, or keep it out of the task.") from exc
         return {"path": relative, "sha256": digest(raw), "content": content}
 
     def files(self, limit: int = 2000) -> list[str]:

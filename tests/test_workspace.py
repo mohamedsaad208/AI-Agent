@@ -267,7 +267,21 @@ class ReadTests(unittest.TestCase):
         (self.root / "latin.py").write_bytes(b"a = caf\xe9\n")
         with self.assertRaises(PolicyError) as caught:
             self.ws.read("latin.py")
-        self.assertIn("UTF-8", str(caught.exception))
+        refusal = str(caught.exception)
+        # The refusal has to be actionable: the file it names, the exact byte, and its offset, so the
+        # developer can open the editor at that position instead of guessing which line is cp1252.
+        self.assertIn("UTF-8", refusal)
+        self.assertIn("latin.py", refusal)
+        self.assertIn("0xe9", refusal)
+        self.assertIn("offset 7", refusal)
+        self.assertIn("Convert", refusal)
+        # And a file that IS valid UTF-8 with non-ASCII in it must still read whole — the guard against
+        # "fixing" this by decoding leniently, which is what corrupts a later write. (Code points rather
+        # than an Arabic literal, the way this suite keeps its source ASCII.)
+        hello = "".join(map(chr, [0x0645, 0x0631, 0x062D, 0x0628, 0x0627]))
+        (self.root / "arabic.properties").write_text("greeting=" + hello + "\n", encoding="utf-8",
+                                                     newline="\n")
+        self.assertEqual(self.ws.read("arabic.properties")["content"], "greeting=" + hello + "\n")
 
     def test_a_directory_named_like_a_source_file_is_not_one(self):
         # The suffix gate is text, not shape: without the regular-file check a read would hand

@@ -3,9 +3,9 @@
 <img src="assets/banner.svg" alt="AI Code Engineer Banner" width="100%"/>
 
 # AI Code Engineer
-### Give your coding workflow an autonomous, privacy-first software engineer.
+### Reviewable code changes, local models, and evidence-based verification.
 
-AI Code Engineer is an open-source autonomous agent framework for real-world software engineering: AST repository indexing, cryptographic diff proposals, zero-trust workspace security, automated JUnit test loops, and multi-provider LLM support (Ollama local, OpenRouter, OpenAI, Groq, DeepSeek).
+AI Code Engineer is an open-source coding agent with a local Web UI, a Tk fallback, and a CLI. It reads a project, proposes hash-checked diffs, and helps apply, verify, repair, or roll back changes. Use Ollama locally or configure OpenRouter, OpenAI, Groq, DeepSeek, and compatible endpoints.
 
 [![License](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3B82F6?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
@@ -17,6 +17,8 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 [Why AI Code Engineer](#-why-ai-code-engineer) •
 [Platform Guide](#-platform-guide) •
 [Try These First](#-try-these-first) •
+[Plan Files](#plan-files-and-progress) •
+[Troubleshooting](#troubleshooting) •
 [Architecture](#-architecture) •
 [Contributing](#-contributing)
 
@@ -32,7 +34,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 
 | Feature | Why it matters |
 | :--- | :--- |
-| 🔒 **Zero-Trust Security** | Path-traversal guards, symlink blocking, and automatic secret redaction (AWS, GitHub tokens, Bearer keys, `.env`) prevent leakage to logs or LLMs. |
+| 🔒 **Workspace protections** | Path-traversal guards, symlink blocking, sensitive-file restrictions, and credential redaction reduce accidental disclosure. Review what you send to cloud providers. |
 | 🛡️ **Reviewed diffs** | Every change is a proposal with a `SHA-256` hash, and applying it is a decision you make (or hand over per folder, explicitly). Rollback is one step, as long as nothing else edited those files afterwards. |
 | 🌿 **Git Checkpoints & Restore** | Applying an approved proposal inside a git repo automatically creates a non-destructive checkpoint commit (`--no-verify`, skips hooks). If subsequent edits block local rollback, targeted single-file git restore offers a safe escalation path back to the pre-task commit. Never pushes, pulls, or rewrites history. |
 | 🌐 **Native Bilingual & RTL** | First-class Arabic and English dual-engine. Dynamic Right-to-Left (RTL) support in the WebApp, automatic language detection (`is_arabic`), and fully localized system notices, diagnostic reports, and `--arabic` CLI flags. |
@@ -41,7 +43,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 | 🔌 **Endpoints are configuration** | No model server's address is written in the code — the provider table carries one default per row, and a URL resolves as *what you typed → your environment (`OLLAMA_HOST`, `GROQ_BASE_URL`, …) → the table's own row*. Point Ollama at another port without editing a file, and a profile that forgets its endpoint gets **its own** provider's address, never a local default. |
 | 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
 | 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
-| ⏱️ **Zero-Drop Task Queueing** | Messages typed while a task or build is in progress are safely enqueued without race conditions, running automatically in FIFO order when the active job finishes. |
+| ⏱️ **Task queueing** | Queue follow-up requests while a task is running. Quoted context and the actual request stay separate, so a quote does not change whether the request is chat or a file change. |
 | 📑 **Session Audit & Export** | Transcripts, diffs, and proof tallies are exportable to structured JSON or clean, readable Markdown reports (`agent export-session`) for documentation and audits. |
 | 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
 
@@ -49,7 +51,7 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 
 # 🧭 Three modes, and the limits that go with them
 
-**Chat** answers in prose and reads no files until you hand it a folder. **Change** produces a
+The three modes are **Chat**, **Read-only**, and **Change**. **Chat** answers in prose and reads no files until you hand it a folder. **Change** produces a
 proposal you review, and only `Apply` writes. **Auto-Apply** is a switch you turn on *per folder*:
 the agent then writes what it proposes without a click, runs that folder's own command afterwards,
 and keeps the rollback. It still asks first if the proposal would empty or delete an existing file, or
@@ -102,12 +104,21 @@ run-tests.cmd
 
 The suite is the gate CI runs (`.github/workflows/ci.yml`: 3.11 on Windows and Linux, `compileall`,
 `node --check` on the two UI scripts, a wheel build checked for the files the window needs). There is
-no pytest, no `pip install -e .` step and no network access in it.
+no pytest or `pip install -e .` step required for the suite. Provider tests use doubles and local test servers; they do not require a live model or cloud API key.
+
+Run the additional JavaScript behavior checks with Node.js (no npm install required):
+
+```bash
+node tests/test_plan_markdown.cjs
+node tests/test_web_ui_phase2.cjs
+node tests/test_web_ui_phase3.cjs
+```
 
 To open the local web window without an engine behind it — the same UI, scripted data, useful for
 reading the interface before trusting a folder to it:
 
 ```bash
+python -m pip install -e .
 python -m ai_code_engineer.webapp --fake --no-browser --port 8765
 ```
 
@@ -169,6 +180,10 @@ python agent.py status "<session_id>"
 # Export session transcript and diff report to Markdown or JSON
 python agent.py export-session "<session_id>" --format markdown --out session-report.md
 
+# A declined proposal must be explicitly reopened before Apply can accept it.
+# Reopen only restores the offer to review; it does not write project files.
+python agent.py reopen "<session_file>" --approve "<sha256_hash>"
+
 # Rollback if needed
 python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ```
@@ -183,6 +198,10 @@ python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 </div>
 
 The application features a sleek, local WebApp interface served on `127.0.0.1` with:
+- **Compact change card:** One current proposal card updates to the applied state. It shows total files, additions and deletions, the first three files, and a toggle for the rest. File descriptions summarize recorded changes; clicking a file opens its diff.
+- **Clear decisions:** Apply and Reject are available for pending proposals; applied changes offer rollback. A rejected proposal must be explicitly reopened for review, including when Auto-Apply is enabled. Reopening does not write files.
+- **Resizable right rail:** Separate Changes, Tasks, and Checks tabs, activity indicators, and task execution controls keep details beside the conversation.
+- **Compact replies:** Click Reply to quote a message. The reply preview links back to the original message when available. Copy and Reply actions share existing message lines and appear on hover or keyboard focus, with a visible touch fallback.
 - 📂 **Multi-Project Workspace:** Manage isolated branches, project memory notes, and saved tasks.
 - ⚡ **Review-First Diff Inspector:** Side-by-side **Diff / Now / Was** inspector with one-click rollbacks.
 - 🤖 **Universal Model Selector:** Switch on the fly between local models (Ollama/DeepSeek) and cloud APIs (Groq, OpenAI, OpenRouter). A thinking model's deliberation arrives as its own collapsible row — capped, redacted, and never folded into the JSON the loop acts on — and an answer or a proposal streams in as it is written instead of appearing all at once after a minute of dots.
@@ -201,6 +220,52 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
 Both windows are the same product: the web window and the `--tk` fallback share the engine, the
 sentences and the decisions, and each keeps its proposed files in a viewer of its own — a sheet over the
 chat there, a second window you can move beside the conversation on the desktop.
+
+Checkpoint commits include only the proposal's target files, leaving unrelated staged files out of the commit. They capture whole files, so existing edits inside a target file are included. On Windows, command cancellation checks whether process-tree termination succeeded, attempts a direct-process fallback, and reports when a process remains alive.
+
+## Plan files and progress
+
+Attach a plan inside the selected project using **+ Plan**. Both Web and Tk use the same step reader and verification ledger.
+
+Numbered headings take priority:
+
+```markdown
+# Authentication service
+
+## 1. Set up Spring Boot
+Inspect the existing pom.xml and complete the application configuration.
+
+## 2. Add login
+Implement the endpoint and tests.
+```
+
+Numbered lists are also supported when there are no numbered headings:
+
+```markdown
+## Tasks
+1. **Set up Spring Boot**
+   - Inspect existing files before adding dependencies.
+2) Add login
+   - Implement the endpoint and tests.
+```
+
+- Step IDs follow document order, even if written numbers repeat.
+- Indented continuation lines belong to their list item; a new section or unindented prose ends it. Nested items and fenced code examples do not become separate top-level tasks.
+- Plans currently support **up to 50 steps**. Larger plans are refused with an explanation rather than silently truncated.
+- Each step has its own status and session association. A passing command with verification evidence is required before the ledger marks it verified; applying files alone is not completion.
+- Ledgers live in `.agent-plans/`, keyed by project root and plan content. Renaming an unchanged plan does not reset its progress.
+
+## Troubleshooting
+
+| Message or symptom | What to do |
+| :--- | :--- |
+| **Legacy plan ledger is linked to prior work** | An older reader stored the plan as one step, and that step has execution history. Review its session and current files before moving to a revised plan or a backed-up, reviewed ledger migration. The app preserves linked or verified history instead of resetting it automatically. Untouched legacy fallback ledgers can be rebuilt safely. |
+| **Plan has too many steps** | Split the work into smaller plans within the current 50-step limit. Existing ledgers do not bypass the check. |
+| **Proposal declined / Apply disabled** | Choose **Reopen for review**, inspect the diff, then apply. The CLI equivalent is `agent reopen SESSION_FILE --approve HASH`. |
+| **Files changed after review** | Create a new proposal against the current files; do not bypass the stale-file check. |
+| **UI still behaves like an older version** | Restart the application after updating its code. If using an installed package, update that installation too; running the module may otherwise load the installed copy rather than this checkout. |
+
+Project files, conversation history, and verification are separate records. Neither a migration nor a successful UI action should be treated as proof that project tests passed.
 
 ---
 
@@ -262,7 +327,7 @@ chat there, a second window you can move beside the conversation on the desktop.
 | `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
 | `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
 | `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | **the gate.** 1534 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `tests/` | Python `unittest` coverage plus standalone Node.js rendering checks. `doubles.py` and `helpers.py` provide shared fixtures; a live model is not required. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
 | `docs/` | plans, implementation status, code reviews — **local working notes, gitignored.** They quote this machine's paths, ports and counts, so they are kept on the device that measured them instead of shipped as product files. The rules they describe live in the modules' own docstrings, and the test suite is the gate: nothing in `src/`, `tests/` or CI reads a `docs/` file. |
@@ -270,7 +335,7 @@ chat there, a second window you can move beside the conversation on the desktop.
 | `sandbox/` | probes that produced a number someone quoted, kept so the number can be re-measured. |
 | `examples/` | folders the agent is pointed at to try it out. |
 | `archive/` | see `archive/README.md` — including why two experiment folders were **not** moved into it. |
-| `.agent-chats/`, `.agent-runs/`, `.agent-projects.json` | what the tool writes next to itself: conversations, run records, the granted-folder registry. Ignored by git, and the history in them is addressed by absolute path. |
+| `.agent-chats/`, `.agent-runs/`, `.agent-plans/`, `.agent-projects.json` | Local conversations, run records, plan progress, and the granted-folder registry. Ignored by git; publishing the source does not upload these records. |
 
 ---
 
@@ -293,7 +358,7 @@ We welcome contributions from the global open-source community!
    ```
 5. **Push to your fork and submit a Pull Request (PR).**
 
-> ⚠️ **Branch Protection Note:** Direct pushes to `main` are restricted. All contributions must go through Pull Requests and pass automated verification.
+Please submit contributions through pull requests and keep automated checks passing.
 
 ---
 

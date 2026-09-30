@@ -651,6 +651,50 @@ class ProcessDisciplineTests(unittest.TestCase):
                     patch.object(runner.os, "killpg", create=True, side_effect=ProcessLookupError):
                 runner.kill_tree(Gone())
 
+    def test_taskkill_failure_status_uses_the_direct_child_fallback(self):
+        child = unittest.mock.Mock(pid=4321)
+        for code in (1, 128):
+            with self.subTest(code=code), patch.object(runner.os, "name", "nt"), \
+                    patch.object(runner.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], code)):
+                child.kill.reset_mock()
+                runner.kill_tree(child)
+                child.kill.assert_called_once()
+
+    def test_successful_taskkill_does_not_kill_the_child_twice(self):
+        child = unittest.mock.Mock(pid=4321)
+        with patch.object(runner.os, "name", "nt"), \
+                patch.object(runner.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 0)):
+            runner.kill_tree(child)
+        child.kill.assert_not_called()
+
+    def test_a_failed_kill_does_not_block_closing_the_output_pipe(self):
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import time; print('up', flush=True); time.sleep(30)"],
+                                 stdout=subprocess.PIPE)
+        started = time.monotonic()
+        try:
+            def failed_display(_line):
+                raise RuntimeError("display failed")
+            with patch.object(runner, "kill_tree"), self.assertRaisesRegex(RuntimeError, "display failed"):
+                runner._collect(child, failed_display, started + 10)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertIsNone(child.poll())
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+
+    def test_a_child_that_survives_cleanup_is_reported(self):
+        holder, name = self.script_recipe("pass")
+        child = unittest.mock.Mock(pid=4321, returncode=None)
+        child.wait.side_effect = subprocess.TimeoutExpired("child", 5)
+        with holder, patch.object(runner.subprocess, "Popen", return_value=child), \
+                patch.object(runner, "_collect", side_effect=RuntimeError("display failed")), \
+                patch.object(runner, "kill_tree"), \
+                self.assertRaisesRegex(PolicyError, "could not be stopped"):
+            runner.run(self.root, name)
+
     def test_a_child_the_os_will_not_reap_still_hands_over_its_output(self):
         class Wedged:
             pid = 4321

@@ -56,7 +56,7 @@ MAX_PATHS = 500
 COMMIT_TIMEOUT = 20.0
 
 # Global options, in the order git expects them, before the subcommand.
-PREFIX = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "color.ui=false"]
+PREFIX = ["--no-optional-locks", "--literal-pathspecs", "-c", "core.fsmonitor=false", "-c", "color.ui=false"]
 
 # Environment the child gets on top of the scrubbed toolchain env. The scrub itself
 # matters: GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE in the parent's environment would
@@ -257,7 +257,11 @@ def checkpoint(root: str | Path, task: str, session_id: str, paths: list[str]) -
         return result
     subject = ("agent: " + " ".join((task or "change").split())[:120]
                + " [session-" + str(session_id)[:12] + "]")
-    committed = _done(folder, ["commit", "--no-verify", "-m", subject], COMMIT_TIMEOUT)
+    # A plain commit also consumes unrelated paths already in the user's index. --only
+    # commits the named files' current contents and preserves the other staged entries.
+    # These are whole-file checkpoints, including any prior edits in the named files.
+    committed = _done(folder, ["commit", "--only", "--no-verify", "-m", subject,
+                               "--", *targets], COMMIT_TIMEOUT)
     if not committed["ok"]:
         result["reason"] = (_first_line(committed["err"]) or _first_line(committed["out"])
                             or "git had nothing to commit")

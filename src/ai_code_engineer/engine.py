@@ -17,7 +17,7 @@ from .errors import AgentError, Cancelled, MissingFileError, PolicyError
 from . import labels
 from . import memory as memory_module
 from . import symbols
-from .providers import ModelProvider
+from .providers import ModelProvider, metrics_of
 from .redaction import redact
 from .workspace import Workspace, digest
 
@@ -661,7 +661,9 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         raise AgentError(f"Task must contain 1-{MAX_TASK_CHARS} characters.")
     # The task decides the language the loop announces in, exactly as it decides the language the
     # model answers in — a window that has been used for both must not switch halfway through.
-    arabic = labels.is_arabic(task)
+    # The reference block is stripped first: it is written in the language of the *quoted* message,
+    # and an English question quoting an Arabic reply would otherwise announce itself in Arabic.
+    arabic = labels.is_arabic(labels.asked_of(task))
 
     def announce(action: str, **fields) -> None:
         """One thing the loop just did, said three ways: the strip, the conversation, the record.
@@ -820,6 +822,14 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             thought = str(getattr(provider, "reasoning", "") or "")
             if thought:
                 announce("model_reasoning", count=len(thought), detail=thought)
+            counted = metrics_of(provider)
+            if counted:
+                # Summed over the task's turns, because the number worth having is what one task cost.
+                # A provider that reports nothing writes no key at all: an audit that finds `metrics`
+                # missing can then tell "nobody measured" from "it was free", which a 0 could not.
+                spent = session.setdefault("metrics", {})
+                for field, value in counted.items():
+                    spent[field] = spent.get(field, 0) + value
             if cancelled is not None and cancelled():
                 raise Cancelled("Planning cancelled; no project files changed.")
             repeated[raw] = repeated.get(raw, 0) + 1
@@ -886,8 +896,16 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                     announce("search_code", query=action["query"], count=len(result["matches"]))
                 elif name == "find_symbol" and set(action) == {"action", "query"}:
                     _files, rows = ws.index()
-                    hits = symbols.find_symbol(rows, action["query"])
-                    result = {"declarations": hits}
+                    # One more than the cap, the way `list_files` learns it truncated. An answer that
+                    # filled 40 and an answer that is 40 arrive identical otherwise, and a small model
+                    # reads the first one as "this project declares this name 40 times".
+                    found = symbols.find_symbol(rows, action["query"], limit=symbols.MAX_HITS + 1)
+                    hits = found[:symbols.MAX_HITS]
+                    result = {"declarations": hits, "truncated": len(found) > len(hits)}
+                    if result["truncated"]:
+                        result["note"] = (f"Only the first {symbols.MAX_HITS} are shown; more "
+                                          "declarations exist in the repository. Name the file or "
+                                          "narrow the identifier before reading.")
                     if not hits:
                         # An empty answer with nothing after it is the shape a small model replies to by
                         # asking the same question again. `read_file` does this already via `next_step`.
@@ -898,22 +916,35 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                         "No declaration of that name is in the index, which is an answer: the project "
                         "does not define it. Propose the files the plan calls for instead of blocking: "
                         + PROPOSE_SHAPE)
-                    event(session, "tool", name=name, query=action["query"], count=len(hits))
+                    event(session, "tool", name=name, query=action["query"], count=len(hits),
+                          truncated=result["truncated"])
                     announce("find_symbol", query=action["query"], count=len(hits))
                 elif name == "find_references" and set(action) == {"action", "query"}:
                     _files, rows = ws.index()
-                    sites = symbols.find_references(action["query"], ws.sources(rows), rows)
+                    found = symbols.find_references(action["query"], ws.sources(rows), rows,
+                                                    limit=symbols.MAX_HITS + 1)
+                    sites = found[:symbols.MAX_HITS]
                     result = {"sites": sites,
+                              "truncated": len(found) > len(sites),
+                              # The per-file ceiling is a rule the answer always obeys, not something
+                              # this call can detect after the fact, so it is stated rather than
+                              # inferred: one file with twenty uses reports six and looks complete.
+                              "caps": {"total": symbols.MAX_HITS,
+                                       "per_file": symbols.PER_FILE_LIMIT},
                               "summary": {kind: sum(1 for row in sites if row["kind"] == kind)
                                           for kind in sorted({row["kind"] for row in sites})},
                               "files": sorted({row["path"] for row in sites})}
+                    if result["truncated"]:
+                        result["note"] = (f"(truncated at {symbols.MAX_HITS} matches; more references "
+                                          "exist in the repository)")
                     if not sites:
                         result["next_step"] = ("No code names it. search_code answers text, including "
                                                "configuration and comments; or propose if it is new.")
                     recoverable = "" if sites else (
                         "Nothing in the indexed code names it. Try search_code for text, or propose: "
                         + PROPOSE_SHAPE)
-                    event(session, "tool", name=name, query=action["query"], count=len(sites))
+                    event(session, "tool", name=name, query=action["query"], count=len(sites),
+                          truncated=result["truncated"])
                     announce("find_references", query=action["query"], count=len(sites))
                 elif name == "propose" and {"action", "changes"} <= set(action) <= {
                         "action", "summary", "checks", "changes"}:
@@ -1171,10 +1202,37 @@ def review(session: dict) -> str:
     return "\n".join(rows)
 
 
+def proposal_rejected(session: dict) -> bool:
+    """The latest decision for this exact proposal, shared by every surface."""
+    wanted = session.get("proposal_hash")
+    if not wanted:
+        return False
+    for item in reversed(session.get("events", [])):
+        if item.get("hash") == wanted and item.get("kind") in {
+            "proposal_rejected", "proposal_reopened",
+        }:
+            return item["kind"] == "proposal_rejected"
+    return False
+
+
+def reopen_proposal(path: Path, approved_hash: str) -> dict:
+    """Explicitly reopen a declined proposal; this never applies its files."""
+    session = load_session(path)
+    if session["state"] != "WAITING_APPROVAL" or approved_hash != session.get("proposal_hash"):
+        raise PolicyError("Reopening requires the matching pending proposal hash.")
+    if not proposal_rejected(session):
+        raise PolicyError("This proposal has not been declined.")
+    event(session, "proposal_reopened", hash=approved_hash)
+    atomic_json(path, session)
+    return session
+
+
 def apply_proposal(path: Path, approved_hash: str) -> dict:
     session = load_session(path)
     if session["state"] != "WAITING_APPROVAL" or approved_hash != session.get("proposal_hash"):
         raise PolicyError("Approval must match the pending proposal hash.")
+    if proposal_rejected(session):
+        raise PolicyError("This proposal was declined. Reopen it for review before applying it.")
     ws = Workspace(Path(session["root"]))
     reference = session.get("plan_reference")
     if reference and ws.read(reference["path"])["sha256"] != reference["sha256"]:

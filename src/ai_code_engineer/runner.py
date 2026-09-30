@@ -407,10 +407,11 @@ def kill_tree(process: subprocess.Popen) -> None:
     if os.name == "nt":
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
                            capture_output=True, stdin=subprocess.DEVNULL, timeout=30,
                            creationflags=flags)
-            return
+            if result.returncode == 0:
+                return
         except (OSError, subprocess.SubprocessError):
             pass                       # taskkill absent or wedged: fall back to the direct child
     else:
@@ -605,14 +606,33 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
     # would turn each spinner redraw into its own log entry.
     stream = io.TextIOWrapper(process.stdout, encoding="utf-8", errors="replace", newline="\n")
 
+    stopped = threading.Event()
+
+    def put_chunk(chunk):
+        # A failed display consumer must not leave this reader blocked on a full queue.
+        while not stopped.is_set():
+            try:
+                chunks.put(chunk, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
     def reader():
         try:
             for chunk in iter(stream.readline, ""):
-                chunks.put(chunk)
+                if stopped.is_set():
+                    break
+                put_chunk(chunk)
         except (OSError, ValueError):
             pass                       # the pipe closes when the process dies
         finally:
-            chunks.put(None)
+            # This thread owns the buffered reader's lock. Closing it in the collector
+            # can block forever if the OS refuses to stop a child still holding the pipe.
+            try:
+                stream.close()
+            except OSError:
+                pass
+            put_chunk(None)
 
     threading.Thread(target=reader, daemon=True, name="agent-output").start()
     try:
@@ -669,15 +689,9 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
                 # A child the OS will not reap is not a reason to lose the output we already read.
                 pass
     finally:
-        # A progress sink that raises escapes from the middle of the loop above with the child
-        # still running. Closing first would block here: the reader thread holds the buffer's lock
-        # until the pipe closes, so the child has to die before the stream can.
+        stopped.set()
         if process.returncode is None:
             kill_tree(process)
-        try:
-            stream.close()
-        except OSError:
-            pass
     return text, timed_out, dropped
 
 
@@ -790,6 +804,7 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
             try:
                 process.wait(timeout=POST_KILL_GRACE)
             except subprocess.TimeoutExpired:
+                # Finish the other cleanup below before reporting that this process survived.
                 pass
         if name:
             # `--rm` removes a container that exits; one that was killed does not get the chance, and a
@@ -806,6 +821,9 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
             sandbox_dir.cleanup()
         if reports is not None:
             reports.cleanup()
+        if process is not None and process.returncode is None:
+            raise PolicyError(f"Build process {process.pid} could not be stopped. "
+                              "It may still be running; stop it before starting another build.")
     return {"recipe": recipe, "label": recipe_entry["label"],
             # Which folder of this project the command actually ran in, recorded rather than implied:
             # a reactor's root and one module of it answer to the same recipe name, and a fix round

@@ -95,6 +95,42 @@ class FriendlyErrorTests(unittest.TestCase):
         self.assertIn("Settings", text)
 
 
+class CompactReviewContract(unittest.TestCase):
+    def test_summaries_cover_authored_and_legacy_changes_without_mutating_the_proposal(self):
+        import copy
+        controller = AgentController.__new__(AgentController)
+        controller.session = {"id": "task", "proposal_hash": "hash", "state": "WAITING_APPROVAL",
+                              "changes": [
+            {"path": "canvas.html", "before": None, "after": "<canvas></canvas>\n",
+             "description": "Added canvas\n   for the game"},
+            {"path": "game.py", "before": "def old():\n    pass\n", "after": "def move():\n    pass\n"},
+            {"path": "old.txt", "before": "old\n", "after": None, "delete": True},
+        ]}
+        controller.busy = False
+        controller.review_file = 0
+        controller.diff_tab = "diff"
+        controller.messages = []
+        controller.rejected = lambda: False
+        controller.reading_only = lambda: False
+        original = copy.deepcopy(controller.session)
+        review = controller._review()
+        self.assertEqual(review["files"][0]["summary"], "Added canvas for the game")
+        self.assertIn("move", review["files"][1]["summary"])
+        self.assertIn("Removed", review["files"][2]["summary"])
+        self.assertEqual([(f["add"], f["del"]) for f in review["files"]], [(1, 0), (1, 1), (0, 1)])
+        self.assertTrue(review["pending"])
+        self.assertEqual(controller.session, original)
+
+    def test_explicit_reply_keeps_the_selected_duplicate_message(self):
+        controller = AgentController.__new__(AgentController)
+        controller.messages = [{"role": "assistant", "text": "Same words"},
+                               {"role": "assistant", "text": "Same words"}]
+        controller._state = threading.RLock()
+        controller._emit = lambda event: None
+        controller._add("user", "You", controller.with_quote("Explain", 0), quote_of=0)
+        self.assertEqual(controller.messages[-1]["replyTo"], 0)
+
+
 class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -134,6 +170,23 @@ class ControllerTests(unittest.TestCase):
         return self.controller.snapshot()
 
     # ---------------------------- the happy path ----------------------------
+    def test_invalid_attached_plan_reports_its_error_without_crashing(self):
+        from ai_code_engineer import planbook
+        count = planbook.MAX_STEPS + 1
+        plan = self.repo / "too-many-steps.md"
+        plan.write_text("\n".join(f"{i}. Task {i}" for i in range(1, count + 1)), encoding="utf-8")
+        self.controller.answers["plan"] = str(plan)
+        events = []
+        with patch.object(self.controller, "_emit", side_effect=events.append):
+            self.controller.browse_plan()
+        self.assertEqual(self.controller.plan_file, "")
+        self.assertIsNone(self.controller.ledger)
+        self.assertIn(f"{count} steps", self.controller.status)
+        self.assertIn(str(planbook.MAX_STEPS), self.controller.status)
+        notice = next(event for event in events if event.get("kind") == "toast")
+        self.assertEqual(notice["text"], self.controller.status)
+        self.assertEqual(notice["level"], "bad")
+
     def test_plan_then_apply_then_a_passing_run_with_proof(self):
         state = self.plan_a_fix()
         self.assertEqual(state["review"]["state"], "Changes ready for review")
@@ -2538,6 +2591,17 @@ class TheModelFilter(unittest.TestCase):
         served = [entry["id"] for entry in self.controller.snapshot()["provider"]["models"]]
         self.assertEqual(served, ["codellama:13b"])
 
+    def test_the_snapshot_carries_the_cost_of_the_task_on_screen(self):
+        self.controller.session = {"id": "s-1", "root": str(self.controller.app_dir),
+                                   "state": "PROPOSED", "changes": [],
+                                   "metrics": {"prompt_tokens": 2050, "completion_tokens": 180}}
+        self.assertEqual(self.controller.snapshot()["provider"]["metrics"],
+                         {"prompt_tokens": 2050, "completion_tokens": 180})
+
+    def test_a_window_that_has_run_nothing_says_nothing_about_cost(self):
+        # `{}` rather than zeros: the drawer would otherwise open claiming the last answer was free.
+        self.assertEqual(self.controller.snapshot()["provider"]["metrics"], {})
+
     def test_the_settings_line_says_what_the_filter_hid(self):
         self.controller.model = ""
         self.controller.set_filter("cloud")
@@ -2785,6 +2849,47 @@ class QueueTests(unittest.TestCase):
         summary = [text for text in texts if "Batch finished" in text]
         self.assertEqual(len(summary), 1, "one row per batch, not one per task: " + repr(texts[-3:]))
         self.assertIn("1 task(s)", summary[0])
+
+    def test_two_drains_in_the_same_tick_take_the_row_once(self):
+        """A finished job is not the only thread that reaches for a queued row: two jobs can end in one
+        tick, and until the claim was made under the same lock as `busy` both of them saw an idle
+        window. The one that lost then re-queued the text the winner had already taken out of the
+        queue, so the operator's single message ran twice and the batch reported two tasks for it —
+        seen 7 times in 60 runs of the test above under load, and 8 in 60 at this commit's parent.
+
+        This reproduces the tick instead of waiting for it: the second drain is called while the first
+        is still choosing, which is the exact moment the two used to disagree about.
+        """
+        queued = "Add a helper that reads the config file"
+        self.controller.set_auto_apply(True)
+        self.running()
+        self.action("queue_add", text=queued)
+        real = self.controller.start_plan
+        reached, while_it_chose = [], []
+
+        def watching(text, quote_of=None):
+            reached.append(text)
+            if text == queued and not while_it_chose:
+                while_it_chose.append("second drain")
+                second = threading.Thread(target=self.controller._drain_queue)
+                second.start()
+                second.join(timeout=10)
+                # Read inside the first drain's own decision: a row the second one took would be gone,
+                # and a row it re-queued would be a second copy of the same text.
+                while_it_chose.append(len(self.controller.queue))
+            return real(text, quote_of)
+
+        self.controller.start_plan = watching
+        self.finish()
+        self.assertEqual(reached.count(queued), 1,
+                         "one reach for the row, not one per drain: " + repr(reached))
+        self.assertEqual(while_it_chose[1:], [1], "the row was still queued when the second drain "
+                         "looked — it took nothing, and re-queued nothing")
+        self.assertEqual(self.queued(), [])
+        summary = next(text for text in (message["text"] for message in
+                                         self.controller.snapshot()["messages"]
+                                         if message["role"] == "tool") if "Batch finished" in text)
+        self.assertIn("1 task(s)", summary)
 
     def test_the_batch_row_flags_the_count_the_task_asked_for(self):
         """D36: "Create exactly two new files" answered with one. The flag reads only the literal
@@ -3159,6 +3264,410 @@ class TheStepRows(unittest.TestCase):
         self.assertTrue(state["log_note"])
 
 
+class TheReplayedActivityLog(unittest.TestCase):
+    """UI 4.6: a reopened task's Activity rows are sentences, not the engine's notebook.
+
+    `display_session` rebuilt each row by joining the stored record's own fields, so the list an
+    operator came back to read said `tool name=read_file path=pom.xml sha256=9f3c2…`. Worse, a
+    `plan_attached` record carries the plan's whole body in `content`, so one status row printed a
+    file's worth of text. The rows now go through `labels.log_line`, in the language the task was
+    asked in — the same reason the step rows already had (`_history_steps`).
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name).resolve()
+        self.repo = sandbox_repo(self.app_dir)
+        self.model = SteppingModel()
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
+                        patched_catalog()):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(self.app_dir)
+        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        self.controller.model = "test-local"
+        self.controller.set_repo(str(self.repo))
+        self.addCleanup(self.controller.close)
+
+    def reopen(self, task="Fix add in calculator.py", events=()):
+        self.controller.start_plan(task)
+        self.controller.join()
+        self.controller.session["events"].extend(events)
+        # The file is what `display_session` reads, so a test that only edited memory would prove nothing.
+        atomic_json(self.controller.session_path, self.controller.session)
+        self.controller.display_session(self.controller.session_path, select=True)
+        return self.controller.snapshot()["log"]
+
+    def test_a_reopened_task_says_what_happened_instead_of_dumping_its_fields(self):
+        rows = self.reopen(events=[
+            {"at": "2026-09-28T10:00:01", "kind": "tool", "name": "read_file",
+             "path": "pom.xml", "sha256": "9f3c2a1b"},
+            {"at": "2026-09-28T10:00:02", "kind": "written", "path": "src/a.py",
+             "sha256": "aa11bb22"}])
+        texts = [row["text"] for row in rows]
+        joined = "\n".join(texts)
+        self.assertNotIn("sha256=", joined, "an audit field is not a sentence")
+        self.assertNotIn("name=read_file", joined)
+        self.assertIn("\U0001f4d6 Read pom.xml", texts)
+        self.assertIn("\U0001f4be Wrote src/a.py", texts)
+
+    def test_a_plan_row_names_the_file_and_not_its_whole_body(self):
+        body = "Create the package. Reject duplicate emails."
+        joined = "\n".join(row["text"] for row in self.reopen(events=[
+            {"at": "2026-09-28T10:00:03", "kind": "plan_attached",
+             "path": "docs/PLAN.md", "content": body}]))
+        self.assertNotIn(body, joined, "the plan body belongs in the prompt, not in a status row")
+        self.assertIn("docs/PLAN.md", joined)
+
+    def test_a_kind_no_window_has_met_is_still_said_by_name(self):
+        rows = self.reopen(events=[{"at": "2026-09-28T10:00:04", "kind": "seismograph", "depth": 3}])
+        text = next(row["text"] for row in rows if row["kind"] == "seismograph")
+        self.assertEqual(text, "\u2699\ufe0f seismograph",
+                         "a row that comes out blank hides a whole phase of a run")
+        self.assertNotIn("depth", text)
+
+    def test_the_replay_keeps_the_language_the_task_was_asked_in(self):
+        rows = self.reopen(task="\u0635\u0644\u062d \u062f\u0627\u0644\u0629 add \u0641\u064a calculator.py",
+                           events=[{"at": "2026-09-28T10:00:05", "kind": "rolled_back"}])
+        text = next(row["text"] for row in rows if row["kind"] == "rolled_back")
+        self.assertTrue(labels.is_arabic(text), repr(text))
+
+
+    def test_a_reopened_task_marks_its_records_as_records(self):
+        """The client sorts Activity by this flag: a stored record goes into the block under the list,
+        a sentence the window wrote stays in the list. An unmarked replay row would read as a milestone
+        that happened twice."""
+        rows = self.reopen(events=[{"at": "2026-09-28T10:00:06", "kind": "proposal_rejected",
+                                    "hash": "a" * 64}])
+        self.assertTrue(all(row.get("audit") for row in rows), repr(rows[-1]))
+        self.controller._note("progress", "still working")
+        self.assertNotIn("audit", self.controller.snapshot()["log"][-1])
+
+
+class DecliningAProposal(unittest.TestCase):
+    """UI 4.6: Reject answers a proposal without discarding it or writing it.
+
+    There was no way to say no before this: dismissing an offer meant rolling back a write that had
+    already happened, or leaving a proposal on screen while the next task overwrote it. The refusal is
+    recorded in the session rather than kept beside it, which is what lets the same answer hold after a
+    restart and lets a *new* proposal from the same task be asked about again.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name).resolve()
+        self.repo = sandbox_repo(self.app_dir)
+        self.model = SteppingModel()
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
+                        patched_catalog()):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(self.app_dir)
+        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        self.controller.model = "test-local"
+        self.controller.set_repo(str(self.repo))
+        self.addCleanup(self.controller.close)
+        self.controller.start_plan("Fix add in calculator.py")
+        self.controller.join()
+
+    def test_declining_keeps_the_diff_and_loses_the_offer(self):
+        self.controller.action("reject", {}, lambda event: None)
+        state = self.controller.snapshot()
+        self.assertTrue(state["review"]["rejected"])
+        self.assertFalse(state["review"]["canApply"], "the offer is gone")
+        self.assertFalse(state["review"]["canRollback"], "and there is nothing to undo: nothing ran")
+        self.assertEqual(len(state["review"]["files"]), 1, "the diff is still there to read")
+        self.assertEqual(state["artifact"]["state"], "Rejected")
+        self.assertEqual(state["artifact"]["tone"], "idle")
+        self.assertFalse(state["artifact"]["written"])
+
+    def test_declining_writes_nothing_and_says_so_in_the_thread(self):
+        self.controller.action("reject", {}, lambda event: None)
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD,
+                         "a refusal that edited the file would be the red line, not a click")
+        row = next(message for message in self.controller.snapshot()["messages"]
+                   if message["role"] == "tool" and "declined" in message["text"])
+        self.assertEqual(row["text"], labels.rejected_note(arabic=False, count=1))
+
+    def test_the_answer_is_in_the_task_record_and_survives_a_reopen(self):
+        self.controller.action("reject", {}, lambda event: None)
+        path = self.controller.session_path
+        self.assertIn("proposal_rejected",
+                      [item.get("kind") for item in load_session(path).get("events", [])])
+        self.controller.display_session(path, select=True)
+        state = self.controller.snapshot()
+        self.assertTrue(state["review"]["rejected"])
+        self.assertFalse(state["review"]["canApply"])
+        self.assertEqual(state["log"][-1]["text"], "\U0001f6ab Proposal declined — nothing was written")
+
+    def test_a_later_proposal_from_the_same_task_is_answerable_again(self):
+        self.controller.action("reject", {}, lambda event: None)
+        self.controller.session["proposal_hash"] = "a" * 64
+        self.assertFalse(self.controller.rejected(),
+                         "the refusal belongs to one proposal, not to the whole conversation")
+        self.assertTrue(self.controller.snapshot()["review"]["canApply"])
+
+    def test_a_sealed_folder_answers_a_refusal_with_a_refusal(self):
+        self.controller.set_composer("read")
+        self.controller.reject()
+        self.assertIn(intent.no_write("Reject"), self.controller.snapshot()["status"])
+        self.assertNotIn("proposal_rejected",
+                         [item.get("kind") for item in self.controller.session.get("events", [])])
+
+    def test_declining_twice_says_it_once(self):
+        self.controller.action("reject", {}, lambda event: None)
+        before = len(self.controller.snapshot()["messages"])
+        self.controller.reject()
+        self.assertEqual(len(self.controller.snapshot()["messages"]), before)
+        self.assertIn("already declined", self.controller.snapshot()["status"].lower())
+
+    def test_apply_action_cannot_override_a_decline(self):
+        self.controller.reject()
+        before = len(self.controller.asked)
+        self.controller.action("apply", {}, lambda _event: None)
+        self.controller.join()
+        self.assertEqual(len(self.controller.asked), before, "no approval dialog may override the refusal")
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+        self.assertEqual(load_session(self.controller.session_path)["state"], "WAITING_APPROVAL")
+        self.assertIn("declined", self.controller.status)
+
+    def test_reopening_is_review_only_even_with_auto_apply(self):
+        self.controller.set_auto_apply(True)
+        self.controller.reject()
+        path = self.controller.session_path
+        self.assertTrue(self.controller.snapshot()["review"]["canReopen"])
+        self.controller.action("reopen", {}, lambda _event: None)
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+        self.assertTrue(self.controller.snapshot()["review"]["canApply"])
+        self.assertFalse(self.controller.snapshot()["review"]["canReopen"])
+        self.controller.display_session(path, select=True)
+        self.assertFalse(self.controller.rejected(), "the reopen must survive loading the session")
+        self.assertEqual(load_session(path)["events"][-1]["kind"], "proposal_reopened")
+
+    def test_sealed_folder_cannot_reopen_a_declined_proposal(self):
+        self.controller.reject()
+        self.controller.set_composer("read")
+        self.controller.reopen()
+        self.assertTrue(self.controller.rejected())
+        self.assertFalse(self.controller.snapshot()["review"]["canReopen"])
+
+
+class AnsweringAnEarlierMessage(unittest.TestCase):
+    """UI 4.6: a message can point back at one already in the thread.
+
+    Three things had to hold together. The quotation is read out of the window's own record rather than
+    sent in from the browser, so it cannot say something that was never said. The block is composed
+    before the length ceiling measures the message, so attaching a reference cannot make a legal prompt
+    refuse itself. And the operator's own words still decide the route — a quoted "fix add in
+    calculator.py" inside a question about that task must not turn the question into a change request.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name).resolve()
+        self.repo = sandbox_repo(self.app_dir)
+        self.model = SteppingModel()
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
+                        patched_catalog()):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.controller = Scripted(self.app_dir)
+        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        self.controller.model = "test-local"
+        self.controller.set_repo(str(self.repo))
+        self.addCleanup(self.controller.close)
+        self.events: list[dict] = []
+        self.controller.start_plan("Fix add in calculator.py")
+        self.controller.join()
+
+    def row(self, role):
+        rows = self.controller.snapshot()["messages"]
+        return [index for index, row in enumerate(rows) if row["role"] == role]
+
+    def test_the_reference_comes_first_and_says_whose_words_they_are(self):
+        answer = self.row("assistant")[-1]
+        self.controller.action("send", {"text": "why that file and not the service",
+                                        "quote_of": answer}, self.events.append)
+        self.controller.join()
+        text = [row for row in self.controller.snapshot()["messages"] if row["role"] == "user"][-1]["text"]
+        self.assertTrue(text.startswith('> [In reference to the agent\'s earlier reply: "'), text[:60])
+        block, asked = text.split("\n\n", 1)
+        self.assertEqual(asked, "why that file and not the service")
+        self.assertNotIn("why that file", block, "the quotation quotes the answer, not the question")
+
+    def test_a_stale_or_fabricated_index_sends_the_message_as_it_was_typed(self):
+        for index in (9999, -1, "0 and also my own words"):
+            self.controller.action("send", {"text": "carry on", "quote_of": index},
+                                   self.events.append)
+            self.controller.join()
+            text = [row for row in self.controller.snapshot()["messages"]
+                    if row["role"] == "user"][-1]["text"]
+            self.assertEqual(text, "carry on", f"index {index!r} invented a reference")
+
+    def test_the_ceiling_measures_the_message_the_model_will_read(self):
+        from ai_code_engineer.engine import MAX_TASK_CHARS
+        answer = self.row("assistant")[-1]
+        self.controller.action("send", {"text": "x" * (MAX_TASK_CHARS - 4), "quote_of": answer},
+                               self.events.append)
+        self.controller.join()
+        self.assertEqual(self.controller.snapshot()["status"], labels.status_text("too_long"),
+                         "the block slipped past a ceiling that only weighed the typed half")
+
+    def test_a_quoted_change_request_stays_a_question(self):
+        """Chat mode over a project promotes a message that *asks* for a change. The promotion reads
+        the operator's words, so quoting an old imperative back at them is still a question."""
+        asked = self.row("user")[0]
+        self.controller.set_composer("chat")
+        self.controller.action("send", {"text": "what went wrong there?", "quote_of": asked},
+                               self.events.append)
+        self.controller.join()
+        self.assertIsNone(self.controller.session, "the quote turned a question into a plan")
+        self.assertEqual(self.controller.snapshot()["messages"][-1]["role"], "assistant")
+
+    def test_a_queued_message_is_written_out_before_the_queue_drains(self):
+        answer = self.row("assistant")[-1]
+        self.controller.busy = True
+        try:
+            self.controller.action("queue_add", {"text": "and now the tests", "quote_of": answer},
+                                   self.events.append)
+        finally:
+            self.controller.busy = False
+        item = self.controller.snapshot()["queue"]["items"][-1]
+        self.assertTrue(item["text"].startswith('> [In reference to the agent\'s earlier reply: "'),
+                        item["text"][:60])
+
+    def test_the_title_names_the_request_rather_than_the_reference(self):
+        answer = self.row("assistant")[-1]
+        self.controller.action("send", {"text": "why that file", "quote_of": answer},
+                               self.events.append)
+        self.controller.join()
+        self.assertEqual(self.controller.title, "why that file")
+        self.assertNotIn("> [", self.controller.snapshot()["review"]["title"])
+
+    def test_the_block_is_written_in_the_language_of_the_message_being_sent(self):
+        asked = self.row("user")[-1]
+        self.controller.action("send", {"text": "ليه الملف ده", "quote_of": asked},
+                               self.events.append)
+        self.controller.join()
+        text = [row for row in self.controller.snapshot()["messages"] if row["role"] == "user"][-1]["text"]
+        line = text.split("\n")[0]
+        self.assertTrue(labels.is_arabic(line), repr(line))
+        self.assertIn("calculator.py", line, "the quoted Latin words stay inside the Arabic sentence")
+        self.assertEqual(labels.asked_of(text), "ليه الملف ده")
+
+    def queued_change(self, asked, *, old_format=False, detached=False):
+        answer = self.row("assistant")[-1]
+        self.controller.set_composer("chat")
+        self.controller.busy = True
+        try:
+            self.controller.action("queue_add", {"text": asked, "quote_of": answer}, self.events.append)
+        finally:
+            self.controller.busy = False
+        item = self.controller.queue[-1]
+        frozen = item["text"]
+        if old_format:
+            item.pop("asked")
+            item.pop("reference")
+        if detached:
+            self.controller.queue_detached(item["id"])
+        else:
+            # The old message list must not be used to resolve the quotation again.
+            self.controller.messages = []
+            self.controller._drain_queue()
+        self.controller.join()
+        self.assertIsNotNone(self.controller.session, "a change request was routed to prose")
+        self.assertEqual(self.controller.session["task"], frozen)
+        self.assertEqual(labels.asked_of(self.controller.session["task"]), asked)
+
+    def test_queued_quoted_change_keeps_its_route(self):
+        self.queued_change("Fix add in calculator.py")
+
+    def test_arabic_queued_change_uses_the_question_for_routing(self):
+        self.queued_change("صلح add في calculator.py")
+
+    def test_legacy_quoted_queue_can_still_propose_changes(self):
+        self.queued_change("Fix add in calculator.py", old_format=True)
+
+    def test_detached_quoted_queue_keeps_its_route(self):
+        self.queued_change("Fix add in calculator.py", detached=True)
+
+    def test_restarted_queue_keeps_the_frozen_reference_and_question(self):
+        self.restored_quoted_queue()
+
+    def test_restarted_legacy_queue_keeps_its_route(self):
+        self.restored_quoted_queue(old_format=True)
+
+    def restored_quoted_queue(self, old_format=False):
+        self.controller.set_composer("chat")
+        answer = self.row("assistant")[-1]
+        self.controller.busy = True
+        try:
+            self.controller.queue_add("Fix add in calculator.py", answer)
+        finally:
+            self.controller.busy = False
+        frozen = self.controller.queue[-1]["text"]
+        previous = self.controller.session_path
+        self.controller.close()
+        if old_format:
+            path = self.app_dir / ".agent-projects.json"
+            state = json.loads(path.read_text())
+            item = state["ui"]["queue"][-1]
+            item.pop("asked")
+            item.pop("reference")
+            atomic_json(path, state)
+        restored = Scripted(self.app_dir)
+        self.addCleanup(restored.close)
+        restored.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        restored.model = "test-local"
+        self.assertEqual(restored.queue[-1]["asked"], "Fix add in calculator.py")
+        self.assertTrue(restored.queue[-1]["restored"])
+        # A project restart opens a new conversation. Select the original one before
+        # resuming its queue; rows must not run in a different conversation.
+        restored.display_session(previous, select=True)
+        restored.set_composer("chat")
+        restored.queue_resume()
+        restored.join()
+        self.assertIsNotNone(restored.session)
+        self.assertEqual(restored.session["task"], frozen)
+
+    def test_editing_a_quoted_queue_updates_the_question_and_persists_it(self):
+        self.controller.busy = True
+        try:
+            self.controller.queue_add("why that file", self.row("assistant")[-1])
+            item = self.controller.queue[-1]
+            reference = item["reference"]
+            self.controller.queue_edit(item["id"], reference + "Fix add in calculator.py")
+            stored = json.loads((self.app_dir / ".agent-projects.json").read_text())["ui"]["queue"][-1]
+            self.assertEqual(stored["asked"], "Fix add in calculator.py")
+            self.assertEqual(stored["reference"], reference)
+        finally:
+            self.controller.busy = False
+        self.controller.set_composer("chat")
+        self.controller._drain_queue()
+        self.controller.join()
+        self.assertIsNotNone(self.controller.session)
+
+    def test_late_quoted_plan_and_chat_keep_the_question_when_the_job_is_busy(self):
+        answer = self.row("assistant")[-1]
+        self.controller.set_composer("chat")
+        def late_claim(_operation, _done, _status, **options):
+            self.controller.busy = True
+            options["on_busy"]()
+        for asked in ("Fix add in calculator.py", "why that file?"):
+            with self.subTest(asked=asked), patch.object(self.controller, "run_job", side_effect=late_claim):
+                try:
+                    self.controller.start_plan(asked, answer)
+                finally:
+                    self.controller.busy = False
+                queued = self.controller.queue[-1]
+                self.assertEqual(queued["asked"], asked)
+                self.assertTrue(queued["reference"].startswith("> ["))
+                self.assertEqual(queued["text"], queued["reference"] + asked)
+
+
 class ThinkingModel(SteppingModel):
     """The same four turns, plus the deliberation a reasoning model returns beside its answer."""
 
@@ -3511,7 +4020,7 @@ class SecondSendBecomesAQueueItem(unittest.TestCase):
         import inspect
         from ai_code_engineer.webapp import controller
         source = Path(inspect.getfile(controller)).read_text(encoding="utf-8")
-        self.assertEqual(source.count("on_busy=lambda: self.queue_add(task)"), 2,
+        self.assertEqual(source.count("on_busy=lambda: self.queue_add("), 2,
                          "start_plan and start_chat both hand their text to the queue")
 
     def test_a_refused_start_does_not_spend_the_row(self):

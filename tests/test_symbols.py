@@ -714,6 +714,18 @@ class ReferenceTests(unittest.TestCase):
         self.assertNotIn("was renamed", paths)
         self.assertNotIn("only the old name", paths)
 
+    def test_the_ceilings_are_the_numbers_the_answer_is_named_with(self):
+        """`engine` says these two numbers back to the model when it reports a capped lookup, so a
+        silent change here changes a sentence there — pinned as the contract it is, not a preference."""
+        self.assertEqual((symbols.MAX_HITS, symbols.PER_FILE_LIMIT), (40, 6))
+
+    def test_the_default_answer_is_bounded_at_the_ceiling(self):
+        sites = symbols.find_references("C", [("pkg/B%d.java" % n,
+                                               "class B {\n  void m() {\n    C.x();\n  }\n}\n")
+                                              for n in range(50)], [])
+        self.assertEqual(len(sites), symbols.MAX_HITS,
+                         "asking with no limit still cannot return an unbounded answer")
+
     def test_the_method_call_through_an_object_still_counts_as_a_use(self):
         sites = [site for site in self.sites("login") if site["kind"] == "call"]
         self.assertEqual([(site["path"], site["text"][:20]) for site in sites][0][0],

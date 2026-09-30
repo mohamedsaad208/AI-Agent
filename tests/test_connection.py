@@ -24,8 +24,8 @@ from ai_code_engineer import catalog, config, providers
 from ai_code_engineer.config import KINDS, Settings, check_endpoint, kind_for, needs_consent, settings_for, validate
 from ai_code_engineer.errors import AgentError, PolicyError, ProviderError
 from ai_code_engineer.labels import catalog_status_line, friendly_error
-from ai_code_engineer.providers import (OpenAICompatibleProvider, OllamaProvider, make_provider,
-                                        REASONING_CHARS, read_reasoning)
+from ai_code_engineer.providers import (OpenAICompatibleProvider, OllamaProvider, counts,
+                                        make_provider, metrics_of, REASONING_CHARS, read_reasoning)
 
 ANSWER = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
 
@@ -471,29 +471,29 @@ class DiscoveryFollowsTheEndpoint(unittest.TestCase):
     def test_ollama_is_queried_where_it_was_told_it_lives(self):
         # The regression this whole round starts from: discovery read a literal while generation
         # read settings, so a relocated Ollama reported "no models found".
-        with patch("ai_code_engineer.catalog.request_json", return_value={"models": []}) as request:
+        with patch("ai_code_engineer.providers.request_json", return_value={"models": []}) as request:
             catalog.ollama_models("http://127.0.0.1:19999/ollama")
             self.assertEqual(request.call_args.args[0], "http://127.0.0.1:19999/ollama/api/tags")
 
     def test_openrouter_is_queried_at_its_configured_base(self):
-        with patch("ai_code_engineer.catalog.request_json", return_value={"data": []}) as request:
+        with patch("ai_code_engineer.providers.request_json", return_value={"data": []}) as request:
             catalog.openrouter_models(None, "https://openrouter.ai/api/v1")
             self.assertEqual(request.call_args.args[0], "https://openrouter.ai/api/v1/models")
 
     def test_v1_models_is_parsed_in_both_shapes(self):
         for payload in ({"data": [{"id": "a"}, {"id": "b"}]}, {"models": ["a", "b"]}):
-            with patch("ai_code_engineer.catalog.request_json", return_value=payload):
+            with patch("ai_code_engineer.providers.request_json", return_value=payload):
                 found = catalog.openai_models("http://localhost:1234/v1", cloud=False)
             self.assertEqual([entry["id"] for entry in found], ["a", "b"])
             self.assertEqual([entry["cloud"] for entry in found], [False, False])
 
     def test_the_openai_list_does_not_claim_a_price_it_cannot_see(self):
-        with patch("ai_code_engineer.catalog.request_json", return_value={"data": [{"id": "m"}]}):
+        with patch("ai_code_engineer.providers.request_json", return_value={"data": [{"id": "m"}]}):
             entry = catalog.openai_models("https://api.example/v1")[0]
         self.assertIn("Pricing is not reported", entry["description"])
 
     def test_a_failure_falls_back_only_where_names_are_actually_known(self):
-        with patch("ai_code_engineer.catalog.request_json", side_effect=ProviderError("down")):
+        with patch("ai_code_engineer.providers.request_json", side_effect=ProviderError("down")):
             entries, source = catalog.models_for(kind_for("groq"))
             self.assertEqual(source, catalog.BUILT_IN)
             self.assertIn("llama-3.3-70b-versatile", [entry["id"] for entry in entries])
@@ -501,7 +501,7 @@ class DiscoveryFollowsTheEndpoint(unittest.TestCase):
                 catalog.models_for(kind_for("lmstudio"))      # nothing verified, nothing guessed
 
     def test_a_live_answer_says_so(self):
-        with patch("ai_code_engineer.catalog.request_json", return_value={"data": [{"id": "m"}]}):
+        with patch("ai_code_engineer.providers.request_json", return_value={"data": [{"id": "m"}]}):
             entries, source = catalog.models_for(kind_for("openai"), "https://api.openai.com/v1", "k")
         self.assertEqual(source, catalog.LIVE)
         self.assertEqual(entries[0]["cloud"], True)
@@ -795,6 +795,52 @@ class AStreamedAnswer(unittest.TestCase):
         provider = OllamaProvider(Settings())
         self.assertEqual(provider.generate([], on_token=lambda piece: None), "{}")
         self.assertEqual(provider.reasoning, "weighing the options")
+
+    def test_the_counts_the_server_reports_on_the_last_frame_are_kept(self):
+        """Ollama writes the token counts only when it finishes, and they are the measured answer to a
+        question this tool has been asking by hand: `prompt_eval_count` smaller than what was sent is
+        the server cutting the prompt, which then looks like a model that could not code."""
+        self.serve(self.ollama(self.content("{}"),
+                               {"message": {"content": ""}, "done": True,
+                                "done_reason": "stop", "prompt_eval_count": 2050,
+                                "eval_count": 18}))
+        answer = providers.read_stream("http://127.0.0.1:11434/api/chat", {},
+                                       on_token=lambda piece: None)
+        self.assertEqual((answer["prompt_tokens"], answer["completion_tokens"]), (2050, 18))
+
+    def test_a_stream_that_reported_no_counts_reports_nothing_rather_than_zero(self):
+        self.serve(self.ollama(self.content("{}"), {"message": {"content": ""},
+                                                    "done": True, "done_reason": "stop"}))
+        answer = providers.read_stream("http://127.0.0.1:11434/api/chat", {},
+                                       on_token=lambda piece: None)
+        self.assertNotIn("prompt_tokens", answer,
+                         "an unmeasured answer must not arrive wearing a measured zero")
+
+    def test_the_provider_carries_the_counts_of_its_last_answer(self):
+        self.serve(self.ollama(self.content("{}"), {"message": {"content": ""},
+                                                    "done": True, "done_reason": "stop",
+                                                    "prompt_eval_count": 900, "eval_count": 12}))
+        provider = OllamaProvider(Settings())
+        provider.generate([], on_token=lambda piece: None)
+        self.assertEqual(provider.metrics, {"prompt_tokens": 900, "completion_tokens": 12})
+        self.assertEqual(metrics_of(provider), provider.metrics,
+                         "one reader for the loop and the window")
+
+    def test_a_scripted_provider_that_measures_nothing_reports_nothing(self):
+        """The doubles this suite runs on answer a string and own no transport. They have to read as
+        "nobody measured", never as "this cost nothing" — which is why `metrics_of` is a getattr."""
+        from doubles import ProposalModel
+
+        self.assertEqual(metrics_of(ProposalModel()), {})
+
+    def test_both_provider_spellings_land_in_one_shape(self):
+        """Ollama names them `prompt_eval_count`, OpenAI puts them under `usage`; one normalizer."""
+        self.assertEqual(counts({"prompt_eval_count": 5, "eval_count": 2}),
+                         {"prompt_tokens": 5, "completion_tokens": 2})
+        self.assertEqual(counts({"prompt_tokens": 5, "completion_tokens": 2}),
+                         {"prompt_tokens": 5, "completion_tokens": 2})
+        self.assertEqual(counts({"eval_count": "not a number"}), {},
+                         "a string is not a measurement either")
 
     def test_a_stream_that_never_stops_is_refused_at_the_same_size_as_a_body(self):
         self.serve(self.ollama(*([self.content("x" * 1000)] * 20)))

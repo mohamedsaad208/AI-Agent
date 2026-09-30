@@ -272,7 +272,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.controller.snapshot())
         if path == "/api/fs":
             try:
-                return self._json(self.controller.list_dir(query.get("path", [""])[0]))
+                files_raw = query.get("files", [""])[0]
+                want = [f.strip() for f in files_raw.split(",") if f.strip()] if files_raw else None
+                return self._json(self.controller.list_dir(query.get("path", [""])[0], want_files=want))
             except (AgentError, OSError, ValueError) as exc:
                 return self._fail(exc, 400)
         if path == "/api/project":

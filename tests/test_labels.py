@@ -582,5 +582,83 @@ class TheRowThatThoughtOutLoud(unittest.TestCase):
             self.assertFalse(labels.step_has_detail("unresolved_error", fields))
 
 
+class TheRefusalSentences(unittest.TestCase):
+    """UI 4.6: every sentence a declined proposal can print exists in both languages.
+
+    Reject is a new answer to an old question, and the two halves of it that must not be confused are
+    that the engine's state never changes — the operator answered it — and that the refusal is a fact
+    about the run worth exporting afterwards.
+    """
+
+    def test_the_thread_note_is_written_in_arabic_too(self):
+        english = labels.rejected_note(arabic=False, count=2)
+        arabic = labels.rejected_note(arabic=True, count=2)
+        self.assertTrue(is_arabic(arabic))
+        self.assertNotEqual(english, arabic, "copied, not translated")
+        self.assertIn("2", arabic)
+        self.assertFalse(is_arabic(english), "and the English twin stayed English")
+
+    def test_the_two_refusals_in_the_notes_table_have_arabic_twins(self):
+        for key in ("proposal_reject_nothing", "proposal_reject_twice"):
+            english, arabic_text = labels.NOTE_TEMPLATES[key]
+            self.assertTrue(is_arabic(arabic_text), key)
+            self.assertNotEqual(english, arabic_text, key)
+
+    def test_a_declined_proposal_is_said_in_the_replayed_log(self):
+        english = labels.log_line(False, {"kind": "proposal_rejected"})
+        self.assertIn("Proposal declined", english)
+        self.assertTrue(is_arabic(labels.log_line(True, {"kind": "proposal_rejected"})))
+
+    def test_the_card_answers_the_refusal_without_the_engine_changing_state(self):
+        card = artifact_card("WAITING_APPROVAL", arabic=False, count=3, project="demo2",
+                             rejected=True)
+        self.assertEqual(card["state"], "Rejected")
+        self.assertEqual(card["tone"], "idle")
+        self.assertFalse(card["written"], "nothing went to disk, and the card says so")
+        self.assertIn("3 file(s)", card["title"])
+        self.assertEqual(artifact_card("WAITING_APPROVAL", arabic=False, count=3,
+                                       project="demo2")["state"], STATES["WAITING_APPROVAL"],
+                       "an unanswered proposal still reads as one")
+
+
+class TheReferenceLine(unittest.TestCase):
+    """UI 4.6: the line that puts somebody else's words in front of a message.
+
+    It is a quotation, it says whose words they are, and it is short. The first two are the honesty
+    half — a sentence the agent wrote must not arrive in the prompt looking like an instruction from
+    the operator — and the third is because 160 characters of quoted answer would eat the message that
+    needs reading.
+    """
+
+    def test_the_block_quotes_and_attributes(self):
+        line = labels.quote_reference(False, "assistant", "The guard lives in create().")
+        self.assertEqual(line, '> [In reference to the agent\'s earlier reply: '
+                               '"The guard lives in create()."]\n\n')
+
+    def test_every_role_in_the_thread_has_a_phrase_in_both_languages(self):
+        for role in ("user", "assistant", "tool"):
+            english = labels.quote_reference(False, role, "x")
+            arabic = labels.quote_reference(True, role, "x")
+            self.assertTrue(is_arabic(arabic), role)
+            self.assertNotEqual(english, arabic, role)
+            self.assertTrue(english.startswith("> [In reference to "), role)
+        # A role this table has never met is still said, as the agent's words rather than as nothing.
+        self.assertIn("the agent", labels.quote_reference(False, "unknown", "x"))
+
+    def test_the_quotation_is_cut_at_the_length_the_window_says(self):
+        words = "w" * (labels.QUOTE_CHARS + 60)
+        line = labels.quote_reference(False, "user", words)
+        self.assertIn("w" * labels.QUOTE_CHARS + '…"', line)
+        self.assertNotIn("w" * (labels.QUOTE_CHARS + 1), line)
+        self.assertNotIn("…", labels.quote_reference(False, "user", "short enough"))
+
+    def test_the_block_comes_back_off_for_a_display_question_only(self):
+        text = labels.quote_reference(False, "assistant", "a long answer nobody asked for") + "why?"
+        self.assertEqual(labels.asked_of(text), "why?")
+        self.assertEqual(labels.asked_of("why?"), "why?")
+        self.assertEqual(labels.asked_of("> [In reference"), "> [In reference",
+                         "a message that merely starts with the marker is not a block")
+
+
 if __name__ == "__main__":
     unittest.main()
