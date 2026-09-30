@@ -34,11 +34,15 @@ AI Code Engineer is an open-source autonomous agent framework for real-world sof
 | :--- | :--- |
 | 🔒 **Zero-Trust Security** | Path-traversal guards, symlink blocking, and automatic secret redaction (AWS, GitHub tokens, Bearer keys, `.env`) prevent leakage to logs or LLMs. |
 | 🛡️ **Reviewed diffs** | Every change is a proposal with a `SHA-256` hash, and applying it is a decision you make (or hand over per folder, explicitly). Rollback is one step, as long as nothing else edited those files afterwards. |
+| 🌿 **Git Checkpoints & Restore** | Applying an approved proposal inside a git repo automatically creates a non-destructive checkpoint commit (`--no-verify`, skips hooks). If subsequent edits block local rollback, targeted single-file git restore offers a safe escalation path back to the pre-task commit. Never pushes, pulls, or rewrites history. |
+| 🌐 **Native Bilingual & RTL** | First-class Arabic and English dual-engine. Dynamic Right-to-Left (RTL) support in the WebApp, automatic language detection (`is_arabic`), and fully localized system notices, diagnostic reports, and `--arabic` CLI flags. |
 | ⚡ **100% Offline & Local** | Full first-class support for **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Code stays on your hardware. |
 | ☁️ **Multi-Provider Cloud** | Seamlessly switch between **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, or custom OpenAI-compatible endpoints. |
 | 🔌 **Endpoints are configuration** | No model server's address is written in the code — the provider table carries one default per row, and a URL resolves as *what you typed → your environment (`OLLAMA_HOST`, `GROQ_BASE_URL`, …) → the table's own row*. Point Ollama at another port without editing a file, and a profile that forgets its endpoint gets **its own** provider's address, never a local default. |
 | 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
 | 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
+| ⏱️ **Zero-Drop Task Queueing** | Messages typed while a task or build is in progress are safely enqueued without race conditions, running automatically in FIFO order when the active job finishes. |
+| 📑 **Session Audit & Export** | Transcripts, diffs, and proof tallies are exportable to structured JSON or clean, readable Markdown reports (`agent export-session`) for documentation and audits. |
 | 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
 
 ---
@@ -59,6 +63,7 @@ forget and hardest to undo.
 | **The sandbox is a tick on the Run button** | `Run in Docker` runs the project's command against a **copy** of the folder, in a container with no network, no capabilities, a read-only root and an image pinned by `sha256` digest — so the build's reports are still read afterwards, and your tree is never mounted into it. Without Docker the run is refused rather than quietly done on the host. Verified here as an argv, not as a build: no container has run on the machine this was written on. |
 | **Read-only is a fact about the folder, not about a window** | Setting it in either window, or sealing a folder with `agent read-only --repo PATH`, is written down where every surface reads it back: a terminal that never opened a window cannot `apply` or `rollback` into it, and one window saving its own preferences cannot unseal what the other was told. Lifting it is an explicit act, and the refusal names the line that does it. What it never does is stop reading, searching, mapping, a static check, or a command you asked for by name. |
 | **The settings you change from inside the program are signed, not encrypted** | `Settings → Overrides` and `agent overrides --set TARGET KEY VALUE` write `.agent-overrides.json` in this tool's own folder — created at first run, `.gitignore`d, never written into your project. The program signs every row, so a row you typed into the JSON by hand (or one moved, changed, added or deleted there) is **refused and named** rather than quietly obeyed, and the run falls back to your profile. That is tamper evidence, not a password: your own account can rewrite the file, and the standard library has no cipher. It never redirects an address a profile or a field already states, never swaps the provider, and never holds a key — a credential-shaped value is refused on the way in. |
+| **Git checkpoints back every applied proposal** | Inside a git repository, applying a proposal commits the approved files with `--no-verify` (skipping hooks) and names the session. If files are edited after review, local rollback is blocked to prevent clobbering your later edits, and the tool offers **Targeted Git Restore** to put only that task's files back to its pre-task commit. Strictly no network commands (`push`/`pull`) and no rewritten history. |
 | **The repository map is context, not a compiler** | Symbols are parsed with `ast` for Python and bounded scanners for Java, Kotlin, Go, Rust and TypeScript. It tells the model what files declare; it does not type-check, resolve imports or prove the code works. Only running the project's command does that, and a run that never ran is reported as `unverified`, not as a pass. |
 | **Small local models write small diffs** | The reference setup is a CPU-only `qwen2.5-coder` on Ollama. Larger models produce better proposals; none of them produce a diff you should apply without reading. |
 | **A cloud endpoint means your code leaves the device** | Cloud rows are refused until you approve, the approval is asked per task, cleartext to a remote host is refused outright, and API keys live in memory only — never in a config file, a log line or an error message. |
@@ -158,6 +163,12 @@ python agent.py apply "<session_id>" --approve "<sha256_hash>"
 # Execute automated test suite
 python agent.py verify "<session_id>"
 
+# Check status and outcome of any session
+python agent.py status "<session_id>"
+
+# Export session transcript and diff report to Markdown or JSON
+python agent.py export-session "<session_id>" --format markdown --out session-report.md
+
 # Rollback if needed
 python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ```
@@ -185,6 +196,7 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
 - ✏️ **Overrides you can see:** Settings → Overrides lists every configuration row the program is
   running on — whose profile, whose field, whose signed file — and refuses to pretend a row it cannot
   verify is in force. Both windows and the terminal read the same one file.
+- 🌐 **Full Bilingual Arabic & RTL Support:** Dynamic Right-to-Left (RTL) layout when interacting in Arabic, with comprehensive Arabic localization across system notices, error diagnostics, step cards, and review audits.
 
 Both windows are the same product: the web window and the `--tk` fallback share the engine, the
 sentences and the decisions, and each keeps its proposed files in a viewer of its own — a sheet over the
