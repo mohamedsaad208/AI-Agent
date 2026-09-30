@@ -17,8 +17,12 @@ file, not in the code, so the tool is not tied to one type.*
 One resolution order, in the one function that already owns endpoints:
 
 ```
-typed value  →  the provider's environment variable  →  the table's base  →  refused if empty
+typed value  →  a signed override row  →  the provider's environment variable  →  the table's base  →  refused if empty
 ```
+
+The middle source arrived later, in `overrides.py` and `docs/CONFIG-OVERRIDES.md`: the order is unchanged
+in kind — one function, one order, every caller — with one row of the file inserted below the value a
+person spelled out. A row never redirects an address a profile or a field already names.
 
 - `Kind.url_env` names the variable per row, using the names those servers already document rather than
   inventing a scheme: `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST`, `OPENAI_BASE_URL`,

@@ -4,8 +4,9 @@ The provider list lives here rather than in ``providers`` because both ``validat
 windows need it, and ``providers`` imports this module — the other direction would be a cycle.
 
 This module is also the only place in the codebase that names a model server's address. A URL resolves
-in one order everywhere: what the person typed, what their environment says for that provider
-(``OLLAMA_HOST``, ``GROQ_BASE_URL`` and the rest of ``Kind.url_env``), then the provider's own row.
+in one order everywhere: what the person typed, a signed override row (``overrides.py``), what their
+environment says for that provider (``OLLAMA_HOST``, ``GROQ_BASE_URL`` and the rest of
+``Kind.url_env``), then the provider's own row.
 """
 import os
 from dataclasses import dataclass, replace
@@ -15,6 +16,12 @@ import re
 import tomllib
 
 from .errors import AgentError, PolicyError
+from . import overrides
+
+# The folder this tool keeps its own records in — the same one `cli.app_dir()` and `webapp/launch.py`
+# compute. It is spelled here as well because a profile read from the terminal has no window to ask.
+APP_DIR = Path(__file__).resolve().parents[2]
+from . import overrides
 
 # The request timeout is the one number a user can set in either window, and the saved registry,
 # the browser's number input and Tk's spinbox all disagree about it by construction. The range
@@ -168,13 +175,25 @@ def env_url(kind: Kind) -> str:
     return raw if "://" in raw else "http://" + raw
 
 
-def default_endpoint(kind: Kind) -> str:
+def endpoint_override(app_dir, kind: Kind) -> str:
+    """The address this provider's signed row supplies, or "" when the store has nothing to say.
+
+    ``app_dir`` is a caller's, never a guess here: a resolution that read whichever folder the process
+    happened to start in is how two surfaces end up disagreeing about where their traffic goes.
+    """
+    if app_dir is None:
+        return ""
+    value = overrides.values(app_dir, kind.key).get("endpoint")
+    return str(value or "").strip()
+
+
+def default_endpoint(kind: Kind, app_dir=None) -> str:
     """What the endpoint would be if nobody typed one, in the same order the gates resolve it.
 
     A window that showed ``kind.base`` here could be advertising a URL its own policy then refuses,
     which is the difference between a default and a hint that lies.
     """
-    return env_url(kind) or kind.base
+    return endpoint_override(app_dir, kind) or env_url(kind) or kind.base
 
 
 def check_endpoint(kind: Kind, endpoint) -> str:
@@ -226,6 +245,12 @@ def check_endpoint(kind: Kind, endpoint) -> str:
 # project. `test_the_smallest_budget_still_starts` keeps the two numbers from drifting apart.
 MIN_CONTEXT_CHARS = 6000
 
+# The number ranges, written once. `overrides.py` prints these into the file it creates and judges a
+# row against them through ``validate``, so a limit cannot be restated in the module that stores them —
+# a second table is what eventually disagrees with the first.
+LIMITS = {"max_turns": (1, 30), "timeout_seconds": (1, 900),
+          "context_chars": (MIN_CONTEXT_CHARS, 100000), "output_tokens": (256, 8192)}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -244,9 +269,48 @@ class Settings:
     api_key_env: str = ""
 
 
-def load_settings(path: Path | None) -> Settings:
+def apply_overrides(settings: Settings, app_dir=None, *, keep=()) -> Settings:
+    """Put this provider's signed rows under the values the caller is actually looking at.
+
+    A row never carries an address or a provider, and that is the whole safety of the layer: where the
+    code and the key go stays decided by the profile or the field on screen, and swapping which vendor
+    answers a task from a side file is the failure ``providers.py`` already refuses upstream fallbacks
+    for. Everything else a row states outranks a profile line and a table default — that is the point of
+    a file the program writes rather than the operator. ``keep`` names the exceptions a caller states:
+    a window passes `model`, because the model its list has selected is the one being reviewed.
+
+    ``app_dir=None`` keeps the store out of the resolution entirely, which is what a caller with no
+    records directory means, and what every test that has never heard of overrides relies on.
+    """
+    if app_dir is None:
+        return settings
+    kind = kind_for(settings.provider)
+    if kind is None:
+        return settings
+    changes = {key: value for key, value in overrides.values(app_dir, kind.key).items()
+               if key != "endpoint" and key not in keep}
+    if not changes:
+        return settings
+    merged = replace(settings, **changes)
+    try:
+        validate(merged)
+    except AgentError:
+        # Individually valid rows can still stop fitting the rules this version has. Refusing the set
+        # silently would be the exact thing the signature exists to prevent, and raising would fail a
+        # task that has nothing to do with the row, so: named, dropped, and the profile is used.
+        for key in changes:
+            overrides.note(app_dir, key, "no-longer-valid")
+        return settings
+    return merged
+
+
+def load_settings(path: Path | None, app_dir=None) -> Settings:
     if path is None:
-        return Settings()
+        # No profile read, so nothing was stated for it: the rows fill in the defaults, and an address
+        # they supply resolves through the same order a profile's own line would.
+        settings = Settings()
+        where = endpoint_override(app_dir, kind_for(settings.provider) or DEFAULT_KIND)
+        return apply_overrides(replace(settings, endpoint=where) if where else settings, app_dir)
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         if set(data) - {"model", "limits"}:
@@ -272,7 +336,12 @@ def load_settings(path: Path | None) -> Settings:
         kind = kind_for(settings.provider)
         if kind is None:
             raise AgentError("Provider must be one of: " + ", ".join(item.key for item in KINDS) + ".")
-        settings = replace(settings, endpoint=check_endpoint(kind, model.get("endpoint", "")))
+        # An address the profile spells out is the one thing a row never replaces; when it names none,
+        # the order is the row, then the provider's own environment variable, then its table entry.
+        typed = str(model.get("endpoint", "") or "").strip()
+        settings = replace(settings, endpoint=check_endpoint(
+            kind, typed or endpoint_override(app_dir, kind)))
+        settings = apply_overrides(settings, app_dir)
         validate(settings)
         return settings
     except (OSError, ValueError, TypeError) as exc:
@@ -291,23 +360,29 @@ def validate(settings: Settings) -> None:
             settings.api_key_env and not ENV_NAME.fullmatch(settings.api_key_env)):
         raise AgentError("api_key_env must name an environment variable, not hold a key.")
     check_endpoint(kind, settings.endpoint)
-    for name, low, high in (
-        ("max_turns", 1, 30), ("timeout_seconds", 1, 900),
-        ("context_chars", MIN_CONTEXT_CHARS, 100000), ("output_tokens", 256, 8192),
-    ):
+    for name, (low, high) in LIMITS.items():
         value = getattr(settings, name)
         if type(value) is not int or not low <= value <= high:
             raise AgentError(f"{name} must be between {low} and {high}.")
 
 
-def settings_for(kind: Kind, endpoint: str = "", **changes) -> Settings:
+def settings_for(kind: Kind, endpoint: str = "", *, app_dir=None, keep=("model",),
+                 **changes) -> Settings:
     """A Settings for one provider row, with its own default base when nothing was typed.
 
     Both windows used to hand every choice to ``replace(Settings(), …)`` with a literal provider
     name; this is the one place that pairs a kind with the endpoint that kind actually uses.
+
+    ``keep`` defaults to `model` because that is the one value a window is showing as a decision: the
+    model its list has selected is the one a person reviewed and clicked. The other numbers on the
+    screen are remembered preferences rather than choices made for this run, so a row outranks them —
+    and the Overrides section of both windows lists the rows currently in force, which is what keeps a
+    number the field disagrees with from being a surprise.
     """
-    return replace(Settings(), provider=kind.key,
-                   endpoint=check_endpoint(kind, endpoint), **changes)
+    settings = replace(Settings(), provider=kind.key,
+                       endpoint=check_endpoint(kind, endpoint or endpoint_override(app_dir, kind)),
+                       **changes)
+    return apply_overrides(settings, app_dir, keep=keep)
 
 
 # A profile label arrives from a browser dropdown, so it is a name from a closed shape rather than
@@ -324,7 +399,7 @@ def profile_names(directory: Path | None = None) -> list[str]:
         return []
 
 
-def load_profile(label: str, directory: Path | None = None) -> Settings:
+def load_profile(label: str, directory: Path | None = None, app_dir=None) -> Settings:
     if not PROFILE_NAME.fullmatch(str(label or "")):
         raise AgentError("Unknown configuration profile.")
-    return load_settings((directory or PROFILES_DIR) / f"{label}.toml")
+    return load_settings((directory or PROFILES_DIR) / f"{label}.toml", app_dir)

@@ -13,7 +13,7 @@ from .engine import apply_proposal, load_session, plan, review, rollback
 from .errors import AgentError
 from .providers import make_provider
 from .report import export_file, find_session
-from . import config, intent, modes, setup
+from . import config, intent, modes, overrides, setup
 from .verification import RECIPES, verify
 from .workspace import Workspace
 
@@ -49,6 +49,14 @@ def parser() -> argparse.ArgumentParser:
     seal.add_argument("--repo", type=Path, help="The folder to declare or lift; with no folder, list")
     seal.add_argument("--off", action="store_true", help="Lift the declaration instead of making it")
     seal.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
+    over = sub.add_parser("overrides",
+                          help="Read, set or remove the configuration rows the program signs")
+    over.add_argument("--list", action="store_true", help="Every row and every refusal, newest first")
+    over.add_argument("--set", nargs=3, metavar=("TARGET", "KEY", "VALUE"),
+                      help=f"A provider key or {overrides.EVERY}, one of "
+                           f"{', '.join(sorted(overrides.TYPES))}, and the new value")
+    over.add_argument("--unset", nargs=2, metavar=("TARGET", "KEY"), help="Remove one row")
+    over.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
     draft = sub.add_parser("plan", help="Explore a repository and save a proposed diff; never writes code")
     draft.add_argument("task")
     draft.add_argument("--repo", type=Path, required=True)
@@ -159,6 +167,51 @@ def run_read_only(args) -> int:
     return 0
 
 
+def run_overrides(args) -> int:
+    """Read, set or remove the rows the program signs.
+
+    The file is the terminal's half of the same store both windows write, so a row set here changes a
+    profile read here — and one set in a window changes this listing. Writing it through ``overrides``
+    rather than editing the JSON is what makes it take effect: a row the signature does not cover is
+    refused on the next read, and this command is the only routine that signs.
+    """
+    where = app_dir()
+    if args.arabic:
+        speak_arabic()
+    created = overrides.ensure(where)
+    if created:
+        safe_print("Created " + str(overrides.path(where)) + " and its signing key "
+                   + str(overrides.key_path(where)) + " — the rows live beside the other records this "
+                   "tool keeps, and never inside a project it is working on.")
+    if args.set:
+        target, key, value = args.set
+        row = overrides.put(where, target, key, value, by=modes.TERMINAL, arabic=args.arabic)
+        safe_print(f"{row['key']} = {row['value']} for "
+                   + (f"every provider" if row["target"] == overrides.EVERY else row["target"])
+                   + ". Signed, and read by every surface from now on.")
+        return 0
+    if args.unset:
+        target, key = args.unset
+        safe_print(("Removed " if overrides.delete(where, target, key) else "Nothing to remove: no row for ")
+                   + f"{key} for {target or overrides.EVERY}.")
+        return 0
+    listed = overrides.listed(where)
+    if not listed:
+        safe_print("Nothing is overridden yet. The file lists its own keys, ranges and order.")
+    for row in listed:
+        if row["state"] == "in force":
+            safe_print(f"{row['key']} = {row['value']}  [{row['target']}]  {row['by']}  {row['at']}")
+        else:
+            safe_print(overrides.says(row, arabic=args.arabic) + "  refused: "
+                       + overrides.why_text(row["why"], arabic=args.arabic))
+    refused = overrides.refusals(where)
+    if refused:
+        safe_print(overrides.refused_line(refused, arabic=args.arabic))
+    safe_print("")
+    safe_print(overrides.scope(arabic=args.arabic))
+    return 0
+
+
 def ask_line(prompt: str, ask=input) -> str:
     """One line from the operator. Ctrl-D is an empty answer, not a traceback."""
     try:
@@ -195,6 +248,9 @@ def run_setup(args, ask=input, interactive=None) -> int:
         # A console that defaults to cp1252 cannot print Arabic at all, and the person who asked for
         # Arabic rows is exactly the one who needs to read them rather than see question marks.
         speak_arabic()
+    # The wizard is the first thing a new operator runs, so it is where the file the windows and the
+    # terminal later share appears — with its own keys and ranges printed inside it.
+    overrides.ensure(app_dir())
     repo = str(args.repo) if args.repo else ""
     rows = setup.audit(repo=repo, provider=args.provider, endpoint=args.endpoint,
                        model=args.model, arabic=args.arabic)
@@ -266,9 +322,11 @@ def main(argv: list[str] | None = None) -> int:
             safe_print(Workspace(args.repo).repo_map())
         elif args.command == "read-only":
             return run_read_only(args)
+        elif args.command == "overrides":
+            return run_overrides(args)
         elif args.command == "plan":
             refuses_sealed(args.repo, "A proposal")
-            settings = load_settings(args.config)
+            settings = load_settings(args.config, app_dir())
             if args.model:
                 settings = replace(settings, model=args.model)
             validate(settings)

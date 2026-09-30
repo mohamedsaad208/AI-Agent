@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, modes, repair, runner, setup
+from .. import config, git_integration, intent, labels, modes, overrides, repair, runner, setup
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -213,6 +213,15 @@ class FakeController:
         self.pending: str | None = None
         # The activity strip draws from this, so the preview needs a live-looking line of its own.
         self.status_line = "Turn 3/12: asking qwen2.5-coder:1.5b..."
+        # The rows the Overrides section shows, held in memory: a preview that wrote to this machine's
+        # real signed file would be a preview that changed how the real window runs.
+        self.override_rows = [{"target": "ollama", "key": "timeout_seconds", "value": 600,
+                               "state": "in force", "by": "cli", "at": "2026-09-30 09:40", "why": ""},
+                              {"target": "*", "key": "context_chars", "value": 40000,
+                               "state": "in force", "by": "web", "at": "2026-09-30 09:12", "why": ""},
+                              {"target": "*", "key": "endpoint", "value": "",
+                               "state": "refused", "by": "", "at": "",
+                               "why": "per-provider"}]
         # Two scripted rows so the strip can be laid out and reviewed: a plain wait, and one the
         # user has sent to a chat of its own.
         self.queue = [
@@ -354,6 +363,7 @@ class FakeController:
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
                          "models": self.visible_models()},
             "connection": self.connection_info(),
+            "overrides": self.overrides_info(),
             "recipes": self.target_recipes(), "recipe": self.recipe,
             "targets": [{"path": row["path"], "label": row["label"]} for row in self.targets],
             "target": self.target, "targetLabel": self.target_label(),
@@ -469,6 +479,59 @@ class FakeController:
                     "Clear the filter to see the rest.")
         return f"{loaded} models available. Select one from the list."
 
+    def overrides_info(self) -> dict:
+        """The preview's own rows, kept in memory.
+
+        Reviewing the Overrides section against a scripted list is what makes the design checkable
+        without touching this machine's real signing key or its real settings.
+        """
+        return {"rows": overrides.spoken(self.override_rows, arabic=False),
+                "keys": overrides.fields(),
+                "targets": [overrides.EVERY] + [kind.key for kind in config.KINDS],
+                "path": "(preview) " + overrides.FILE, "kind": self.kind().key,
+                "note": overrides.scope(arabic=False)}
+
+    def kind(self):
+        return config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+
+    def set_override(self, payload: dict) -> None:
+        """Sign nothing here: the preview stores the same shape the real window writes to disk."""
+        target = str(payload.get("target", "")).strip().casefold() or overrides.EVERY
+        key = str(payload.get("key", "")).strip().casefold()
+        raw = payload.get("value", "")
+        field = next((item for item in overrides.fields() if item["key"] == key), None)
+        if field is None or (target == overrides.EVERY and key in overrides.PER_PROVIDER):
+            self.status_line = overrides.bad_value(key, "unknown" if field is None else
+                                                   "per-provider", arabic=False)
+            return
+        if field["number"]:
+            try:
+                value = int(str(raw).strip())
+            except ValueError:
+                self.status_line = overrides.bad_value(key, "not a number", arabic=False)
+                return
+            low, high = config.LIMITS[key]
+            if not low <= value <= high:
+                self.status_line = f"{key} must be between {low} and {high}."
+                return
+        else:
+            value = str(raw).strip()
+        self.override_rows = [row for row in self.override_rows
+                              if not (row["target"] == target and row["key"] == key)]
+        self.override_rows.insert(0, {"target": target, "key": key, "value": value, "state": "in force",
+                                      "by": "web", "at": "just now", "why": ""})
+        self.status_line = overrides.written({"key": key, "value": value, "target": target},
+                                             arabic=False)
+
+    def unset_override(self, payload: dict) -> None:
+        target = str(payload.get("target", "")).strip().casefold() or overrides.EVERY
+        key = str(payload.get("key", "")).strip().casefold()
+        before = len(self.override_rows)
+        self.override_rows = [row for row in self.override_rows
+                              if not (row["target"] == target and row["key"] == key)]
+        self.status_line = (overrides.removed(key, arabic=False) if len(self.override_rows) < before
+                            else overrides.absent(key, arabic=False))
+
     def connection_info(self) -> dict:
         """The same block the real controller sends, so the Connection tab is reviewable here.
 
@@ -530,6 +593,12 @@ class FakeController:
     # ----------------------------- actions -----------------------------
     def action(self, type: str, payload: dict, emit) -> dict | None:
         self._emit = emit
+        if type == "set_override":
+            self.set_override(payload)
+            return None
+        if type == "unset_override":
+            self.unset_override(payload)
+            return None
         if type == "send":
             return self._send(payload.get("text", ""), emit)
         if type == "apply":

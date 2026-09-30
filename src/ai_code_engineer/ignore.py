@@ -26,7 +26,11 @@ from pathlib import Path
 # policy decision, not a tidiness one, and it does not change because a repository asked.
 PROTECTED_DIRS = {
     ".git", ".env", ".ssh", ".aws", ".azure", ".gnupg", ".codex", ".agents", ".agent-runs",
-    ".agent-projects.json", ".agent-plans", ".agent-memory", ".venv", "venv", ".gradle", ".m2",
+    ".agent-projects.json", ".agent-modes.json", ".agent-plans", ".agent-memory",
+    # The signed rows and the key that signs them. The signature is what actually refuses a row a model
+    # wrote, but a file the operator set with their own hands is not the model's to rewrite either.
+    ".agent-overrides.json", ".agent-overrides.key",
+    ".venv", "venv", ".gradle", ".m2",
     ".idea",
 }
 # Matches files that *are* credentials, not source that merely names one — `token.json` yes,

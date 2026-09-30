@@ -9,6 +9,12 @@
 # stays off the repository like the registry above it.
 .agent-modes.json
 
+# Configuration rows the program signs (overrides.py), and the per-install key it signs them with.
+# Both are the tool's own records: the rows change how a run behaves, so a project must never carry a
+# copy that a different machine then obeys - and a signing key in a repository is not a signature.
+.agent-overrides.json
+.agent-overrides.key
+
 # Session JSON, chat history and streamed logs - controller.py self.runs / self.chats.
 .agent-runs/
 .agent-chats/

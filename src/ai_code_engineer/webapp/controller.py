@@ -50,7 +50,8 @@ from ..labels import note as shared_note     # `note` is a local variable in thr
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
-from .. import git_integration, host, ignore, intent, modes, planbook, repair, runner, setup, symbols
+from .. import (git_integration, host, ignore, intent, modes, overrides, planbook, repair,
+                runner, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 
@@ -244,6 +245,9 @@ class AgentController:
 
     def __init__(self, app_dir: Path) -> None:
         self.app_dir = Path(app_dir).resolve()
+        # First run writes the override file and its signing key beside the other records; an existing
+        # pair is left alone, because rewriting a signed file on every start is how a row gets lost.
+        overrides.ensure(self.app_dir)
         self.runs = self.app_dir / ".agent-runs"
         self.chats = self.app_dir / ".agent-chats"
         # Plan step ledgers live outside the approved project folder: a step that gates
@@ -960,6 +964,9 @@ class AgentController:
             # The whole connection row: a drawer that offered a provider without saying where it
             # points, or whether it wants a key, could only be filled by trial and error.
             "connection": self.connection_info(),
+            # The signed rows a task is actually running on, beside the row that produced them:
+            # a number the field and the run disagree about has to be visible in the same drawer.
+            "overrides": self.overrides_info(),
             "recipes": [runner.RECIPES[name]["label"] for name in self.recipes],
             "recipe": self.recipe, "canRun": self._can_run(), "runInfo": self.run_info,
             # Which folder of a multi-project folder the command runs in. One entry means there is
@@ -1051,6 +1058,8 @@ class AgentController:
             "set_chained": lambda: self.set_chained(bool(payload.get("value"))),
             "set_timeout": lambda: self.set_timeout(payload.get("value")),
             "set_key": lambda: self.set_key(payload.get("value", "")),
+            "set_override": lambda: self.set_override(payload),
+            "unset_override": lambda: self.unset_override(payload),
             "set_consent": lambda: self.set_consent(bool(payload.get("value"))),
             "set_style": lambda: self.set_pref("style", str(payload.get("style", "claude"))),
             "set_collapsed": lambda: self.set_pref("collapsed", bool(payload.get("value"))),
@@ -1477,7 +1486,7 @@ class AgentController:
     def endpoint_for(self, mode: str = "") -> str:
         """Where this provider row actually is — typed value, saved value, or its own default."""
         kind = MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
-        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind)
+        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind, self.app_dir)
 
     def set_endpoint(self, value: str) -> None:
         """Point the active row somewhere else. Refused loudly, never half-applied.
@@ -1515,7 +1524,7 @@ class AgentController:
         """
         self.profile = label
         try:
-            settings = config.load_profile(label) if label else None
+            settings = config.load_profile(label, app_dir=self.app_dir) if label else None
         except AgentError as exc:
             self.status = friendly_error(exc)
             self.profile = ""
@@ -1549,7 +1558,8 @@ class AgentController:
         endpoint = self.endpoint_for()
         needs_consent = config.needs_consent(kind, endpoint)
         return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
-                "default_endpoint": config.default_endpoint(kind), "cloud": kind.cloud, "shape": kind.shape,
+                "default_endpoint": config.default_endpoint(kind, self.app_dir), "cloud": kind.cloud,
+                "shape": kind.shape,
                 "needs_key": kind.needs_key, "key_env": kind.key_env or "",
                 "consent": needs_consent, "paid": self.mode.endswith(" \u00b7 Paid"),
                 "profile": self.profile, "profiles": self.available_profiles(),
@@ -1577,7 +1587,7 @@ class AgentController:
         """
         kind = self.active_kind()
         try:
-            return config.settings_for(kind, self.endpoint_for(), model=self.model,
+            return config.settings_for(kind, self.endpoint_for(), app_dir=self.app_dir, model=self.model,
                                        api_key_env=kind.key_env,
                                        max_turns=8 if cloud else 12,
                                        timeout_seconds=self.timeout_seconds())
@@ -1610,6 +1620,43 @@ class AgentController:
 
     def set_key(self, value: str) -> None:
         self.key = str(value or "")          # memory only; never written to disk
+
+    # ------------------------------- configuration overrides -------------------------------
+    def overrides_info(self) -> dict:
+        """The signed rows, the ones this file refused, and what may be added.
+
+        Shipped whole rather than fetched: it is a handful of rows, the drawer cannot draw the
+        "what is live now" line without it, and a refusal a person hand-edited has to be visible the
+        moment the section opens — that is the entire promise the file makes about its own signature.
+        """
+        return {"rows": overrides.reported(self.app_dir, arabic=self.arabic),
+                "keys": overrides.fields(),
+                "targets": [overrides.EVERY] + [kind.key for kind in config.KINDS],
+                "path": str(overrides.path(self.app_dir)), "kind": self.active_kind().key,
+                "note": overrides.scope(arabic=self.arabic)}
+
+    def set_override(self, payload: dict) -> None:
+        """Sign one row. Refused loudly and stored nowhere if it is not a row this tool would obey.
+
+        The value goes through ``overrides.put``, which validates it with the same ``validate`` a
+        profile is judged by — so a number out of range, a credential-shaped string, a wildcard address
+        and a key the schema does not know are all refused here rather than dropped silently later.
+        """
+        try:
+            row = overrides.put(self.app_dir, str(payload.get("target", "")),
+                                str(payload.get("key", "")), payload.get("value", ""),
+                                by=modes.WEB, arabic=self.arabic)
+        except AgentError as exc:
+            self.status = friendly_error(exc)
+            return
+        self.status = overrides.written(row, arabic=self.arabic)
+
+    def unset_override(self, payload: dict) -> None:
+        """Remove one row, or say there was nothing to remove — a silent no-op reads as a save."""
+        gone = overrides.delete(self.app_dir, str(payload.get("target", "")),
+                                str(payload.get("key", "")))
+        self.status = overrides.removed(str(payload.get("key", "")), arabic=self.arabic) if gone \
+            else overrides.absent(str(payload.get("key", "")), arabic=self.arabic)
 
     def set_consent(self, value: bool) -> None:
         self.cloud_ok = bool(value)

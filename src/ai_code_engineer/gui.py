@@ -16,7 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from .catalog import LIVE, models_for
 from .chat import create_chat, context_block, load_chat, respond, title_for
-from . import config
+from . import config, overrides
 from .config import Settings
 from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      load_session, plan,
@@ -147,6 +147,7 @@ class AgentWindow:
     def __init__(self, root: tk.Tk, app_dir: Path):
         self.root = root
         self.app_dir = app_dir.resolve()
+        overrides.ensure(self.app_dir)      # the same first-run file the web window writes
         self.runs = self.app_dir / ".agent-runs"
         self.chats = self.app_dir / ".agent-chats"
         # Plan step ledgers live outside the approved project folder: a step that gates
@@ -1020,6 +1021,7 @@ class AgentWindow:
             endpoint_entry.bind(event, lambda _e: self.set_endpoint(self.endpoint.get()))
         Tooltip(endpoint_entry, "A local row must stay on this device; a remote address needs https "
                                 "and the approval below.")
+        self.override_frame = self._override_page(parent)
         self.cloud_frame = ttk.Frame(parent)
         self.key_frame = ttk.Frame(self.cloud_frame)
         self.key_frame.pack(fill="x")
@@ -1043,6 +1045,107 @@ class AgentWindow:
                   font=("Segoe UI", 9), wraplength=500, justify="left").pack(fill="x", pady=(10, 0))
         self.hint = ttk.Label(parent, text="You will review a proposal first. Project files are not changed automatically.", style="Muted.TLabel", anchor="w", wraplength=500, justify="left")
         self.hint.pack(fill="x", pady=(12, 0))
+
+    def _override_page(self, parent):
+        """The signed rows, listed and editable, in the same frame the endpoint is set from.
+
+        One list of rows, one form, and the file named where it lives: the desktop window and the web
+        drawer write the same file, so a row added here has to be readable there without a restart.
+        """
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(frame, text="Overrides (rows only this program can write)", anchor="w").pack(fill="x")
+        self.override_note = ttk.Label(frame, text="", style="Muted.TLabel", anchor="w",
+                                       wraplength=500, justify="left")
+        self.override_note.pack(fill="x", pady=(3, 0))
+        self.override_rows = ttk.Treeview(frame, columns=("target", "state"), show="tree headings",
+                                          height=5, selectmode="browse")
+        self.override_rows.heading("#0", text="Field = value")
+        self.override_rows.heading("target", text="For")
+        self.override_rows.heading("state", text="State")
+        self.override_rows.column("#0", width=210, stretch=True)
+        self.override_rows.column("target", width=80, stretch=False)
+        self.override_rows.column("state", width=150, stretch=False)
+        self.override_rows.pack(fill="x", pady=(4, 0))
+        self.override_key = ttk.Combobox(frame, values=[item["key"] for item in overrides.fields()],
+                                         state="readonly")
+        self.override_key.set("timeout_seconds")
+        self.override_key.pack(fill="x", pady=(8, 3))
+        # The row's own target, so "every provider" is reachable from here too. The provider shown on
+        # screen is the sensible default, and the two are only ever different on purpose.
+        self.override_target = ttk.Combobox(frame, state="readonly",
+                                            values=[overrides.EVERY] + [kind.key for kind in config.KINDS])
+        self.override_target.set(self.active_kind().key)
+        self.override_target.pack(fill="x", pady=(3, 3))
+        self.override_values = {item["key"]: item for item in overrides.fields()}
+        self.override_hint = ttk.Label(frame, text="", style="Muted.TLabel", anchor="w", wraplength=500,
+                                       justify="left")
+        self.override_hint.pack(fill="x", pady=(0, 2))
+        self.override_key.bind("<<ComboboxSelected>>", lambda _e: self.show_override_range())
+        self.show_override_range()
+        self.override_value = tk.StringVar()
+        value_row = ttk.Frame(frame)
+        value_row.pack(fill="x")
+        entry = ttk.Entry(value_row, textvariable=self.override_value)
+        entry.pack(side="left", fill="x", expand=True)
+        self.button(value_row, "Save", self.save_override, tip="Judged by the same rules a profile is "
+                                                               "judged by, then signed and stored.").pack(
+            side="right", padx=(6, 0))
+        self.button(value_row, "Remove", self.remove_override).pack(side="right")
+        self.job_controls.extend([(entry, "normal"), (self.override_key, "normal"),
+                                  (self.override_target, "normal")])
+        self.refresh_overrides()
+        return frame
+
+    def show_override_range(self) -> None:
+        """Put the numbers this field is allowed to take under the box that asks for one."""
+        field = self.override_values.get(str(self.override_key.get() or ""), {})
+        if field.get("number"):
+            self.override_hint.configure(text=f"{field.get('key')}: {field['low']} to {field['high']}")
+        else:
+            self.override_hint.configure(text=str(field.get("key") or ""))
+
+    def refresh_overrides(self) -> None:
+        """Redraw the list from the file, and say what the file is."""
+        tree = self.override_rows
+        for row in tree.get_children():
+            tree.delete(row)
+        for item in overrides.reported(self.app_dir, arabic=self.arabic):
+            # The row id is its own target and key, so Remove deletes the row that is on screen rather
+            # than the one this window happens to be pointed at.
+            tree.insert("", "end", iid=f"{item['target']}|{item['key']}", text=item["display"],
+                        values=(item["target"], item["state"],
+                                "" if item["state"] == "in force" else item["why"]))
+        self.override_note.configure(text=overrides.scope(arabic=self.arabic))
+
+    def save_override(self) -> None:
+        """Write one row through the program, so it is signed and every surface reads it back.
+
+        The provider it speaks for is chosen here, not assumed from the row on screen: the first thing
+        most people set is an address for a provider they are not currently using.
+        """
+        target = str(self.override_target.get() or overrides.EVERY)
+        key = str(self.override_key.get() or "")
+        try:
+            row = overrides.put(self.app_dir, target, key, self.override_value.get(), by=modes.DESKTOP,
+                                arabic=self.arabic)
+        except AgentError as exc:
+            self.say(friendly_error(exc))
+            return
+        self.override_value.set("")
+        self.refresh_overrides()
+        self.say(overrides.written(row, arabic=self.arabic))
+
+    def remove_override(self) -> None:
+        """Drop the selected row. The provider it was written for comes from the row, not the screen."""
+        selected = self.override_rows.selection()
+        if not selected:
+            self.say(overrides.absent(str(self.override_key.get() or ""), arabic=self.arabic))
+            return
+        target, key = str(selected[0]).split("|", 1)
+        self.say(overrides.removed(key, arabic=self.arabic) if overrides.delete(self.app_dir, target, key)
+                 else overrides.absent(key, arabic=self.arabic))
+        self.refresh_overrides()
 
     def _review_page(self):
         """The proposal viewer: its own window, withdrawn until something is worth reviewing.
@@ -2237,7 +2340,7 @@ class AgentWindow:
 
     def endpoint_for(self, mode: str = "") -> str:
         kind = config.MODE_KIND.get(mode or self.mode.get(), config.DEFAULT_KIND)
-        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind)
+        return self.endpoints.get(kind.key, "") or config.default_endpoint(kind, self.app_dir)
 
     def cloud_choice(self):
         """``(cloud, paid)`` for the row on screen: the provider, the endpoint and the model entry
@@ -2256,7 +2359,8 @@ class AgentWindow:
         """
         kind = self.active_kind()
         try:
-            return config.settings_for(kind, self.endpoint_for(), model=self.model.get().strip(),
+            return config.settings_for(kind, self.endpoint_for(), app_dir=self.app_dir,
+                                       model=self.model.get().strip(),
                                        api_key_env=kind.key_env,
                                        max_turns=8 if cloud else 12,
                                        timeout_seconds=self.request_timeout_seconds())
@@ -2287,7 +2391,7 @@ class AgentWindow:
     def set_profile(self, label: str) -> None:
         self.profile = label
         try:
-            settings = config.load_profile(label) if label else None
+            settings = config.load_profile(label, app_dir=self.app_dir) if label else None
         except AgentError as exc:
             self.status.set(friendly_error(exc))
             self.profile = ""

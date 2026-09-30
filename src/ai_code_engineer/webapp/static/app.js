@@ -1401,15 +1401,26 @@ function connectionSignature() {
   return [c.kind, c.endpoint, c.profile, DATA.provider.mode, DATA.provider.model].join('|');
 }
 
+/* The rows are the server's, so a save that changed them has to repaint the tab that lists them.
+   The value field survives the repaint for the same reason the key field does: the next row may be
+   half-typed while this one lands. */
+function overrideSignature() {
+  const o = DATA.overrides || {};
+  return (o.rows || []).map((r) => [r.target, r.key, r.value, r.state].join(':')).join('|');
+}
+
 function syncSettings() {
-  if (!SETTINGS || SETTINGS.tab !== 'connection') return;
-  if (SETTINGS.signature === connectionSignature()) return;
+  if (!SETTINGS || (SETTINGS.tab !== 'connection' && SETTINGS.tab !== 'overrides')) return;
+  if (SETTINGS.signature === connectionSignature() + overrideSignature()) return;
+  // Only the key field is text the server never echoes back. The value box is not preserved on
+  // purpose: this repaint runs when a row actually landed, and a box still holding the value that
+  // just saved is a box waiting to save it twice. A refused row changes nothing, so no repaint runs.
   const typed = document.querySelector('#key');
-  const keep = typed ? typed.value : '';          // the server never echoes a key back
+  const keep = typed ? typed.value : '';
   SETTINGS.show(SETTINGS.tab);
   const again = document.querySelector('#key');
   if (again) again.value = keep;
-  SETTINGS.signature = connectionSignature();
+  SETTINGS.signature = connectionSignature() + overrideSignature();
 }
 
 function refreshPreview() {
@@ -1902,6 +1913,28 @@ function openSettings(tab) {
       <div class="field"><label>Project notes — sent with every task in this folder</label>
         <textarea id="memory" ${st.project ? '' : 'disabled placeholder="Choose a project folder first."'}>${esc(st.memory || '')}</textarea>
         <div class="hint">${esc(st.memory_info || '')}</div></div>`,
+    overrides: () => {
+      const o = DATA.overrides || {};
+      const rows = (o.rows || []).map((r) => `
+        <div class="ovrow"><span class="ovk">${esc(r.display)}</span>
+          <span class="ovm">${esc(r.state === 'in force' ? r.target : r.why)}`
+          + `${r.by ? ' \u00b7 ' + esc(r.by) + ' ' + esc(r.at || '') : ''}</span>
+          ${r.state === 'in force' ? `<button class="link" data-drop="${esc(r.target)}|${esc(r.key)}">Remove</button>` : ''}</div>`).join('');
+      const keys = (o.keys || []).map((k) => `<option value="${esc(k.key)}">${esc(k.key)}`
+        + `${k.number ? ' (' + k.low + ' to ' + k.high + ')' : ''}</option>`).join('');
+      const targets = (o.targets || []).map((v) => `<option value="${esc(v)}"`
+        + `${v === o.kind ? ' selected' : ''}>${esc(v === '*' ? 'every provider' : v)}</option>`).join('');
+      return `
+      <div class="field"><label>Rows in force. Only this program writes them, and it signs each one.</label>
+        ${rows || '<div class="ovrow"><span class="ovm">Nothing is overridden.</span></div>'}
+        <div class="hint">${esc(o.note || '')}</div>
+        <div class="hint">${esc(o.path || '')}</div></div>
+      <div class="field"><label>Provider this row speaks for, or every provider</label>
+        <select id="ov-target">${targets}</select></div>
+      <div class="field"><label>Field to change</label><select id="ov-key">${keys}</select></div>
+      <div class="field"><label>New value</label><input id="ov-value" placeholder="600"></div>
+      <button class="solid" id="ov-save">Save row</button>`;
+    },
     connection: () => {
       const c = DATA.connection || {};
       const rows = (list, selected) => list.map((v) =>
@@ -1945,8 +1978,18 @@ function openSettings(tab) {
     body.querySelector('#endpoint')?.addEventListener('change', (e) => send('set_endpoint', { value: e.target.value }));
     body.querySelector('#key')?.addEventListener('input', (e) => send('set_key', { value: e.target.value }));
     body.querySelector('#consent')?.addEventListener('change', (e) => send('set_consent', { value: e.target.checked }));
+    body.querySelector('#ov-save')?.addEventListener('click', () => send('set_override', {
+      target: body.querySelector('#ov-target').value,
+      key: body.querySelector('#ov-key').value,
+      value: body.querySelector('#ov-value').value}));
+    for (const button of body.querySelectorAll('[data-drop]')) {
+      button.addEventListener('click', () => {
+        const [target, key] = button.dataset.drop.split('|');
+        send('unset_override', { target: target, key: key });
+      });
+    }
   }
-  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['connection', 'Connection']]) {
+  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['connection', 'Connection'], ['overrides', 'Overrides']]) {
     const b = el('button', '', label); b.dataset.tab = name; b.onclick = () => show(name); tabs.appendChild(b);
   }
   const foot = el('footer');
@@ -1958,7 +2001,8 @@ function openSettings(tab) {
   checks.onclick = () => send('setup_check');
   const done = el('button', 'solid', 'Done'); done.onclick = close;
   foot.append(refresh, checks, done); s.appendChild(foot);
-  SETTINGS = { show: show, tab: tab || 'project', signature: connectionSignature() };
+  SETTINGS = { show: show, tab: tab || 'project',
+                   signature: connectionSignature() + overrideSignature() };
   show(tab || 'project');
 }
 

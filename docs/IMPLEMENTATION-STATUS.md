@@ -1,5 +1,36 @@
 # Implementation status — 2026-09-30
 
+## Configuration you change from inside the program: a file the tool signs
+
+The request, in three parts: *a feature in the program to edit those values instead of editing the
+files*, *a file created automatically at first run, gitignored, edited if it already exists*, and
+*encrypted so nobody can change it except from inside the program*. Planned in `docs/CONFIG-OVERRIDES.md`,
+which records the encryption refusal. **1466 → 1534 offline tests**, `node --check` and
+`tools/scan_asi_strings.py` clean, the drawer driven live on `--fake` and the command run for real.
+
+| what changed | where |
+| --- | --- |
+| the third request, delivered as the thing that actually moves it | `.agent-overrides.json` is signed with a per-install key (`overrides.py`, HMAC-SHA256 over the stored row order). A row added, retyped, deleted **or reordered** by another editor fails the signature, and the read refuses the whole file and says so — hand-editing cannot change behaviour quietly. It is not a lock: the owner can rewrite both files, and what they lose is every row in them. That sentence is printed in the file itself, in both windows, and in the README |
+| one file, three writers, no fourth | `agent overrides [--list] [--set TARGET KEY VALUE] [--unset TARGET KEY] [--arabic]`, the web drawer's Overrides tab, and the desktop window's frame under the endpoint field — all through the same `put`/`delete`, which judges the value with `config.validate` before signing it |
+| created on first run, never rewritten | `overrides.ensure()` runs in the two window constructors and in `agent setup`. It writes the **schema**, not a `{}`: its own keys, their ranges, the resolution order, the two ways to change a row, and why the file is signed rather than encrypted. A second run writes nothing — a test compares the bytes |
+| where it lives, after the user's own correction | the tool's own directory beside `.agent-projects.json`, not beside the project: these are the tool's settings, and writing into a granted folder is the line the read-only round hardened. Two explicit `.gitignore` lines (that file lists `.agent-*` by name, not by wildcard) and both names in `ignore.PROTECTED_DIRS`, so a proposal cannot edit the file that decides where tasks run either |
+| the order, in one place | typed value → signed row → profile → the provider's environment variable → the table — and `default_endpoint()` walks the same order, so the hint a window shows is still the answer its gates will give |
+| the two things a row may not do | **redirect an address somebody spelled out** (an address decides where the code and the key go; a row supplies only an address nobody wrote down), and **swap the provider** — the failure `providers.py` already refuses OpenRouter's upstream fallbacks for. A row also cannot set a wildcard address or key variable: those belong to one provider |
+| what the drawer shows about itself | `overrides` in the snapshot: the rows in force, the ones refused *with the reason already turned into the window's language*, the file path, and the targets and fields the store accepts with their ranges read from `config.LIMITS` — one tuple now, printed by the file and judged by `validate` |
+| nothing secret lands in it | a credential-shaped value is refused at write time through `redaction`'s own patterns, and `api_key_env` may only name a variable — the rule profiles already obey |
+| the store costs nothing per push | rows and refusals are cached by `(mtime_ns, size)` **and by the key file's bytes**, because the rows ride in `snapshot()` and a snapshot goes out on every streamed log line. The first version re-read the key from disk per push, and a queue test that counts tasks started losing that race under suite load |
+
+**Refused, with the reason:** encryption — no stdlib cipher under a stdlib-only rule, a key that must sit
+on the same account as the file it protects, and ciphertext that would destroy the self-documenting
+first-run file that was asked for one message earlier. A flag hiding the section (a protective surface
+behind a default-off switch makes the unsafe path the default — the same refusal as the read-only
+curtain). And per-row signatures: one signature over the set is what makes a *deleted* row visible.
+
+**Open from the same measurements:** a row overrides a profile's number but not its address, which is a
+rule a person has to be told — the drawer says it, and the file says it, and neither is obvious; and
+`agent overrides` writes to whichever directory `cli.app_dir()` computes, so a checkout in two places has
+two stores, exactly like `.agent-modes.json`.
+
 ## Endpoints out of the code — one resolution order, and a profile that can forget its URL
 
 The request: *any URL or IP belonging to Ollama or to any model belongs in the model's configuration,
