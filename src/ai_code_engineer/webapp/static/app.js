@@ -27,6 +27,7 @@ const ICON = {
   spark: '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>',
   branch: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="17.5" cy="8" r="2.2"/><path d="M6 7.7v10.8M17.5 10.2c0 3.2-2.4 4.6-5 5.1-1.9.4-3.3.9-4.3 1.6"/></svg>',
   copy: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5.5H6a1.5 1.5 0 0 0-1.5 1.5v9"/></svg>',
+  lock: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>',
 };
 
 const state = {
@@ -1062,6 +1063,16 @@ function modeBadge() {
     return b;
   }
   b.title = modeRow(DATA.composer)[2] + ' Click to choose what the next Send will do.';
+  const declared = DATA.declared || {};
+  if (declared.sealed) {
+    // A folder can carry a position written by another surface — the other window, or a terminal that
+    // never opened one. Without the lock here that seal looks like a button that forgot to work, so
+    // the badge says who set it and when before it says why the click did nothing.
+    b.classList.add('sealed');
+    b.insertAdjacentHTML('afterbegin', ICON.lock + ' ');
+    if (declared.note) b.title = declared.note;
+    else if (declared.by) b.title = modeRow(DATA.composer)[2] + ' Set by ' + declared.by + '.';
+  }
   b.onclick = () => {
     if (!DATA.project) { toast('Choose a project first — then Chat, Read-only and Change each mean something'); return; }
     modeMenu();

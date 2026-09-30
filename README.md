@@ -56,6 +56,7 @@ forget and hardest to undo.
 | :--- | :--- |
 | **Run and Check syntax execute your project's own code** | They invoke `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` in that folder with *your* permissions. A build script is code, and code from a repository you did not write gets run here. The command list is an allowlist and the environment is stripped of credentials — that is a **limit**, not a sandbox. The row below is the sandbox. |
 | **The sandbox is a tick on the Run button** | `Run in Docker` runs the project's command against a **copy** of the folder, in a container with no network, no capabilities, a read-only root and an image pinned by `sha256` digest — so the build's reports are still read afterwards, and your tree is never mounted into it. Without Docker the run is refused rather than quietly done on the host. Verified here as an argv, not as a build: no container has run on the machine this was written on. |
+| **Read-only is a fact about the folder, not about a window** | Setting it in either window, or sealing a folder with `agent read-only --repo PATH`, is written down where every surface reads it back: a terminal that never opened a window cannot `apply` or `rollback` into it, and one window saving its own preferences cannot unseal what the other was told. Lifting it is an explicit act, and the refusal names the line that does it. What it never does is stop reading, searching, mapping, a static check, or a command you asked for by name. |
 | **The repository map is context, not a compiler** | Symbols are parsed with `ast` for Python and bounded scanners for Java, Kotlin, Go, Rust and TypeScript. It tells the model what files declare; it does not type-check, resolve imports or prove the code works. Only running the project's command does that, and a run that never ran is reported as `unverified`, not as a pass. |
 | **Small local models write small diffs** | The reference setup is a CPU-only `qwen2.5-coder` on Ollama. Larger models produce better proposals; none of them produce a diff you should apply without reading. |
 | **A cloud endpoint means your code leaves the device** | Cloud rows are refused until you approve, the approval is asked per task, cleartext to a remote host is refused outright, and API keys live in memory only — never in a config file, a log line or an error message. |
@@ -138,6 +139,10 @@ Launch the interactive CLI:
 ```powershell
 # Index repository symbols
 python agent.py map --repo examples/demo_repo
+
+# Declare a folder Read-only for every surface — window and terminal alike — and lift it again
+python agent.py read-only --repo examples/demo_repo
+python agent.py read-only --repo examples/demo_repo --off
 
 # Plan and propose code changes with local Ollama
 python agent.py plan "Fix add in calculator.py so it adds two numbers" --repo examples/demo_repo --config profiles/local.toml
@@ -237,10 +242,10 @@ chat there, a second window you can move beside the conversation on the desktop.
 
 | path | what it is |
 | :--- | :--- |
-| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
+| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
 | `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
 | `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | **the gate.** 1403 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
+| `tests/` | **the gate.** 1450 offline tests, stdlib `unittest`, no network. `doubles.py` and `helpers.py` are the shared fixtures. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
 | `docs/` | plans, implementation status, code reviews. Every measured claim in this README points at one of these. |

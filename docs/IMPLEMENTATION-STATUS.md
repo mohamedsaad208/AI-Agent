@@ -1,4 +1,36 @@
-# Implementation status — 2026-09-29
+# Implementation status — 2026-09-30
+
+## UI 4.4 — the folder's position became a fact: read-only as a declaration every surface reads
+
+The request was "there is something called read-only mode, make it a flag and finish it". The reading
+that got built is the one `docs/READ-ONLY-MODE.md` had refused on purpose — a declaration on disk a
+second process cannot ignore — and the reading that got refused is the curtain: hiding a *protective*
+mode behind a default-off switch makes the writable path the default. Measured first, in
+`docs/READ-ONLY-FLAG-PLAN.md`. **1403 → 1450 offline tests**, `node --check` and
+`tools/scan_asi_strings.py` clean, and every claim below driven through a live window.
+
+| what changed | where |
+| --- | --- |
+| the bug this round exists for | both windows rebuilt the shared `ui` block of `.agent-projects.json` from a list of named keys, so the desktop window's next save deleted the web window's per-folder positions — and a granted folder with no stored row opens on **Change**. Choosing Read-only for a folder and then opening the other window once put it back on the writable path without a word |
+| one file with one purpose | `modes.py`: `{project_key: {mode, by, at, path}}` in `.agent-modes.json`, read through a `(mtime_ns, size)` cache because a gate asks on every snapshot and a snapshot goes out on every streamed log line. Written by whichever surface got there first, read by all of them |
+| the asymmetry a corrupt row would have opened | a row nobody can parse is read as **sealed**, not as absent: over-sealing costs one deliberate click, under-sealing costs a file. `project_key("")` is the current directory, so an empty folder declares nothing rather than sealing wherever the process was started |
+| two writes the mode still allowed | `git_branch` (`checkout -b`, a switch — git rewrites the tracked files) and `git_restore` (replaces bytes) asked nothing of `reading_only()`. Both refuse now, and the preview refuses them the same way so the design stays reviewable |
+| the terminal was outside the promise | `agent read-only [--repo] [--off] [--arabic]` declares, lifts and lists; `plan`, `apply` and `rollback` refuse a declared folder *before* a provider is built or a hash is asked for. `map`, `review`, `status` and `verify` keep working: reading is what the mode is for, and a command typed by hand is the explicit yes the window would otherwise have asked for |
+| which row wins, in one direction only | a stored `read` outranks anything (it is the only row that promises *less*); a stored `change` does not outrank the window's memory of a folder left on Chat — two tests failed on exactly that overreach and they were right |
+| what the refusal says when the badge is not the culprit | `modes.refusal()` picks between the badge's own sentence and the declaration's, so a seal that arrived from a terminal names the command line and the minute, and the line to type that lifts it |
+| the badge can now be honest | `declared` in the snapshot, a lock glyph and a dashed border on the pill, and `note` only when badge and fact disagree — the case where every refusal below would otherwise look like a bug |
+| the desktop switch changed meaning | it is this window's starting position now, and clicking it tells the folder. Opening a folder whose declaration says read moves the box without the write-trace reading that as a click |
+| a flag nobody would have found | the new command's `--arabic` printed `??????` on a cp1252 console until the four-line fix `run_setup` already had was lifted into `cli.speak_arabic()` — and the listing printed a lower-cased path because the *key* is normalised, so the row carries the path as the file system spells it |
+
+**Refused, with the reason written down:** the default-off curtain; a per-call `--allow-write` (a
+refusal you can rename your way around is not a refusal); `canMutate` as a "hole" — measuring showed it
+drives the **Check syntax** button, one of the four verbs Read-only promises to keep doing, so gating it
+would have broken the mode rather than finished it. `auto_apply`, `style`, `theme` and `queue` still get
+erased across surfaces; only the position that decides whether files are written was moved out.
+
+**Open from the same measurements:** a seal is keyed to a path, so renaming or moving a folder on disk
+leaves it behind at the old one; and the *other* window's badge catches up when the folder is next
+selected, not by watcher — the gate refuses live in the meantime, which is the half that matters.
 
 ## UI 4.3 — the container the command runs in, the desktop's own viewer, and one provider line
 

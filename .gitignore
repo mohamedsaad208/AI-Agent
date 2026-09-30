@@ -5,6 +5,10 @@
 # writes both into one registry file via atomic_json(self.app_dir / ".agent-projects.json").
 .agent-projects.json
 
+# Which position each folder was told to keep (modes.py) - absolute paths of granted folders, so it
+# stays off the repository like the registry above it.
+.agent-modes.json
+
 # Session JSON, chat history and streamed logs - controller.py self.runs / self.chats.
 .agent-runs/
 .agent-chats/

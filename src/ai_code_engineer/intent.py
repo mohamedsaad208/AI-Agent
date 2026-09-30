@@ -157,3 +157,66 @@ def run_declined(*, arabic: bool = False) -> str:
     return say(arabic,
                en="Nothing ran. Read-only starts no command until you say yes to that one.",
                ar="لم يُنفَّذ شيء. وضع القراءة فقط لا يشغّل أمرا إلا بموافقتك عليه.")
+
+
+# ------------------------------------------------------------------ the durable declaration
+
+# Which surface wrote the declaration. Stored as a code, spoken in either language, because a row that
+# reads "the command line" in an Arabic window is half a sentence.
+SOURCES = {"web": ("the web window", "نافذة الويب"),
+           "gui": ("the desktop window", "نافذة سطح المكتب"),
+           "cli": ("the command line", "سطر الأوامر"),
+           "saved": ("a window before this one", "نافذة قبل هذه")}
+
+
+def source(code: str, *, arabic: bool = False) -> str:
+    """Who set this folder, in the language the rest of the line is in."""
+    pair = SOURCES.get(str(code or ""))
+    return (pair[1] if arabic else pair[0]) if pair else str(code or "")
+
+
+def declared(by: str = "", at: str = "", *, arabic: bool = False, project: str = "") -> str:
+    """Why the write stopped at a fact about the folder rather than at this window's badge.
+
+    Names the surface and the minute, because "refused" without a who and a when reads like a bug, and
+    the operator's next move is to find whoever set it.
+    """
+    who, when = source(by, arabic=arabic), str(at or "")
+    bits = [part for part in (who, when) if part]
+    tail = " (" + " · ".join(bits) + ")" if bits else ""
+    where = f" ({project})" if project else ""
+    if arabic:
+        return ("المجلد" + where + " معلَن أنه للقراءة فقط" + tail +
+                ". لا سطح من سطوح هذه الأداة يكتب فيه طالما الإعلان قائم: لا اقتراح، ولا تنفيذ ولا "
+                "تراجع، ولا جولة إصلاح، ولا فرع أو استرجاع في git.")
+    return ("This folder" + where + " is declared Read-only" + tail +
+            ". No surface of this tool writes it while that stands: not a proposal, not Apply or Roll "
+            "back, not a fix round, and not a git branch or a restore.")
+
+
+def lift(folder: str, *, arabic: bool = False) -> str:
+    """How to end the declaration, said as the exact line to type.
+
+    A refusal that does not name its own remedy teaches the operator to go looking in a config file for
+    a switch that is not there, and the next one gets set by accident.
+    """
+    return say(arabic,
+               en=("To lift it, run:  agent read-only --off \"" + str(folder) + "\"  — or set the badge "
+                   "to Change in a window. Lifting is asked for by name on purpose: nothing here lifts "
+                   "itself."),
+               ar=("للرفع، شغّل:  agent read-only --off \"" + str(folder) +
+                   "\"  أو حوّل الشارة إلى وضع التعديل من أي نافذة. الرفع يُطلب بالاسم عمدًا، ولا شيء "
+                   "هنا يرفع نفسه."))
+
+
+def followed(by: str = "", at: str = "", *, arabic: bool = False) -> str:
+    """The line a window prints when the folder it is showing was declared elsewhere after it opened."""
+    who = source(by, arabic=arabic)
+    tail = (" (" + who + " · " + str(at or "") + ")") if at else (" (" + who + ")" if who else "")
+    return say(arabic,
+               en=("The badge follows the declaration, not the other way round: this folder was set "
+                   "Read-only" + tail + " after this window opened it. Every write is refused from here "
+                   "on, and choosing Change is what lifts the declaration."),
+               ar=("الشارة تتبع الإعلان وليس العكس: المجلد أُعلِن أنه للقراءة فقط" + tail +
+                   " بعد أن فتحته هذه النافذة. كل كتابة مرفوضة من هنا فصاعدًا، واختيار وضع التعديل هو "
+                   "ما يرفع الإعلان."))

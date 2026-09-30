@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, repair, runner, setup
+from .. import config, git_integration, intent, labels, modes, repair, runner, setup
 from ..errors import PolicyError
 from .controller import MODES, PROJECT_ICONS as ICONS
 
@@ -157,6 +157,10 @@ class FakeController:
         self.sandbox_on = False
         self.sandbox_image = ""
         self.composer = "chat"
+        # The scripted twin of the controller's `declared` block: the folder's own position, kept by
+        # whichever surface wrote it. The preview needs the field or the lock on the badge cannot be
+        # reviewed at all, and a surface nobody has seen is exactly what a design review should catch.
+        self.declared = {"mode": "", "by": "", "at": ""}
         # The real window keys the composer placeholder and the auto-write note off this switch, so
         # the preview has to carry a live one or neither can be reviewed here.
         self.auto_apply = False
@@ -322,6 +326,12 @@ class FakeController:
             "branch": {"kind": "project", "key": "demo2", "id": "s-1", "bound": False,
                        "projectName": "demo2"},
             "composer": self.composer,
+            "declared": {"sealed": self.declared["mode"] == intent.READ,
+                         "mode": self.declared["mode"], "by": intent.source(self.declared["by"]),
+                         "at": self.declared["at"],
+                         "note": (intent.followed(self.declared["by"], self.declared["at"])
+                                  if self.declared["mode"] == intent.READ
+                                  and not intent.read_only(self.composer) else "")},
             "icons": list(ICONS),
             "git": dict({"repo": True, "branch": self.branch, "detached": False,
                          "head": "9f3c21a", "dirty": 2},
@@ -533,6 +543,10 @@ class FakeController:
             self._note(emit, "rolled_back", "Task changes rolled back.")
             self.git_restore_offer = {"commit": "9f3c21a", "paths": len(FILES)}
         elif type == "git_restore":
+            if self.reading_only:
+                # The preview has to refuse the escalation exactly like the real window does, or the
+                # design gets reviewed against a button the shipped thing will not press.
+                return self._refuse(intent.no_write("Restoring files from git"))
             offer = self.git_restore_offer or {"commit": "9f3c21a", "paths": len(FILES)}
             self.git_restore_offer = None
             text = labels.restore_done(arabic=False, commit=offer["commit"],
@@ -541,6 +555,10 @@ class FakeController:
             emit({"kind": "message", "message": self.messages[-1]})
             self._note(emit, "git_restore", text)
         elif type == "git_branch":
+            if self.reading_only:
+                # A switch rewrites the tracked files, so a read-only preview refuses it for the same
+                # reason the controller does.
+                return self._refuse(intent.no_write("Switching branches"))
             # The scripted branch comes from the same generator the real window uses, so reviewing
             # the chip here shows the name a user would actually get.
             back = str(payload.get("back", "")).strip()
@@ -619,6 +637,10 @@ class FakeController:
                 self.auto_apply = bool(payload.get("value"))
         elif type == "set_composer":
             self.composer = intent.normalise(payload.get("value"))
+            if self.composer in (intent.READ, intent.CHANGE):
+                # Read and Change are the two positions that say what happens to the folder's files,
+                # so either is written down — the same rule the real window keeps in `modes`.
+                self.declared = {"mode": self.composer, "by": modes.WEB, "at": _clock()}
             # The switch belongs to Change mode, exactly as it does in the real window: a folder
             # moved to Read-only mid-session has to stop showing "writes itself" on the next pill.
             self.auto_apply = self.auto_apply and self.composer == "change"

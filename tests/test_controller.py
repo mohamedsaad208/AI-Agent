@@ -17,7 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import git_integration, intent, labels, memory, repair, runner, setup
+from ai_code_engineer import git_integration, intent, labels, memory, modes, repair, runner, setup
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
@@ -3777,6 +3777,166 @@ class TheModuleGraph(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.assertEqual(sorted(str(path.relative_to(self.repo)) for path in self.repo.rglob("*.java")),
                          before)
+
+
+class TheDeclarationOutlivesTheWindow(unittest.TestCase):
+    """Item #58: the folder's position is a fact on disk, not a badge state inside one process.
+
+    Every test here writes the declaration through one surface and reads the consequence from another,
+    which is the half Read-only could not do while the position lived in a window's own preference
+    block — a block each window rebuilds from a list of named keys, so the other window's save deleted
+    it and a folder with no row left opened on Change.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._made = []
+        self.addCleanup(self._drain)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name)
+        self.repo = sandbox_repo(self.app_dir)
+        patcher = patched_catalog()
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.model = ProposalModel()
+        starter = patch("ai_code_engineer.webapp.controller.make_provider",
+                        side_effect=lambda *a, **k: self.model)
+        starter.start()
+        self.addCleanup(starter.stop)
+
+    def _drain(self):
+        for controller in self._made:
+            controller.cancel_event.set()
+            controller.join(timeout=10)
+
+    def window(self, folder=None):
+        controller = Scripted(self.app_dir)
+        controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        controller.model = "test-local"
+        controller.set_repo(str(folder or self.repo))
+        self._made.append(controller)
+        return controller
+
+    def status(self, controller):
+        return controller.snapshot()["status"]
+
+    # ---------------------------- written here, obeyed there ----------------------------
+    def test_choosing_the_badge_writes_the_folder_s_position_outside_the_window(self):
+        controller = self.window()
+        controller.set_composer("read")
+        row = modes.row_for(self.app_dir, self.repo)
+        self.assertEqual(row["mode"], "read", "the promise has to outlive the process that made it")
+        self.assertEqual(row["by"], "web")
+
+    def test_a_folder_sealed_by_the_command_line_is_sealed_when_the_window_opens_it(self):
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        controller = self.window()
+        self.assertEqual(controller.composer, "read")
+        self.assertIn("read-only · writes nothing", controller.snapshot()["header"]["subtitle"])
+
+    def test_a_seal_that_arrives_while_the_window_is_open_refuses_the_write_and_says_who(self):
+        """The window opened on Change and got a proposal, then something else sealed the folder."""
+        controller = self.window()
+        controller.set_composer("change")
+        controller.start_plan("Fix add in calculator.py")
+        controller.join()
+        self.assertEqual(controller.snapshot()["review"]["state"], "Changes ready for review")
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        controller.apply()
+        controller.join()
+        self.assertIn("the command line", self.status(controller),
+                      "a refusal that names no surface reads like a bug in this window")
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    def test_choosing_change_is_what_lifts_a_seal_and_says_that_it_did(self):
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        controller = self.window()
+        self.assertEqual(controller.composer, "read")
+        controller.set_composer("change")
+        self.assertFalse(modes.sealed(self.app_dir, self.repo))
+        self.assertIn(intent.unchecked(), self.status(controller),
+                      "ending a promise somebody else made is not a silent event")
+
+    def test_choosing_chat_over_a_seal_leaves_the_seal_standing(self):
+        """Chat is not a promise about files — a message that asks for one is still planned as a
+        proposal — so picking it must not be a way to lift a seal without naming it."""
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        controller = self.window()
+        controller.set_composer("chat")
+        self.assertTrue(modes.sealed(self.app_dir, self.repo))
+        self.assertTrue(controller.reading_only())
+
+    def test_the_desktop_window_saving_its_own_preferences_cannot_unseal_a_folder(self):
+        """The regression this whole change exists for.
+
+        Both windows rebuild the `ui` block of `.agent-projects.json` from a list of named keys, so a
+        save by one deleted the other's map — and a folder with no stored row is granted on Change.
+        Choosing Read-only for a folder and then opening the other window once used to put that folder
+        back on the writable path without a word.
+        """
+        controller = self.window()
+        controller.set_composer("read")
+        controller.close()
+        atomic_json(self.app_dir / ".agent-projects.json", {
+            "projects": [{"path": str(self.repo), "key": project_key(self.repo), "icon": ""}],
+            # Exactly what the desktop window writes: its own keys, and no `composer` block.
+            "ui": {"mode": "Ollama", "last_project": str(self.repo), "read_only": False}})
+        second = self.window()
+        self.assertEqual(second.composer, "read",
+                         "the position a person chose is not the other window s to forget")
+        second.apply()
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    # ------------------------------- the two git writes -------------------------------
+    def test_a_branch_switch_is_refused_because_git_rewrites_the_tracked_files(self):
+        controller = self.window()
+        controller.set_composer("read")
+        controller.git_branch()
+        self.assertIn(intent.no_write("Switching branches"), self.status(controller))
+        self.assertEqual(controller.asked, [], "and it does not even reach the confirm dialog")
+
+    def test_the_git_escalation_is_refused_with_the_rest(self):
+        """The restore appears only after a rollback refused, so it was the door left open: the same
+        bytes, put back by git instead of by the session file."""
+        controller = self.window()
+        controller.set_composer("read")
+        controller._git_restore = {"commit": "9f3c21a", "paths": ["calculator.py"]}
+        with patch("ai_code_engineer.git_integration.restore_paths") as restored:
+            controller.git_restore()
+        self.assertEqual(restored.call_count, 0)
+        self.assertIn(intent.no_write("Restoring files from git"), self.status(controller))
+
+    # ---------------------------------- what it looks like ----------------------------------
+    def test_the_snapshot_carries_the_declaration_and_only_explains_a_disagreement(self):
+        controller = self.window()
+        controller.set_composer("change")
+        self.assertFalse(controller.snapshot()["declared"]["sealed"])
+        row = modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        state = controller.snapshot()
+        self.assertTrue(state["declared"]["sealed"])
+        self.assertEqual(state["declared"]["by"], "the command line")
+        self.assertEqual(state["declared"]["note"],
+                         intent.followed(row["by"], row["at"]),
+                         "the badge says Change while the gates refuse: that has to be said out loud")
+        controller.set_composer("read")
+        self.assertEqual(controller.snapshot()["declared"]["note"], "",
+                         "badge and fact agreeing is not a thing to explain every snapshot")
+
+    def test_a_static_check_stays_allowed_on_a_sealed_folder(self):
+        """`canMutate` drives the Check syntax button, and a check that executes nothing from the
+        project is one of the four verbs Read-only promises it will still do. The rollback next to it
+        is a write with a friendly name, so that one goes."""
+        controller = self.window()
+        controller.set_composer("change")
+        controller.start_plan("Fix add in calculator.py")
+        controller.join()
+        controller.apply()
+        controller.join()
+        self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_GOOD)
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        state = controller.snapshot()
+        self.assertTrue(state["review"]["canMutate"])
+        self.assertFalse(state["review"]["canRollback"], "restoring bytes is still a write")
 
 
 if __name__ == "__main__":

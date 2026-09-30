@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import intent, labels, memory, repair, runner, setup
+from ai_code_engineer import intent, labels, memory, modes, repair, runner, setup
 from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import (atomic_json, load_session, plan, proposal_hash)
 from ai_code_engineer.errors import Cancelled
@@ -1080,6 +1080,48 @@ Validate the token.
         self.reopen()
         self.assertTrue(self.ui.sandbox_on.get())
         self.assertEqual(self.ui.sandbox_image.get(), self.PINNED)
+
+    # ------------------------------ the durable declaration ------------------------------
+    def test_ticking_the_switch_records_the_position_outside_this_window(self):
+        """The tick is a fact about the folder now, so a terminal that never saw this window obeys it."""
+        self.ui.repo.set(str(self.repo))
+        self.ui.read_only.set(True)
+        self.ui.read_only_changed()
+        row = modes.row_for(self.app_dir, self.repo)
+        self.assertEqual(row["mode"], "read")
+        self.assertEqual(row["by"], "gui")
+
+    def test_a_folder_sealed_in_the_terminal_arrives_ticked_and_with_the_buttons_greyed(self):
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        self.ui.repo.set(str(self.repo))
+        self.assertTrue(self.ui.read_only.get(), "the switch shows what the folder carries")
+        self.assertTrue(self.ui.reading_only)
+        self.assertEqual(str(self.ui.apply_button["state"]), "disabled")
+
+    def test_a_seal_that_lands_while_the_window_is_open_refuses_by_name(self):
+        """The badge is behind this window and the fact is not, so the refusal has to say which."""
+        self.ui.repo.set(str(self.repo))
+        self.ui.read_only.set(False)
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.TERMINAL)
+        self.ui.session = {"state": "WAITING_APPROVAL", "root": str(self.repo)}
+        with patch("ai_code_engineer.gui.apply_proposal") as applied:
+            self.ui.apply()
+        self.assertEqual(applied.call_count, 0)
+        self.assertIn("the command line", self.ui.status.get())
+
+    def test_the_web_window_s_choice_survives_this_window_saving_its_own_preferences(self):
+        """The regression: each window rebuilt the shared block from its own key list, so this save
+        deleted the position the other window had been told — and a folder with no row left opens on
+        Change, writable again with nothing said about it."""
+        modes.declare(self.app_dir, self.repo, intent.READ, by=modes.WEB)
+        self.ui.repo.set(str(self.repo))
+        self.assertTrue(self.ui.read_only.get(), "the box shows what the folder carries")
+        self.ui._save_state()                       # rewrites .agent-projects.json from Tk's own keys
+        self.reopen()
+        self.ui.repo.set(str(self.repo))
+        self.assertTrue(modes.sealed(self.app_dir, self.repo), "the save did not unseal it")
+        self.assertTrue(self.ui.reading_only)
+        self.assertEqual(str(self.ui.apply_button["state"]), "disabled")
 
     # ------------------------------ first run ------------------------------
     def pump(self, seconds=1.4):

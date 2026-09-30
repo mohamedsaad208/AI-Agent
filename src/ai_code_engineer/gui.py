@@ -30,7 +30,7 @@ from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
 from . import planbook, repair, runner
-from . import host, intent, setup
+from . import host, intent, modes, setup
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
 
@@ -165,6 +165,9 @@ class AgentWindow:
         self.current_project = ""
         self._loading_session = False
         self._reverting = False
+        # Raised while this window moves its own Read-only box to match a folder's declaration: the
+        # variable has a write trace, and a fact arriving must not read as a click that re-declares it.
+        self._syncing_read_only = False
         self._pending_model = ""
         self._session_cache: dict[Path, tuple[tuple, dict | None]] = {}
         self._chat_cache: dict[Path, tuple[tuple, dict | None]] = {}
@@ -194,8 +197,9 @@ class AgentWindow:
         self.chained = tk.BooleanVar(value=bool(self._saved_ui.get("plan_chained")))
         # This window has no Chat/Change badge: naming a folder has always meant "work on it". So the
         # axis arrives here as one switch, and it is the strict end of it — Read-only, which refuses
-        # even the proposal. It does not persist per folder the way the web window's does; see
-        # `_save_state`, where it is stored with the rest of this window's own settings.
+        # even the proposal. The position itself is not stored here any more: it belongs to the folder
+        # and lives in `modes`, where the other window and the command line read the same fact. What is
+        # loaded is the tick this window was left with, as a starting position.
         self.read_only = tk.BooleanVar(value=bool(self._saved_ui.get("read_only")))
         # The sandbox is a machine preference, never a project one: a repository must not get to name
         # the image the tool builds that repository inside. Both windows keep it, and both grey it out
@@ -1118,10 +1122,21 @@ class AgentWindow:
 
     def read_only_changed(self, *_):
         """The switch answers its own click: what it just promised, and which buttons that changes."""
+        if self._syncing_read_only:
+            # Opening a folder whose declaration says read moves this box. That is the fact arriving,
+            # not a decision being made, and treating it as one would both speak a sentence nobody
+            # clicked for and overwrite the folder's row on every project switch.
+            return
+        folder = self.repo.get().strip()
+        if folder:
+            # Choosing a position for a folder is a fact about the folder, not about this window: it is
+            # written down where the other window and the command line will read it back.
+            modes.declare(self.app_dir, folder,
+                          intent.READ if self.read_only.get() else intent.CHANGE, by=modes.DESKTOP)
         self.update_buttons()
-        folder = Path(self.repo.get().strip()).name if self.repo.get().strip() else ""
+        name = Path(folder).name if folder else ""
         if self.read_only.get():
-            self.say(intent.switched(intent.READ, arabic=self.arabic, project=folder))
+            self.say(intent.switched(intent.READ, arabic=self.arabic, project=name))
         else:
             self.say(intent.unchecked(arabic=self.arabic))
         self._save_state()
@@ -1149,8 +1164,18 @@ class AgentWindow:
         The web window holds the same position as a third value of its badge and reads it through
         `intent.read_only`; this window has never had a mode badge at all, so it is a switch. What both
         refuse, and in what words, comes from `intent` — that is the part the drift test pins.
+
+        The switch is this window's own click; the declaration is the folder's, written by whichever
+        surface got there first — the other window or the command line. Either one holds, so a folder
+        sealed in a terminal cannot be written from here without somebody saying so out loud.
         """
-        return bool(self.read_only.get())
+        return bool(self.read_only.get()) or modes.sealed(self.app_dir, self.repo.get().strip())
+
+    def write_refusal(self, what: str) -> str:
+        """The sentence a gate prints, naming where the promise came from — one rule with the web
+        window, and it lives in `modes.refusal` so neither window can reword it."""
+        return modes.refusal(self.app_dir, self.repo.get().strip(), what, arabic=self.arabic,
+                             badge=intent.READ if self.read_only.get() else intent.CHANGE)
 
     def sandbox_state(self):
         """The container switch, and the image box that only means something beside a ticked one.
@@ -1290,7 +1315,12 @@ class AgentWindow:
         ui = {"mode": self.mode.get(), "last_project": self.repo.get().strip(),
               "last_chat": self.chat_id, "request_timeout": self.request_timeout_seconds(),
               "endpoints": dict(self.endpoints), "profile": self.profile,
-              "plan_chained": bool(self.chained.get()), "read_only": bool(self.read_only.get()),
+              "plan_chained": bool(self.chained.get()),
+              # This window's starting position, not the folder's promise: the tick says what the next
+              # folder this window is given should be told, and it is written into `modes` when that
+              # folder is chosen. Which position a folder already carries is read from there, so the
+              # other window's save cannot erase it and this one cannot forget it.
+              "read_only": bool(self.read_only.get()),
               "setup_seen": bool(self._saved_ui.get("setup_seen")),
               # Named here or they are not kept: this rebuilds the block from a list of keys rather
               # than writing back whatever was in it, so a new preference is invisible until it is
@@ -1330,6 +1360,19 @@ class AgentWindow:
                 return
         self.current_project = identity
         self.cloud_ok.set(False)
+        if raw:
+            # The tick used to be one switch for every folder, so it survives a restart as this window's
+            # starting position rather than as a per-folder fact — and the first folder opened under it
+            # gets told, out loud, in the file every surface reads. A folder that already carries a
+            # declaration keeps it: the switch never overrules what the terminal or the other window set.
+            if self.read_only.get() and not modes.mode_for(self.app_dir, raw):
+                modes.declare(self.app_dir, raw, intent.READ, by=modes.DESKTOP)
+            self._syncing_read_only = True
+            try:
+                self.read_only.set(modes.sealed(self.app_dir, raw))
+            finally:
+                self._syncing_read_only = False
+            self.update_buttons()
         self.load_memory()
         if raw:
             self.projects[identity] = str(Path(raw).resolve())
@@ -2103,7 +2146,7 @@ class AgentWindow:
             # The button is already greyed out. This is the answer for everything that reaches the
             # method another way: a proposal left on screen when the switch moved, a key binding, a
             # queued step. The mode is a promise about the folder, not about which widget was clicked.
-            self.say(intent.no_write("Apply", arabic=self.arabic))
+            self.say(self.write_refusal("Apply"))
             return
         again = ""
         if self._auto_fix and self.selected_recipe():
@@ -2447,7 +2490,7 @@ class AgentWindow:
             return
         if self.reading_only:
             # Rolling back is a write with a friendly name: it puts different bytes on the same paths.
-            self.say(intent.no_write("Roll back", arabic=self.arabic))
+            self.say(self.write_refusal("Roll back"))
             return
         if not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
             return

@@ -50,7 +50,7 @@ from ..labels import note as shared_note     # `note` is a local variable in thr
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
-from .. import git_integration, host, ignore, intent, planbook, repair, runner, setup, symbols
+from .. import git_integration, host, ignore, intent, modes, planbook, repair, runner, setup, symbols
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 
@@ -446,6 +446,13 @@ class AgentController:
         saved = self._saved_ui.get("composer")
         self._composer_pref = {str(k): v for k, v in saved.items() if isinstance(v, str)} \
             if isinstance(saved, dict) else {}
+        # A position chosen before the declaration file existed is honoured, not lost. Adopted once per
+        # folder, and only where nothing has been declared yet, so this never overrules a choice made in
+        # the terminal after the window closed.
+        for saved_key, saved_mode in self._composer_pref.items():
+            folder = self.projects.get(saved_key, "")
+            if folder and not modes.mode_for(self.app_dir, folder):
+                modes.declare(self.app_dir, folder, saved_mode, by=modes.SAVED)
         branch = self._saved_ui.get("last_branch")
         kind = branch.get("kind") if isinstance(branch, dict) else None
         key = branch.get("key") if isinstance(branch, dict) else ""
@@ -943,6 +950,10 @@ class AgentController:
             "git": self._git_info(),
             "icons": list(PROJECT_ICONS),
             "composer": self.composer,
+            # What the folder itself was told, by whichever surface told it. The badge is the window's
+            # own choice; this is the fact the gates obey, and a seal that arrived from a terminal has
+            # to be visible or every refusal below looks like a bug.
+            "declared": self._declared_info(),
             "plan": plan_info,
             "provider": {"mode": self.mode, "modes": list(MODES), "model": self.model,
                          "models": self.visible_models()},
@@ -1118,6 +1129,7 @@ class AgentController:
         # chat must never be able to write anything at all.
         if composer == CHANGE_COMPOSER and not self.branch["bound"] and self.branch["key"]:
             self._composer_pref[self.branch["key"]] = CHANGE_COMPOSER
+            modes.declare(self.app_dir, repo, CHANGE_COMPOSER, by=modes.WEB)
         self.auto_apply = (bool(self._auto_pref.get(str(self.branch.get("key") or ""), False))
                            if self.composer == CHANGE_COMPOSER and not self.branch["bound"] else False)
         if chat_id:
@@ -1139,29 +1151,65 @@ class AgentController:
         Deliberately not "a bound chat": a chat moved into a project reads its folder as context and
         still plans a proposal when a message asks for one, and that behaviour is pinned by tests and
         by the tooltip on its own badge. Read-only is the position that refuses even the proposal.
+
+        Two things can put a folder here, and both are honoured: the badge this window is holding, and
+        the declaration the folder itself carries — written by any surface, the other window or the
+        terminal, and read from disk on every ask. A badge alone would mean a folder sealed in a
+        terminal could be written from a window that never looked at the terminal.
         """
-        return intent.read_only(self.composer)
+        return intent.read_only(self.composer) or modes.sealed(self.app_dir, self.repo)
+
+    def _declared_info(self) -> dict:
+        """The folder's own declaration, spoken, plus the line the badge owes it.
+
+        `note` is only filled when the two disagree: a window showing Change over a folder a terminal
+        sealed is the one case where a refusal needs an explanation before it needs a retry.
+        """
+        row = modes.row_for(self.app_dir, self.repo)
+        sealed = row.get("mode") == intent.READ
+        return {"sealed": sealed, "mode": row.get("mode", ""),
+                "by": intent.source(row.get("by", ""), arabic=self.arabic), "at": row.get("at", ""),
+                "note": (intent.followed(row.get("by", ""), row.get("at", ""), arabic=self.arabic)
+                         if sealed and not intent.read_only(self.composer) else "")}
+
+    def write_refusal(self, what: str) -> str:
+        """The sentence every write gate prints, and it names where the promise came from.
+
+        "Switch to Change mode" is useless advice when the seal was set by a terminal the window has
+        never seen, so the declaration gets the sentence that says who set it and how to lift it.
+        """
+        return modes.refusal(self.app_dir, self.repo, what, arabic=self.arabic,
+                             badge=self.composer)
 
     def _branch_mode(self, key: str) -> str:
-        """A chat with no folder can only answer in prose; a project keeps the mode it was left in.
+        """A chat with no folder can only answer in prose; a project keeps the position it was told to
+        hold, wherever it was told.
 
-        Read through `intent.normalise`, because a pref written by an older version of this file — or
-        a value that is neither of the words — has to land on the promise that writes nothing.
+        A seal outranks everything, because it is the only row that promises *less*: a folder somebody
+        told to stay read-only opens read-only here too. A stored Change does not outrank the window's
+        own memory of a folder the person left on Chat — that row is not a promise about files, and
+        letting it win would turn "the tool remembers your choice" into "the tool overrules it".
+        Everything else goes through `intent.normalise`, because a pref written by an older version of
+        this file has to land on the promise that writes nothing.
         """
         if not key:
             return CHAT_COMPOSER
+        if modes.sealed(self.app_dir, self.projects.get(key, "")):
+            return intent.READ
         return intent.normalise(self._composer_pref.get(key, CHAT_COMPOSER))
 
     def _grant_folder(self, key: str, resolved: str) -> None:
         """Register a folder and open it — the one way a project branch is entered by granting.
 
         A folder never seen before lands on Change mode, because naming a folder and asking for work
-        on it is what the user asked the window to do. A folder the person has since switched by hand
-        comes back exactly the way they left it, so the grant never overrules a choice.
+        on it is what the user asked the window to do. A folder the person has since switched by hand —
+        here, in the other window, or in a terminal — comes back exactly the way they left it, so the
+        grant never overrules a choice.
         """
         self.projects.setdefault(key, resolved)
+        told = bool(key in self._composer_pref or modes.mode_for(self.app_dir, resolved))
         self._select_branch(BRANCH_PROJECT, key,
-                            composer=None if key in self._composer_pref else CHANGE_COMPOSER)
+                            composer=None if told else CHANGE_COMPOSER)
 
     def set_composer(self, value: str) -> None:
         """What the next Send is allowed to become: prose, a read-only analysis, or a reviewed diff."""
@@ -1175,14 +1223,26 @@ class AgentController:
                            "itself from the sidebar to ask for reviewed changes to its files.")
             return
         self.composer = wanted
+        lifted = modes.sealed(self.app_dir, self.repo)
         if self.branch.get("key") and not self.branch.get("bound"):
             self._composer_pref[self.branch["key"]] = wanted
+            # Read and Change are the two positions that say what happens to this folder's files, so
+            # either of them is written down for every surface to obey. Chat is not: it writes nothing
+            # on its own, and choosing it over a sealed folder leaves the seal standing rather than
+            # quietly lifting a protection somebody else asked for.
+            if wanted in (intent.READ, intent.CHANGE):
+                modes.declare(self.app_dir, self.repo, wanted, by=modes.WEB)
         # The switch is a property of Change mode. Reading masks it for this conversation and leaves
         # the folder's stored preference alone, so switching back is not a silent re-arm of anything.
         self.auto_apply = (bool(self._auto_pref.get(str(self.branch.get("key") or ""), False))
                            if wanted == CHANGE_COMPOSER and not self.branch.get("bound") else False)
         self.subtitle = self._subtitle()
         self._save_state()
+        if lifted and wanted == CHANGE_COMPOSER:
+            # The window is about to say a sentence that ends a promise made elsewhere, so it says
+            # that instead of the ordinary one.
+            self.say(intent.unchecked(arabic=self.arabic))
+            return
         self.status = intent.switched(wanted, arabic=self.arabic,
                                       project=Path(self.repo).name if self.repo else "")
 
@@ -2304,7 +2364,7 @@ class AgentController:
         if self.reading_only():
             # A proposal built before the badge moved is still on the screen, and the mode is a
             # position about this folder — not about whether a diff happens to be rendered right now.
-            self.say(intent.no_write("Apply", arabic=self.arabic))
+            self.say(self.write_refusal("Apply"))
             return
         changes = self.session.get("changes", [])
         again = ""
@@ -2434,7 +2494,7 @@ class AgentController:
             return
         if self.reading_only():
             # Rolling back is a write with a friendly name: it puts different bytes on the same paths.
-            self.say(intent.no_write("Roll back", arabic=self.arabic))
+            self.say(self.write_refusal("Roll back"))
             return
         if not self.session or self.session.get("state") not in MUTABLE_STATES | {"PARTIAL_APPLY", "APPLYING"}:
             return
@@ -2497,6 +2557,11 @@ class AgentController:
         paths = [name for name in offer.get("paths", []) if name]
         if self.busy or not paths or not self.repo:
             return
+        if self.reading_only():
+            # The escalation is the larger write, so it cannot be the door left open: this replaces
+            # bytes on disk from a commit, which is exactly what the position in front of it refuses.
+            self.say(self.write_refusal("Restoring files from git"))
+            return
         commit = offer.get("commit", "")
         if not self.confirm("Restore these files from git",
                             "Replace what is in " + str(len(paths)) + " file(s) now with the copy in"
@@ -2534,6 +2599,11 @@ class AgentController:
         that history lands on whatever branch the developer happened to be standing on.
         """
         if self.busy or not self.repo:
+            return
+        if self.reading_only():
+            # A branch switch is not a read: git rewrites the tracked files to match the commit you
+            # move to, which is a larger change than any proposal this window would have asked about.
+            self.say(self.write_refusal("Switching branches"))
             return
         states = git_integration.status(self.repo)
         if not states["repo"]:
@@ -3359,6 +3429,10 @@ class AgentController:
         ui = {"mode": self.mode, "last_chat": self.chat_id,
               "last_branch": {"kind": self.branch.get("kind", BRANCH_CHAT),
                               "key": self.branch.get("key", "")},
+              # The window's own memory of where it left each folder, Chat included — which is the one
+              # position the durable file does not carry, because Chat is not a promise about files.
+              # Losing this map costs a folder its Chat label and reopens it on Change; it cannot put a
+              # sealed folder back on the writable path, and that half is in `modes.FILE`.
               "composer": dict(self._composer_pref),
               "auto_apply": dict(self._auto_pref),
               "endpoints": dict(self.endpoints), "profile": self.profile,

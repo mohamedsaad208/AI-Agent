@@ -376,6 +376,10 @@ button.pill:hover { background: var(--hover); border-color: var(--line-2) }
 .pill.mode.chat { border-color: transparent; background: var(--chip); color: var(--ink-2) }
 .pill.mode.read { border-color: var(--info-line); background: var(--info-bg); color: var(--info-ink) }
 .pill.mode.change { border-color: var(--ok-line); background: var(--ok-bg); color: var(--ok-ink) }
+/* A folder sealed by another surface keeps its own badge colour, but the lock is drawn and the border
+   goes dashed: the difference between "I chose this" and "this was chosen for the folder" has to be
+   visible without reading the tooltip. */
+.pill.mode.sealed { border-style: dashed }
 .pill.path { max-width: 300px; overflow: hidden; text-overflow: ellipsis; color: var(--faint) }
 /* The git chip reuses the two pairs the contrast audit already grades: a clean tree is
    the same green as a passing run, uncommitted work the same amber as an unverified one. */

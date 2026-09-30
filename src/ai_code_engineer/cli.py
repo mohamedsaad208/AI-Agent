@@ -13,7 +13,7 @@ from .engine import apply_proposal, load_session, plan, review, rollback
 from .errors import AgentError
 from .providers import make_provider
 from .report import export_file, find_session
-from . import config, setup
+from . import config, intent, modes, setup
 from .verification import RECIPES, verify
 from .workspace import Workspace
 
@@ -44,6 +44,11 @@ def parser() -> argparse.ArgumentParser:
     first.add_argument("--no-demo", action="store_true", help="Do not offer the offline proof")
     repo = sub.add_parser("map", help="Read-only repository map: files with their parsed declarations")
     repo.add_argument("--repo", type=Path, required=True)
+    seal = sub.add_parser("read-only",
+                          help="Declare a folder Read-only for every surface, lift it, or list what is declared")
+    seal.add_argument("--repo", type=Path, help="The folder to declare or lift; with no folder, list")
+    seal.add_argument("--off", action="store_true", help="Lift the declaration instead of making it")
+    seal.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
     draft = sub.add_parser("plan", help="Explore a repository and save a proposed diff; never writes code")
     draft.add_argument("task")
     draft.add_argument("--repo", type=Path, required=True)
@@ -92,6 +97,68 @@ def demo() -> dict:
     return setup.run_demo()
 
 
+def app_dir() -> Path:
+    """Where this tool keeps its own records — the folder both windows write to.
+
+    Computed the way the launcher computes it (`webapp/launch.py`), not from the working directory: the
+    declaration file is only worth having if `agent read-only` and a window opened from another folder
+    are reading the same one.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def refuses_sealed(folder, what: str) -> None:
+    """Stop a terminal write on a folder somebody told to stay read-only.
+
+    The answer comes off the file the windows use rather than from anything this process remembers: a
+    position a second process could ignore would only protect the window that set it. Naming the
+    command that lifts it is part of the refusal — an error that says "not allowed" and nothing else
+    sends the operator hunting through config files for a switch that is not there.
+    """
+    if modes.sealed(app_dir(), folder):
+        raise AgentError(modes.refusal(app_dir(), folder, what) + "  " + intent.lift(str(folder)))
+
+
+def speak_arabic() -> None:
+    """Give the console an encoding that can carry Arabic at all.
+
+    A cp1252 terminal cannot print one Arabic letter, and the person who asked for Arabic rows is
+    exactly the one who needs to read them rather than see a line of question marks.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def run_read_only(args) -> int:
+    """Declare, lift, or list — the position a folder keeps after this terminal closes."""
+    folder = str(args.repo) if args.repo else ""
+    if args.arabic:
+        speak_arabic()
+    if not folder:
+        rows = modes.listed(app_dir())
+        if not rows:
+            safe_print("Nothing is declared. A folder with no declaration opens on Change mode.")
+            return 0
+        for row in rows:
+            safe_print(f"{row.get('path') or row['folder']}  {intent.label(row['mode'])}  "
+                       f"{intent.source(row.get('by', ''), arabic=args.arabic)}  {row.get('at', '')}")
+        return 0
+    if not Path(folder).is_dir():
+        raise AgentError("No such folder to declare: " + folder)
+    if args.off:
+        modes.forget(app_dir(), folder)
+        safe_print("Nothing is declared for " + folder
+                   + ". It opens on Change mode again, like any folder nobody has told otherwise.")
+        return 0
+    row = modes.declare(app_dir(), folder, intent.READ, by=modes.TERMINAL)
+    safe_print(intent.declared(by=row["by"], at=row["at"], arabic=args.arabic,
+                               project=Path(folder).name))
+    safe_print(intent.lift(folder, arabic=args.arabic))
+    return 0
+
+
 def ask_line(prompt: str, ask=input) -> str:
     """One line from the operator. Ctrl-D is an empty answer, not a traceback."""
     try:
@@ -127,10 +194,7 @@ def run_setup(args, ask=input, interactive=None) -> int:
     if args.arabic:
         # A console that defaults to cp1252 cannot print Arabic at all, and the person who asked for
         # Arabic rows is exactly the one who needs to read them rather than see question marks.
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except (AttributeError, OSError, ValueError):
-            pass
+        speak_arabic()
     repo = str(args.repo) if args.repo else ""
     rows = setup.audit(repo=repo, provider=args.provider, endpoint=args.endpoint,
                        model=args.model, arabic=args.arabic)
@@ -169,6 +233,8 @@ def run_setup(args, ask=input, interactive=None) -> int:
             "الخطوات الجاية في النافذة: افتح `agent ui`، اختار الموديل من Settings، افتح مجلد من "
             "الشريط الجانبي، وبعدها حدد الشارة: Chat أو Read-only أو Change.",
             "الكتابة التلقائية مفتاح فوق Change، ومتشغلش غير لو كنت مستعد ترجع بـ git.",
+            "لو عايز المجلد يفضل للقراءة فقط من كل السطوح ومن غير ما تعتمد على النافذة: "
+            "`agent read-only --repo PATH`، والرفع بـ `--off` بنفس المسار.",
         ]
         if not accepted:
             lines.insert(0, "لم تتم الموافقة على السياسة: الأداة لسه هتشتغل، بس مش هتكتب في ملفاتك.")
@@ -178,6 +244,8 @@ def run_setup(args, ask=input, interactive=None) -> int:
             "from the sidebar, then set the badge to Chat, Read-only or Change.",
             "Auto-Apply is the switch on top of Change — leave it off unless you are ready to reverse "
             "the writes with git.",
+            "A folder can also be sealed from here, where no window has to stay open for it to hold: "
+            "`agent read-only --repo PATH`, lifted by the same line with `--off`.",
         ]
         if not accepted:
             lines.insert(0, "The policy was not accepted. The tool still runs, but no write should be "
@@ -196,7 +264,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_setup(args)
         elif args.command == "map":
             safe_print(Workspace(args.repo).repo_map())
+        elif args.command == "read-only":
+            return run_read_only(args)
         elif args.command == "plan":
+            refuses_sealed(args.repo, "A proposal")
             settings = load_settings(args.config)
             if args.model:
                 settings = replace(settings, model=args.model)
@@ -227,6 +298,9 @@ def main(argv: list[str] | None = None) -> int:
                 safe_print(json.dumps({"id": session["id"], "state": session["state"],
                                        "model": session["model"], "events": session["events"]}, indent=2))
             elif args.command in {"apply", "rollback"}:
+                # Checked before anything is asked, because a hash typed for a write that was never
+                # going to happen teaches the operator that the prompts do not mean anything.
+                refuses_sealed(session.get("root", ""), args.command)
                 approved = args.approve
                 if not approved:
                     safe_print(review(session))

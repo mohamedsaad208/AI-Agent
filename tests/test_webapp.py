@@ -649,6 +649,29 @@ class ThePreviewKnowsTheThreePositions(unittest.TestCase):
         controller.action("apply_block", {"path": "a.py", "content": "x"}, events.append)
         self.assertIn(intent.no_proposal(), controller.status_line)
 
+    def test_the_two_git_writes_are_refused_in_the_preview_too(self):
+        """A branch switch rewrites tracked files and a restore replaces bytes, so both are writes by
+        any definition — and they were the two the shipped window still allowed in Read-only."""
+        controller, events = self.preview()
+        controller.action("git_branch", {}, events.append)
+        self.assertIn(intent.no_write("Switching branches"), controller.status_line)
+        self.assertEqual(controller.branch, "main", "a refusal moved HEAD anyway")
+        controller.action("git_restore", {}, events.append)
+        self.assertIn(intent.no_write("Restoring files from git"), controller.status_line)
+
+    def test_the_preview_carries_the_folder_s_own_declaration(self):
+        """`declared` is the field the lock on the badge is drawn from; a preview without it cannot
+        review the one part of this change a person has to be able to recognise at a glance."""
+        controller, events = self.preview()
+        declared = controller.snapshot()["declared"]
+        self.assertTrue(declared["sealed"])
+        self.assertEqual(declared["by"], "the web window")
+        self.assertEqual(declared["note"], "", "badge and fact agree, so there is nothing to explain")
+        controller.action("set_composer", {"value": "chat"}, events.append)
+        self.assertEqual(controller.snapshot()["declared"]["note"],
+                         intent.followed("web", declared["at"]),
+                         "choosing Chat over a sealed folder leaves it sealed, and says so")
+
     def test_the_write_switch_cannot_be_armed_and_rearming_the_mode_does_not_either(self):
         controller, events = self.preview()
         controller.action("set_auto_apply", {"value": True}, events.append)
@@ -788,6 +811,18 @@ class TheChangesPaneIsGone(unittest.TestCase):
         self.assertIn("verify.disabled = !r.canMutate;", self.js)
         self.assertIn("undo.disabled = !r.canRollback;", self.js,
                       "an interrupted apply is exactly when the escape has to be on screen")
+
+    def test_a_sealed_folder_is_drawn_locked_on_the_badge(self):
+        """The lock is the only thing that separates "I chose Read-only" from "this folder was chosen
+        for", and a field the front end never reads would leave the two looking identical."""
+        self.assertIn("const declared = DATA.declared || {};", self.js)
+        self.assertIn("if (declared.sealed) {", self.js)
+        self.assertIn("b.classList.add('sealed');", self.js)
+        self.assertIn("b.insertAdjacentHTML('afterbegin', ICON.lock + ' ');", self.js)
+        self.assertIn("if (declared.note) b.title = declared.note;", self.js)
+        self.assertIn(".pill.mode.sealed {", self.css)
+        self.assertIn("lock: '<svg", self.js, "the glyph has to exist in the table the badge reads")
+        self.assertEqual(self.js.count("const ICON = {"), 1)
 
     def test_the_preview_carries_the_panes_checks_tab(self):
         self.assertIn("['checks', 'Checks']", self.js)

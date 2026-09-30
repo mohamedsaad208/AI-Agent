@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import catalog, setup
+from ai_code_engineer import catalog, modes, setup
 from ai_code_engineer.cli import doctor, main, parser, run_setup
 from ai_code_engineer.errors import AgentError
 from doubles import CALCULATOR_BAD, CALCULATOR_GOOD
@@ -75,6 +75,13 @@ class Commands(unittest.TestCase):
         os_env = patch.dict("os.environ", {"GROQ_API_KEY": "synthetic-key-for-tests"})
         os_env.start()
         self.addCleanup(os_env.stop)
+        # The terminal resolves its own record folder the way the launcher does, which in a test run is
+        # this repository — and the folder declarations are a real file. Point it at the temp folder,
+        # or a test that seals a folder would seal the one the suite is running in.
+        where = patch("ai_code_engineer.cli.app_dir", return_value=Path(self.temp.name))
+        where.start()
+        self.addCleanup(where.stop)
+        self.app = Path(self.temp.name)
 
     def run_command(self, argv):
         out, err = io.StringIO(), io.StringIO()
@@ -451,6 +458,137 @@ class FirstRunWizard(unittest.TestCase):
             if ord(char) >= 128:
                 self.assertFalse(0x3040 <= ord(char) <= 0x30ff or 0x4e00 <= ord(char) <= 0x9fff,
                                  f"U+{ord(char):04X} leaked into the Arabic run")
+
+
+class TheFolderSOwnPosition(unittest.TestCase):
+    """`agent read-only`, and the three commands a declaration stops.
+
+    The terminal used to be the surface the promise did not reach: a folder set Read-only in a window
+    could be written by `agent apply` from any directory, with nothing to read back the choice. These
+    go through `main([...])` like the rest of this file, because the point is the command a person
+    types, not the store behind it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app = Path(self.temp.name)
+        self.root = sandbox_repo(self.temp.name)
+        self.runs = self.app / "runs"
+        where = patch("ai_code_engineer.cli.app_dir", return_value=self.app)
+        where.start()
+        self.addCleanup(where.stop)
+
+    def run_command(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue()
+
+    def declare(self, folder=None):
+        code, text = self.run_command(["read-only", "--repo", str(folder or self.root)])
+        self.assertEqual(code, 0, text)
+        return text
+
+    # ------------------------------- declaring it -------------------------------
+    def test_a_folder_is_declared_for_every_surface_and_says_how_to_undo_it(self):
+        text = self.declare()
+        self.assertTrue(modes.sealed(self.app, self.root))
+        self.assertIn("the command line", text)
+        self.assertIn("agent read-only --off", text,
+                      "a promise with no named way out sends the operator into a config file")
+
+    def test_a_folder_that_does_not_exist_is_an_error_not_a_declaration(self):
+        code, text = self.run_command(["read-only", "--repo", str(self.app / "nowhere")])
+        self.assertEqual(code, 1)
+        self.assertTrue(text.startswith("Error:"), text)
+        self.assertEqual(modes.listed(self.app), [])
+
+    def test_listing_answers_for_a_machine_that_has_never_declared_anything(self):
+        code, text = self.run_command(["read-only"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("Nothing is declared", text)
+        self.declare()
+        code, text = self.run_command(["read-only"])
+        self.assertIn("Read-only", text)
+        self.assertIn("command line", text)
+
+    def test_lifting_is_a_separate_line_and_leaves_no_row_behind(self):
+        self.declare()
+        code, text = self.run_command(["read-only", "--repo", str(self.root), "--off"])
+        self.assertEqual(code, 0, text)
+        self.assertFalse(modes.sealed(self.app, self.root))
+        self.assertEqual(modes.listed(self.app), [])
+
+    def test_the_arabic_run_of_the_same_command_answers_in_arabic(self):
+        """The console used to print `??????` for this: `run_setup` had the encoding fix and the new
+        command did not, so the flag existed and the answer nobody could read shipped anyway."""
+        code, text = self.run_command(["read-only", "--repo", str(self.root), "--arabic"])
+        self.assertEqual(code, 0, text)
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in text), text[:120])
+        self.assertNotIn("\ufffd", text)
+        self.assertIn("agent read-only --off", text, "the way out is part of the refusal, in either language")
+        self.assertNotIn("declared Read-only", text)
+
+    # ------------------------------- what it stops -------------------------------
+    def test_a_declared_folder_is_not_planned_against(self):
+        """Refused before a provider is built: a job that was never going to happen cannot cost a
+        request to a model, sealed or not."""
+        self.declare()
+        started = patch("ai_code_engineer.cli.make_provider",
+                        side_effect=AssertionError("asked a model for a sealed folder"))
+        started.start()
+        self.addCleanup(started.stop)
+        code, text = self.run_command(["plan", "Fix add", "--repo", str(self.root),
+                                       "--runs", str(self.runs)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("declared Read-only", text)
+        self.assertIn("agent read-only --off", text)
+        self.assertEqual((self.root / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    def test_apply_refuses_before_it_asks_for_the_hash(self):
+        session = self.planned_session()
+        self.declare()
+        code, text = self.run_command(["apply", str(session)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("the command line", text)
+        self.assertNotIn("Type the full proposal", text,
+                         "asking for a hash is promising the write follows it")
+        self.assertEqual((self.root / "calculator.py").read_text(), CALCULATOR_BAD)
+
+    def test_rollback_is_a_write_too(self):
+        session = self.planned_session()
+        self.declare()
+        code, text = self.run_command(["rollback", str(session)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("declared Read-only", text)
+
+    def planned_session(self):
+        started = patch("ai_code_engineer.cli.make_provider",
+                        return_value=ScriptedProvider([CALCULATOR_READ, PROPOSE]))
+        started.start()
+        self.addCleanup(started.stop)
+        code, text = self.run_command(["plan", "Fix add", "--repo", str(self.root),
+                                       "--runs", str(self.runs)])
+        self.assertEqual(code, 0, text)
+        line = [row for row in text.splitlines() if row.startswith("Session: ")]
+        return Path(line[0].split("Session: ", 1)[1].strip())
+
+    # ------------------------------- what it does not stop -------------------------------
+    def test_reading_a_declared_folder_still_works(self):
+        """The four verbs the mode promises are all reads, and a declaration that also stopped them
+        would be a way to lock a person out of their own project."""
+        self.declare()
+        code, text = self.run_command(["map", "--repo", str(self.root)])
+        self.assertEqual(code, 0, text)
+        self.assertIn("calculator.py", text)
+
+    def test_a_session_of_a_sealed_folder_can_still_be_read_back(self):
+        session = self.planned_session()
+        self.declare()
+        code, text = self.run_command(["review", str(session)])
+        self.assertEqual(code, 0, text)
+        self.assertIn("calculator.py", text)
 
 
 if __name__ == "__main__":

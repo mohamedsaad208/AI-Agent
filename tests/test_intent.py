@@ -31,6 +31,13 @@ SENTENCES = {
     "run_declined": lambda a: intent.run_declined(arabic=a),
     "unchecked": lambda a: intent.unchecked(arabic=a),
     "answered": lambda a: intent.answered(arabic=a),
+    # The durable declaration: a folder told to stay read-only by a surface this window never saw.
+    "declared": lambda a: intent.declared(by="cli", at="2026-09-30 07:12", arabic=a,
+                                          project="auth-service"),
+    "declared with no who": lambda a: intent.declared(arabic=a),
+    "lift": lambda a: intent.lift("D:\\repo\\auth-service", arabic=a),
+    "followed": lambda a: intent.followed(by="web", at="2026-09-30 07:12", arabic=a),
+    "followed with no who": lambda a: intent.followed(arabic=a),
 }
 
 
@@ -121,6 +128,38 @@ class TheRunPermission(unittest.TestCase):
 
     def test_declining_says_that_nothing_ran(self):
         self.assertIn("Nothing ran", intent.run_declined())
+
+
+class TheDurableDeclaration(unittest.TestCase):
+    """The sentences a folder sealed by another surface gets. Each one has to name the way out."""
+
+    def test_the_declaration_names_the_surface_and_the_minute(self):
+        text = intent.declared(by="cli", at="2026-09-30 07:12", project="auth-service")
+        self.assertIn("the command line", text)
+        self.assertIn("2026-09-30 07:12", text)
+        self.assertIn("auth-service", text)
+        self.assertIn("git branch", text, "the two writes this mode stopped late are named with the rest")
+
+    def test_a_declaration_anybody_can_see_needs_no_blame(self):
+        text = intent.declared()
+        self.assertIn("declared Read-only", text)
+        self.assertNotIn("()", text, "no empty parenthesis where a who would have been")
+
+    def test_the_lift_line_carries_the_command_to_type(self):
+        text = intent.lift("D:\\repo\\auth-service")
+        self.assertIn("agent read-only --off", text)
+        self.assertIn("D:\\repo\\auth-service", text)
+
+    def test_the_badge_follows_the_fact_and_says_which_one_won(self):
+        text = intent.followed(by="web", at="2026-09-30 07:12")
+        self.assertIn("The badge follows the declaration", text)
+        self.assertIn("the web window", text)
+
+    def test_a_surface_nobody_listed_keeps_the_name_it_was_written_with(self):
+        self.assertEqual(intent.source("cli"), "the command line")
+        self.assertEqual(intent.source("cli", arabic=True), "سطر الأوامر")
+        self.assertEqual(intent.source("hand-edited"), "hand-edited")
+        self.assertEqual(intent.source(""), "")
 
 
 class NeitherWindowWordsARefusal(unittest.TestCase):

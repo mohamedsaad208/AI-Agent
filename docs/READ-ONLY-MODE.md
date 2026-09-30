@@ -47,8 +47,12 @@ Every refusal is one shared rule with one shared sentence, so the two windows ca
 ## Deliberately not built
 
 - Auto-Apply as a fourth radio button (it is a switch, and it already persists per folder).
-- A read-only flag on disk that a second process cannot ignore — the refusal lives in the window that
-  runs the command, same as every other gate here.
+- ~~A read-only flag on disk that a second process cannot ignore — the refusal lives in the window that
+  runs the command, same as every other gate here.~~ **Built six days later, against this reasoning.**
+  Measuring found what the choice cost: the position was stored inside `ui` of `.agent-projects.json`,
+  which each window rebuilds from its own named keys, so opening the desktop window once deleted every
+  folder the web window had left in Read-only — and a folder with no stored row is granted on Change.
+  See `docs/READ-ONLY-FLAG-PLAN.md` for the declaration, `modes.py`, and `agent read-only`.
 - A "sandbox" that makes reads safe from a malicious project: reading is already confined to the
   approved folder by `Workspace`, and this mode adds no new reach.
 
