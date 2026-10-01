@@ -1,8 +1,7 @@
 // Pure rendering tests: no browser, network, or project writes.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(require('node:path').join(__dirname, '../src/ai_code_engineer/webapp/static/app.js'), 'utf8');
+const { source } = require('./ui_source.cjs');
 class Element {
   constructor(tag, cls, html) { Object.assign(this, {tag, cls, html, children: [], attributes: {}}); }
   append(...nodes) { this.children.push(...nodes); }

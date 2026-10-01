@@ -1,7 +1,7 @@
 """Scratch: serve the real controller with a scripted model so the new sidebar can be driven.
 
-Not a test file — it exists so the browser pass exercises controller.py, server.py and app.js
-exactly as Run-Agent.bat does, with only the model replaced. Flags: ``--inside`` boots already
+Not a test file — it exists so the browser pass exercises controller.py, server.py and the UI
+scripts exactly as Run-Agent.bat does, with only the model replaced. Flags: ``--inside`` boots already
 inside the granted folder in Change mode (so a run can be started without driving the picker),
 ``--chunk`` proposes the same edit in the §6 search/replace shape, and ``--fail`` adds a suite
 that fails so the §5 "Keep going?" question appears after a run.

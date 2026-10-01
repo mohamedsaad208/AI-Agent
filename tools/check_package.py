@@ -15,11 +15,22 @@ import sys
 from pathlib import Path
 from zipfile import ZipFile
 
-# `index.html` alone would pass with an unstyled page, so every file the window fetches is named.
+# `index.html` alone would pass with an unstyled page, so every file the window fetches is named --
+# and the UI scripts are read out of the checkout rather than typed here. The front end is split
+# across several files now, and a list a person has to remember to extend is a wheel that ships
+# without one: the window opens with no rail, no thread, or no dialogs, and every source-tree test
+# still passes because the tests read the tree.
 REQUIRED = ("ai_code_engineer/webapp/static/index.html",
-            "ai_code_engineer/webapp/static/app.js",
             "ai_code_engineer/webapp/static/app.css",
+            "ai_code_engineer/webapp/static/tokens.css",
             "ai_code_engineer/webapp/static/boot.js")
+STATIC = Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer" / "webapp" / "static"
+
+
+def required_files() -> tuple[str, ...]:
+    """The four fixed files, plus every `ui-*.js` the window loads today."""
+    return REQUIRED + tuple("ai_code_engineer/webapp/static/" + path.name
+                            for path in sorted(STATIC.glob("ui-*.js")))
 
 
 def newest_wheel() -> Path:
@@ -32,9 +43,10 @@ def newest_wheel() -> Path:
 
 def main(argv: list[str]) -> int:
     wheel = Path(argv[1]) if len(argv) > 1 else newest_wheel()
+    wanted = required_files()
     with ZipFile(wheel) as archive:
         names = set(archive.namelist())
-        missing = [want for want in REQUIRED if want not in names]
+        missing = [want for want in wanted if want not in names]
         modules = sorted(name for name in names if name.endswith(".py") and name.startswith("ai_code_engineer"))
     if missing:
         print("%s is missing:" % wheel.name)
@@ -46,7 +58,7 @@ def main(argv: list[str]) -> int:
     if not any(name == "ai_code_engineer/cli.py" for name in names):
         print("%s has no cli.py — the `agent` entry point would not exist" % wheel.name)
         return 1
-    print("%s carries %d modules and all %d UI files" % (wheel.name, len(modules), len(REQUIRED)))
+    print("%s carries %d modules and all %d UI files" % (wheel.name, len(modules), len(wanted)))
     return 0
 
 
