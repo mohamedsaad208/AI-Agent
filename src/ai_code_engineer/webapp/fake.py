@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .. import config, git_integration, intent, labels, modes, overrides, repair, runner, setup
 from ..errors import PolicyError
-from .controller import MODES, PROJECT_ICONS as ICONS
+from .controller import PROJECT_ICONS as ICONS
 
 BEFORE = """package com.demo.users;
 
@@ -191,7 +191,7 @@ class FakeController:
         self.mode = "Ollama"
         # The same table the real window builds, so the preview is reviewing the provider list and
         # not a shorter copy of it.
-        self.modes = list(MODES)
+        self.modes = list(config.MODES)
         self.catalogs = {label: (OLLAMA_MODELS if kind.shape == "ollama" else
                                  FREE_MODELS if label == config.free_mode(kind) else
                                  PAID_MODELS if label == config.paid_mode(kind) else SERVED_MODELS)
@@ -199,7 +199,7 @@ class FakeController:
         self.endpoints = {kind.key: config.default_endpoint(kind) for kind in config.KINDS
                            if config.default_endpoint(kind)}
         self.profile = ""
-        self.catalog_source = {label: "live" for label in MODES}
+        self.catalog_source = {label: "live" for label in config.MODES}
         self.model = "qwen2.5-coder:1.5b"
         self.selections = {self.mode: self.model}
         self.model_filter = ""

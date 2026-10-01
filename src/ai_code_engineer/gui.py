@@ -50,13 +50,8 @@ ACCENT_SOFT = "#eaf0ff"
 CHAT_GROUP = "chats"
 SEARCH_PLACEHOLDER = "Search tasks and chats"
 BUBBLE_FONT = ("Segoe UI", 12)
-# Measured on this machine with the app's own request path (see docs/MODEL-BENCHMARK.md):
-# qwen2.5-coder:1.5b was the fastest model that produced valid, correct proposals.
-DEFAULT_MODEL = "qwen2.5-coder:1.5b"
-RECOMMENDED = {
-    "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
-    "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
-}
+# The recommended models are `config.DEFAULT_MODEL` / `config.RECOMMENDED`: this window and the web
+# one used to keep their own copy of each, and a benchmark that moved one would not move the other.
 
 
 def text_set(widget: tk.Text, content: str) -> None:
@@ -1727,7 +1722,7 @@ class AgentWindow:
         entries = self.catalogs.get(self.mode.get(), [])
         values = [entry["id"] for entry in entries
                   if query in (entry["id"] + " " + entry["name"]).casefold()]
-        values.sort(key=lambda name: name != DEFAULT_MODEL)
+        values.sort(key=lambda name: name != config.DEFAULT_MODEL)
         self.model_box.configure(values=values)
         if self.model.get() and not any(entry["id"] == self.model.get() for entry in entries):
             self.model.set("")
@@ -1739,8 +1734,8 @@ class AgentWindow:
         info = (entry["name"] + "\n" + entry["description"]) if entry else \
             f"{len(self.model_box.cget('values'))} models available at {self.endpoint_for()}. " \
             "Select one from the list."
-        if entry and entry["id"] in RECOMMENDED:
-            info += "\n★ " + RECOMMENDED[entry["id"]]
+        if entry and entry["id"] in config.RECOMMENDED:
+            info += "\n★ " + config.RECOMMENDED[entry["id"]]
         self.model_info.set(info)
         cloud, paid = self.cloud_choice()
         kind = self.active_kind()
@@ -1782,8 +1777,8 @@ class AgentWindow:
             self._pending_model = ""
             if pending and not self.model.get() and any(entry["id"] == pending for entry in self.catalogs.get(self.mode.get(), [])):
                 self.model.set(pending)
-            if not self.model.get() and any(entry["id"] == DEFAULT_MODEL for entry in self.catalogs.get(self.mode.get(), [])):
-                self.model.set(DEFAULT_MODEL)
+            if not self.model.get() and any(entry["id"] == config.DEFAULT_MODEL for entry in self.catalogs.get(self.mode.get(), [])):
+                self.model.set(config.DEFAULT_MODEL)
             self.model_changed()
             count = len(self.catalogs[self.mode.get()])
             self.status.set(catalog_status_line(arabic=self.arabic, count=count,

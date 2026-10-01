@@ -58,42 +58,11 @@ from .. import (git_integration, host, ignore, intent, modes, overrides, planboo
                 runner, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
-from . import requestqueue, runresults
+from . import connection, requestqueue, runresults
 
-DEFAULT_MODEL = "qwen2.5-coder:1.5b"
-RECOMMENDED = {
-    "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
-    "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
-}
-
-
-def _mode_rows() -> tuple[tuple[str, config.Kind], ...]:
-    """One row per provider the windows offer, as ``(label, kind)``.
-
-    OpenRouter is two rows on purpose: its free list and its paid list differ in what they cost,
-    which is a decision the user makes per task, not a setting. Every other row is one provider.
-    """
-    rows = []
-    for kind in config.KINDS:
-        if kind.free_only:
-            rows.append((f"{kind.label} \u00b7 Free", kind))
-            rows.append((f"{kind.label} \u00b7 Paid", kind))
-        else:
-            rows.append((kind.label, kind))
-    return tuple(rows)
-
-
-MODE_ROWS = _mode_rows()
-MODES = tuple(label for label, _ in MODE_ROWS)
-MODE_KIND = dict(MODE_ROWS)
-
-
-def free_mode(kind: config.Kind) -> str:
-    return f"{kind.label} \u00b7 Free"
-
-
-def paid_mode(kind: config.Kind) -> str:
-    return f"{kind.label} \u00b7 Paid"
+# The provider rows and the recommended models are the table's (`config.py`), not this window's:
+# a second copy of `MODES` was how the web window and Tk ended up disagreeing about a provider's
+# name once already, and `test_connection` now refuses to let the copy come back.
 PLAN_SUFFIXES = (".md", ".txt")
 # A sidebar entry is a branch, and a branch is the only thing that owns a folder. "chat" never
 # has one unless a project was bound to it by name, so the program cannot start pointed at a
@@ -318,7 +287,7 @@ class AgentController:
         self.request_timeout = config.REQUEST_TIMEOUT_DEFAULT
         self.recipe = ""
         self.run_info = "No command has run yet."
-        self.catalogs: dict[str, list[dict]] = {mode: [] for mode in MODES}
+        self.catalogs: dict[str, list[dict]] = {mode: [] for mode in config.MODES}
         self.selections: dict[str, str] = {}
         self.active_mode = "Ollama"
         self.busy = False
@@ -969,7 +938,7 @@ class AgentController:
             # to be visible or every refusal below looks like a bug.
             "declared": self._declared_info(),
             "plan": plan_info,
-            "provider": {"mode": self.mode, "modes": list(MODES), "model": self.model,
+            "provider": {"mode": self.mode, "modes": list(config.MODES), "model": self.model,
                          "models": self.visible_models(), "metrics": self._metrics_info()},
             # The whole connection row: a drawer that offered a provider without saying where it
             # points, or whether it wants a key, could only be filled by trial and error.
@@ -1520,7 +1489,7 @@ class AgentController:
         self.refresh_plan_status()
 
     def set_mode(self, value: str) -> None:
-        if value not in MODES:
+        if value not in config.MODES:
             return
         with self._state:
             self.selections[self.active_mode] = self.model
@@ -1535,11 +1504,11 @@ class AgentController:
 
     # ------------------------------- connection -------------------------------
     def active_kind(self) -> config.Kind:
-        return MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+        return config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
 
     def endpoint_for(self, mode: str = "") -> str:
         """Where this provider row actually is — typed value, saved value, or its own default."""
-        kind = MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
+        kind = config.MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
         return self.endpoints.get(kind.key, "") or config.default_endpoint(kind, self.app_dir)
 
     def set_endpoint(self, value: str) -> None:
@@ -1561,7 +1530,7 @@ class AgentController:
                 except AgentError as exc:
                     self.status = friendly_error(exc)
                     return
-            for label, row in MODE_ROWS:
+            for label, row in config.mode_rows():
                 if row is kind:
                     self.catalogs[label] = []
                     self.catalog_source.pop(label, None)
@@ -1610,27 +1579,17 @@ class AgentController:
     def connection_info(self) -> dict:
         kind = self.active_kind()
         endpoint = self.endpoint_for()
-        needs_consent = config.needs_consent(kind, endpoint)
-        return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
-                "default_endpoint": config.default_endpoint(kind, self.app_dir), "cloud": kind.cloud,
-                "shape": kind.shape,
-                "needs_key": kind.needs_key, "key_env": kind.key_env or "",
-                "consent": needs_consent, "paid": self.mode.endswith(" \u00b7 Paid"),
-                "profile": self.profile, "profiles": self.available_profiles(),
-                "source": self.catalog_source.get(self.mode, ""),
-                "key_present": bool(self.key.strip() or os.environ.get(kind.key_env or ""))}
+        return connection.info(kind=kind, mode=self.mode, endpoint=endpoint,
+                               default_endpoint=config.default_endpoint(kind, self.app_dir),
+                               profile=self.profile, profiles=self.available_profiles(),
+                               source=self.catalog_source.get(self.mode, ""),
+                               key_present=bool(self.key.strip()
+                                                or os.environ.get(kind.key_env or "")))
 
     def cloud_choice(self) -> tuple[bool, bool]:
-        """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths.
-
-        Two things can make a task leave the device: the provider row itself, and a model entry the
-        catalog marked cloud (an Ollama "cloud" tag answers over the internet from a local URL).
-        """
-        kind = self.active_kind()
-        entry = self.selected_entry()
-        paid = kind.free_only and self.mode == paid_mode(kind)
-        cloud = config.needs_consent(kind, self.endpoint_for()) or bool(entry and entry.get("cloud"))
-        return cloud, paid
+        """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths."""
+        return connection.cloud_choice(self.active_kind(), self.mode, self.selected_entry(),
+                                       self.endpoint_for())
 
     def task_settings(self, cloud: bool) -> Settings | None:
         """The Settings for a task on the current row, or None with the reason on the status line.
@@ -1725,20 +1684,11 @@ class AgentController:
     def visible_models(self, mode: str | None = None) -> list[dict]:
         """The catalog as filtered — a view, never a mutation of what was loaded.
 
-        ``filter_models`` used to write the subset back into ``self.catalogs``, so searching the
-        list cost you every dropped entry until the next Refresh, and then cleared ``self.model``
-        when the query stopped matching it: typing three letters could deselect the model running
-        your task.
+        See `connection.filter_models` for why the subset is a new list and why a search cannot
+        deselect the model a running task is using.
         """
-        query = self.model_filter.strip().casefold()
-        entries = self.catalogs.get(mode if mode is not None else self.mode, [])
-        if not query:
-            return list(entries)
-        kept = [entry for entry in entries
-                if query in " ".join([entry.get("id", ""), entry.get("name", ""),
-                                      entry.get("description", "")]).casefold()]
-        kept.sort(key=lambda entry: entry.get("id") != DEFAULT_MODEL)
-        return kept
+        return connection.filter_models(
+            self.catalogs.get(mode if mode is not None else self.mode, []), self.model_filter)
 
     def model_changed(self) -> None:
         self.selections[self.mode] = self.model
@@ -1746,18 +1696,10 @@ class AgentController:
         self._save_state()
 
     def _model_info(self) -> str:
-        entry = self.selected_entry()
-        if entry:
-            text = entry["name"] + " — " + entry["description"]
-            if entry["id"] in RECOMMENDED:
-                text += " · ★ " + RECOMMENDED[entry["id"]]
-            return text
-        loaded = len(self.catalogs.get(self.mode, []))
-        shown = len(self.visible_models())
-        if shown != loaded:
-            return (f"{shown} of {loaded} models match \"{self.model_filter.strip()}\". "
-                    "Clear the filter to see the rest.")
-        return f"{loaded} models available at {self.endpoint_for()}. Select one from the list."
+        return connection.model_info(self.selected_entry(),
+                                     loaded=len(self.catalogs.get(self.mode, [])),
+                                     shown=len(self.visible_models()),
+                                     query=self.model_filter, endpoint=self.endpoint_for())
 
     def check_setup(self) -> None:
         """Ask the selected provider what it has. Read-only: no code leaves, no token is generated."""
@@ -1780,8 +1722,8 @@ class AgentController:
             catalog = self.catalogs.get(self.mode, [])
             if pending and not self.model and any(entry["id"] == pending for entry in catalog):
                 self.model = pending
-            elif not self.model and any(entry["id"] == DEFAULT_MODEL for entry in catalog):
-                self.model = DEFAULT_MODEL
+            elif not self.model and any(entry["id"] == config.DEFAULT_MODEL for entry in catalog):
+                self.model = config.DEFAULT_MODEL
             self.model_changed()
             self.status = catalog_status_line(arabic=self.arabic, count=len(catalog),
                                               model=self.model, label=selected_mode,

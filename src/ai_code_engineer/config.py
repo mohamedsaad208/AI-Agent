@@ -30,6 +30,18 @@ REQUEST_TIMEOUT_DEFAULT = 300
 REQUEST_TIMEOUT_LOW = 30
 REQUEST_TIMEOUT_HIGH = 900
 
+# The model a window offers when it has nothing better to say, and the note it prints beside the ones
+# worth picking. Both windows recommend the same two, so the recommendation is the provider table's
+# business — it used to be typed out in `gui.py` and in `webapp/controller.py` separately, and the
+# `Settings` default below was a third copy of the same string.
+# Measured on the reference machine through the app's own request path (docs/MODEL-BENCHMARK.md):
+# qwen2.5-coder:1.5b was the fastest model that produced valid, correct proposals.
+DEFAULT_MODEL = "qwen2.5-coder:1.5b"
+RECOMMENDED = {
+    "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
+    "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
+}
+
 
 def clamp_request_timeout(value, fallback: int = REQUEST_TIMEOUT_DEFAULT) -> int:
     """One request timeout inside the advertised range, unreadable input included.
@@ -255,7 +267,7 @@ LIMITS = {"max_turns": (1, 30), "timeout_seconds": (1, 900),
 @dataclass(frozen=True)
 class Settings:
     provider: str = "ollama"
-    model: str = "qwen2.5-coder:1.5b"
+    model: str = DEFAULT_MODEL
     # No address of its own. "" means "ask the order `check_endpoint` implements": the profile, then
     # the provider's environment variable, then its row in the table. A default written here would be
     # one more place a URL is hardcoded, and the one that got read for a provider it never named.
@@ -325,7 +337,7 @@ def load_settings(path: Path | None, app_dir=None) -> Settings:
             raise AgentError("Unknown configuration field.")
         settings = Settings(
             provider=model.get("provider", "ollama"),
-            model=model.get("name", "qwen2.5-coder:1.5b"),
+            model=model.get("name", DEFAULT_MODEL),
             api_key_env=model.get("api_key_env", ""),
             **limits,
         )
