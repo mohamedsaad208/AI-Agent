@@ -29,6 +29,7 @@ from ..catalog import LIVE, models_for
 from ..chat import (context_block, context_use, create_chat, load_chat, project_of, respond,
                     title_for)
 from .. import config
+from .. import service_runner
 from ..config import Settings
 from ..engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, diff_size,
                       load_session, plan, project_key, proposal_rejected, propose_block,
@@ -103,7 +104,10 @@ CHAT_ID = re.compile(r"[a-f0-9]{32}")
 # crafted registry could inject there would read to the user as their own label. Escapes
 # keep the source plain ASCII, which a cp1252 console can at least print.
 PROJECT_ICONS = ("📁", "🚀", "🐍", "☕", "⚛️",
-                 "🦀", "🌐", "📦", "🧪", "🛠️")
+                 "🦀", "🌐", "📦", "🧪", "🛠️",
+                 "💻", "🖥️", "📱", "🤖", "🧠", "🎮",
+                 "🗄️", "☁️", "🔌", "⚙️", "🔒", "📊",
+                 "🛒", "💬", "🎨", "🧩", "🔬", "📡")
 DEFAULT_ICON = "📁"          # folder
 
 # A project branch opens in Chat, and that is the right default: a greeting must not become a
@@ -1019,6 +1023,11 @@ class AgentController:
             "overrides": self.overrides_info(),
             "recipes": [runner.RECIPES[name]["label"] for name in self.recipes],
             "recipe": self.recipe, "canRun": self._can_run(), "runInfo": self.run_info,
+            "runStatus": self.run_status_info(),
+            "services": service_runner.GLOBAL_SERVICES.all_snapshots(),
+            "runConfig": service_runner.read_project_config(Path(self.repo)) if self.repo and Path(self.repo).is_dir() else None,
+            "lastJob": getattr(self, "_last_job", None),
+            "readiness": getattr(self, "_cached_readiness", None),
             # Which folder of a multi-project folder the command runs in. One entry means there is
             # nothing to choose, and the window says so rather than drawing a picker of one.
             "targets": [{"path": row["path"], "label": row["label"]} for row in self.targets],
@@ -1124,6 +1133,17 @@ class AgentController:
             "select_file": lambda: setattr(self, "review_file", int(payload.get("index", 0))),
             "select_tab": lambda: setattr(self, "diff_tab", str(payload.get("tab", "diff"))),
             "refresh_models": self.check_setup,
+            "run_app": lambda: self.run_app_service(payload),
+            "stop_app": lambda: self.stop_app_service(payload),
+            "restart_app": lambda: self.restart_app_service(payload),
+            "stop_all_apps": self.stop_all_app_services,
+            "run_build": self.run_build_action,
+            "get_run_config": self.get_project_run_config,
+            "save_run_config": lambda: self.save_project_run_config(payload),
+            "get_readiness": self.get_project_readiness,
+            "service_lines": lambda: self.get_service_lines(payload),
+            "api_test": lambda: self.run_api_test(payload),
+            "fix_errors": lambda: self.fix_run_failure(payload),
         }
         handler = handlers.get(type)
         if handler is None:
@@ -2950,6 +2970,48 @@ class AgentController:
     # is what D28 was about: the build used to be unreachable exactly when the last task went wrong.
     RUN_LOCKED_STATES = {"DISCOVERING", "WAITING_APPROVAL"}
 
+    def run_status_info(self) -> dict:
+        state = self.session.get("state") if self.session else ""
+        reasons = []
+        has_project = bool(self.repo and Path(self.repo).is_dir())
+        if not has_project:
+            reasons.append({
+                "code": "no_project",
+                "title": "No project selected",
+                "action": "Select or open a project folder in the sidebar."
+            })
+        if self.busy:
+            reasons.append({
+                "code": "agent_busy",
+                "title": "Agent is busy",
+                "action": "Wait for the current operation to complete or press Stop."
+            })
+        if state in self.RUN_LOCKED_STATES:
+            reasons.append({
+                "code": "waiting_approval",
+                "title": "Changes waiting for approval",
+                "action": "Review the pending changes and click Apply or Rollback before running."
+            })
+
+        can_run_general = has_project and not self.busy and state not in self.RUN_LOCKED_STATES
+        can_run_app = can_run_general
+        can_run_tests = can_run_general and bool(self.recipes)
+        can_build = can_run_general
+        disabled_msg = (reasons[0]["title"] + ": " + reasons[0]["action"]) if reasons else ""
+
+        docker_avail = runner.sandbox_available()
+        return {
+            "canRun": can_run_general,
+            "canRunApp": can_run_app,
+            "canRunTests": can_run_tests,
+            "canBuild": can_build,
+            "reasons": reasons,
+            "disabledMessage": disabled_msg,
+            "dockerAvailable": docker_avail,
+            "dockerOn": bool(self.sandbox_on and docker_avail),
+            "dockerNote": "Docker is optional. Local execution runs directly using your system tools.",
+        }
+
     def _can_run(self) -> bool:
         state = self.session.get("state") if self.session else ""
         return (not self.busy and bool(self.recipes) and bool(self.repo)
@@ -3041,6 +3103,7 @@ class AgentController:
         self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
 
     def report_run(self, result) -> None:
+        self._last_job = {"type": "tests", **result}
         summary = runner.summarize(result)
         self.run_info = summary
         self._settle_run_step(result)
@@ -3079,6 +3142,207 @@ class AgentController:
             if result["status"] in {"failed", "timeout"} and self._offer_fix(result):
                 return
         self.advance_plan(result)
+
+    def run_app_service(self, payload: dict | None = None) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        payload = payload or {}
+        repo = Path(self.repo).resolve()
+        cfg = service_runner.read_project_config(repo)
+        
+        name = str(payload.get("name") or "app")
+        command = payload.get("command") or cfg.get("app", {}).get("command")
+        if not command and cfg.get("services"):
+            first_svc = cfg["services"][0]
+            name = first_svc.get("name", "app")
+            command = first_svc.get("command")
+        if not command:
+            recipe = self.selected_recipe()
+            if recipe:
+                command = runner.display_command(recipe)
+            else:
+                command = "python main.py" if (repo / "main.py").is_file() else "npm start"
+
+        cwd_rel = payload.get("cwd") or cfg.get("app", {}).get("cwd", ".")
+        cwd = (repo / cwd_rel).resolve()
+        port = payload.get("port") or cfg.get("app", {}).get("port")
+        if port:
+            try:
+                port = int(port)
+            except ValueError:
+                port = None
+
+        svc_id = f"{repo.name}:{name}"
+        
+        def on_line(line):
+            self._build_line(f"[{name}] {line}")
+            
+        svc = service_runner.GLOBAL_SERVICES.start_service(
+            svc_id, name, command, cwd, port=port, on_output=on_line
+        )
+        self.status = f"Service '{name}' started."
+        self._add("tool", "App", f"🚀 Started service '{name}' ({command}) in {cwd.name}")
+        return svc.snapshot()
+
+    def stop_app_service(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        repo_name = Path(self.repo).name if self.repo else ""
+        name = str(payload.get("name") or "app")
+        svc_id = payload.get("id") or f"{repo_name}:{name}"
+        service_runner.GLOBAL_SERVICES.stop_service(svc_id)
+        self.status = f"Service '{name}' stopped."
+        self._add("tool", "App", f"⏹ Stopped service '{name}'")
+        return {"stopped": True, "id": svc_id}
+
+    def restart_app_service(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        repo_name = Path(self.repo).name if self.repo else ""
+        name = str(payload.get("name") or "app")
+        svc_id = payload.get("id") or f"{repo_name}:{name}"
+        service_runner.GLOBAL_SERVICES.restart_service(svc_id)
+        self.status = f"Service '{name}' restarted."
+        return {"restarted": True, "id": svc_id}
+
+    def stop_all_app_services(self) -> dict:
+        service_runner.GLOBAL_SERVICES.stop_all()
+        self.status = "All services stopped."
+        self._add("tool", "App", "⏹ Stopped all services.")
+        return {"stopped_all": True}
+
+    def run_build_action(self) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        repo = Path(self.repo).resolve()
+        cfg = service_runner.read_project_config(repo)
+        command = cfg.get("build", {}).get("command")
+        if not command:
+            recipe = self.selected_recipe()
+            if recipe and "compile" in recipe:
+                command = runner.display_command(recipe)
+            elif (repo / "pom.xml").is_file():
+                command = "mvn compile"
+            elif (repo / "package.json").is_file():
+                command = "npm run build"
+            elif (repo / "Cargo.toml").is_file():
+                command = "cargo build"
+            else:
+                command = "python -m py_compile"
+
+        cwd = (repo / cfg.get("build", {}).get("cwd", ".")).resolve()
+        self.status = f"Building: {command}…"
+        res = service_runner.execute_bounded_job(command, cwd, timeout=600, on_output=self._build_line)
+        self._last_job = {"type": "build", **res}
+        outcome = "succeeded" if res["success"] else "FAILED"
+        self.status = f"Build {outcome} (exit {res['exit_code']}, {res['duration']}s)"
+        self._add("tool", "Build", f"🔨 Build {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
+        return res
+
+    def get_service_lines(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        repo_name = Path(self.repo).name if self.repo else ""
+        name = str(payload.get("name") or "app")
+        svc_id = payload.get("id") or f"{repo_name}:{name}"
+        svc = service_runner.GLOBAL_SERVICES.get_service(svc_id)
+        lines = svc.get_lines(int(payload.get("max_lines") or 500)) if svc else []
+        return {"id": svc_id, "lines": lines}
+
+    def get_project_readiness(self) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            return {"tools": [], "wrappers": [], "configs": [], "recommendations": []}
+        res = service_runner.check_project_readiness(Path(self.repo))
+        self._cached_readiness = res
+        return res
+
+    def get_project_run_config(self) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            return {}
+        return service_runner.read_project_config(Path(self.repo))
+
+    def save_project_run_config(self, payload: dict) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        config_data = payload.get("config") or {}
+        service_runner.save_project_config(Path(self.repo), config_data)
+        self.status = "Project run configuration saved."
+        return {"saved": True}
+
+    def run_api_test(self, payload: dict) -> dict:
+        url = str(payload.get("url") or "").strip()
+        method = str(payload.get("method") or "GET").upper()
+        if not url.startswith(("http://", "https://")):
+            raise PolicyError("API test requires a valid http:// or https:// URL.")
+        headers = dict(payload.get("headers") or {})
+        body_text = payload.get("body")
+        data = body_text.encode("utf-8") if body_text else None
+        
+        req = urllib.request.Request(url, data=data, method=method)
+        for h, v in headers.items():
+            req.add_header(h, v)
+        if "User-Agent" not in headers:
+            req.add_header("User-Agent", "AICodeEngineer-APITester")
+
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                resp_body = resp.read(100_000).decode("utf-8", errors="replace")
+                duration = round(time.monotonic() - start, 2)
+                return {
+                    "ok": True,
+                    "status": resp.status,
+                    "duration": duration,
+                    "headers": dict(resp.headers),
+                    "body": resp_body,
+                }
+        except urllib.error.HTTPError as e:
+            err_body = e.read(50_000).decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            duration = round(time.monotonic() - start, 2)
+            return {
+                "ok": False,
+                "status": e.code,
+                "duration": duration,
+                "headers": dict(e.headers) if hasattr(e, "headers") else {},
+                "body": err_body,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": 0,
+                "error": str(exc),
+                "duration": round(time.monotonic() - start, 2),
+                "body": "",
+            }
+
+    def fix_run_failure(self, payload: dict | None = None) -> None:
+        payload = payload or {}
+        source = str(payload.get("source") or "check")
+        last_job = getattr(self, "_last_job", {}) or {}
+        diagnosis = payload.get("diagnosis") or last_job.get("diagnosis", {})
+        tail = payload.get("output") or last_job.get("output", "")
+        if not tail and self.run_info:
+            tail = self.run_info
+
+        round_num = getattr(self, "_fix_round", 0) + 1
+        self._fix_round = round_num
+        if round_num > 3:
+            self._add("tool", "Fix", "🛑 Maximum auto-fix attempts reached (3). Manual review required.")
+            self.status = "Auto-fix limit reached."
+            return
+
+        summary = diagnosis.get("summary", "execution failure")
+        prev = getattr(self, "_last_fix_summary", "")
+        if prev and prev == summary and round_num > 1:
+            self._add("tool", "Fix", f"⚠️ The exact same failure repeated ('{summary}'). Stopping fix loop to prevent runaway cycles.")
+            self.status = "Identical failure repeated; manual intervention needed."
+            return
+        self._last_fix_summary = summary
+
+        prompt = (
+            f"Fix {source} failure: {summary}\n\n"
+            f"Diagnostics:\n{diagnosis.get('suggestion', '')}\n\n"
+            f"Output tail:\n```\n{tail[-2500:]}\n```\n\n"
+            "Please analyze the error and propose necessary code changes to fix it."
+        )
+        self.start_plan(prompt)
 
     def round_history(self) -> list:
         """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window

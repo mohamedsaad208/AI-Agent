@@ -424,6 +424,11 @@ class FakeController:
                                      "updated": _ago(5760), "busy": False}]}],
             "chats": [{"id": "c-1", "title": "Explain Maven surefire reports", "updated": _ago(360)},
                       {"id": "c-2", "title": "Best way to gate a plan step?", "updated": _ago(2880)}],
+            "runStatus": {"canRun": True, "canRunApp": True, "canRunTests": True, "canBuild": True, "reasons": [], "disabledMessage": ""},
+            "services": [],
+            "runConfig": {},
+            "lastJob": None,
+            "readiness": None,
         }
 
     def _review(self) -> dict:
@@ -825,6 +830,28 @@ class FakeController:
             # The one scripted verb that answers with data rather than with an event: the sheet is drawn
             # from the reply, so the preview has to hand back the same shape the real window does.
             return self.open_graph()
+        elif type == "run_app":
+            return {"name": "app", "started": True}
+        elif type == "stop_app":
+            return {"stopped": True}
+        elif type == "restart_app":
+            return {"restarted": True}
+        elif type == "stop_all_apps":
+            return {"stopped_all": True}
+        elif type == "run_build":
+            return {"success": True, "exit_code": 0, "output": "Build passed"}
+        elif type == "get_run_config":
+            return {}
+        elif type == "save_run_config":
+            return {"saved": True}
+        elif type == "get_readiness":
+            return {"tools": [], "wrappers": [], "configs": [], "recommendations": []}
+        elif type == "service_lines":
+            return {"lines": [], "status": "running"}
+        elif type == "api_test":
+            return {"status": 200, "headers": {}, "body": "OK"}
+        elif type == "fix_errors":
+            return {"status": "fix_requested"}
         elif type in PREVIEW_ONLY:
             emit({"kind": "toast", "text": PREVIEW_ONLY[type]})
         else:

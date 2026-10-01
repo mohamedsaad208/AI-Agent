@@ -336,14 +336,13 @@ function renderNav() {
     const chosen = state.expanded[group.key];
     const matched = !!q && group.chats.some((c) => c.title.toLowerCase().includes(q));
     const open = chosen === undefined ? matched : chosen;
-    const mark = avatar(group.name);
     const isBusyProj = !!(DATA.busy && DATA.branch && DATA.branch.key === group.key);
     const hasUnread = (group.chats || []).some((c) => c.unread || (DATA.queue && DATA.queue.chat === c.id));
     const unreadDot = hasUnread ? '<span class="unread-dot" title="Unread activity"></span>' : '';
     const spinDot = isBusyProj ? '<span class="spin-dot" title="Task running in this project"></span>' : '';
     const node = el('div', 'node' + (open ? '' : ' closed') + (isBusyProj ? ' running' : ''),
-      `<span class="av" style="background:${mark.bg};color:${mark.ink}">`
-      + (group.icon ? esc(group.icon) : esc(group.initials)) + '</span>'
+      '<span class="av project-icon" aria-hidden="true">'
+      + esc(group.icon || '📁') + '</span>'
       + `<span class="nm">${esc(group.name)}</span>`
       + unreadDot + spinDot
       + '<button class="dots node-add" title="New chat in this project">＋</button>'
@@ -626,6 +625,130 @@ async function graphSheet() {
     `<b>${esc(String(node.name))}</b> <span class="quiet mono">`
     + `${esc(String(node.files))} file(s) · column ${esc(String(Number(node.column || 0) + 1))}</span>`)));
   body.appendChild(list);
+}
+
+async function readinessDrawer() {
+  const s = sheet('Project Readiness Check', 'Toolchain & Environment verification');
+  const body = el('div', 'content');
+  body.appendChild(el('div', 'quiet', 'Checking installed tools and project configs…'));
+  s.appendChild(body);
+  modal(s);
+
+  let data;
+  try {
+    const res = await api('/api/action', { type: 'get_readiness' });
+    data = (res && res.result) || {};
+  } catch (err) {
+    body.innerHTML = `<div class="warnbox">${esc(err.message)}</div>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  const toolsSec = el('div', 'dsec');
+  toolsSec.appendChild(el('h6', '', 'Runtimes & Toolchains'));
+  const toolsList = el('div', 'readiness-list');
+  (data.tools || []).forEach(t => {
+    const row = el('div', 'readiness-item');
+    row.innerHTML = `<span><b>${esc(t.name)}</b></span>
+      <span class="mono quiet">${esc(t.available ? '✓ installed' : '✗ not found')}</span>`;
+    toolsList.appendChild(row);
+  });
+  toolsSec.appendChild(toolsList);
+  body.appendChild(toolsSec);
+
+  if (data.wrappers && data.wrappers.length) {
+    const wrapSec = el('div', 'dsec');
+    wrapSec.appendChild(el('h6', '', 'Project Wrappers'));
+    wrapSec.appendChild(el('div', 'quiet small', 'Found wrappers: ' + data.wrappers.map(w => esc(w)).join(', ')));
+    body.appendChild(wrapSec);
+  }
+
+  const envSec = el('div', 'dsec');
+  envSec.appendChild(el('h6', '', 'Environment (.env)'));
+  const env = data.env || {};
+  envSec.appendChild(el('div', 'quiet small', `Has .env: ${env.has_env ? 'Yes ✓' : 'No ✗'} · Has .env.example: ${env.has_example ? 'Yes ✓' : 'No ✗'}`));
+  if (env.missing_keys && env.missing_keys.length) {
+    envSec.appendChild(el('div', 'warn small', 'Missing keys in .env: ' + env.missing_keys.map(k => esc(k)).join(', ')));
+  }
+  body.appendChild(envSec);
+
+  if (data.recommendations && data.recommendations.length) {
+    const recSec = el('div', 'dsec');
+    recSec.appendChild(el('h6', '', 'Recommendations'));
+    data.recommendations.forEach(r => {
+      recSec.appendChild(el('div', 'quiet small', '💡 ' + esc(r)));
+    });
+    body.appendChild(recSec);
+  }
+}
+
+async function runConfigDrawer() {
+  const s = sheet('Run & Test Configuration', 'Configure run, test, and build commands for this project');
+  const body = el('div', 'content');
+  body.appendChild(el('div', 'quiet', 'Loading configuration…'));
+  s.appendChild(body);
+  const close = modal(s);
+
+  let cfg;
+  try {
+    const res = await api('/api/action', { type: 'get_run_config' });
+    cfg = (res && res.result) || {};
+  } catch (err) {
+    body.innerHTML = `<div class="warnbox">${esc(err.message)}</div>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  const appSec = el('div', 'dsec');
+  appSec.innerHTML = `<h6>App (Run)</h6>
+    <label class="quiet small">Run Command</label>
+    <input class="cfg-input" id="cfg-app-cmd" value="${esc((cfg.app && cfg.app.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-app-cwd" value="${esc((cfg.app && cfg.app.cwd) || '.')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Port (e.g. 3000, 8080)</label>
+    <input class="cfg-input" type="number" id="cfg-app-port" value="${esc((cfg.app && cfg.app.port) || 0)}" style="width:100%">`;
+  body.appendChild(appSec);
+
+  const testSec = el('div', 'dsec');
+  testSec.innerHTML = `<h6>Tests</h6>
+    <label class="quiet small">Test Command</label>
+    <input class="cfg-input" id="cfg-test-cmd" value="${esc((cfg.test && cfg.test.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-test-cwd" value="${esc((cfg.test && cfg.test.cwd) || '.')}" style="width:100%">`;
+  body.appendChild(testSec);
+
+  const buildSec = el('div', 'dsec');
+  buildSec.innerHTML = `<h6>Build</h6>
+    <label class="quiet small">Build Command</label>
+    <input class="cfg-input" id="cfg-build-cmd" value="${esc((cfg.build && cfg.build.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-build-cwd" value="${esc((cfg.build && cfg.build.cwd) || '.')}" style="width:100%">`;
+  body.appendChild(buildSec);
+
+  const saveBtn = el('button', 'solid', 'Save Configuration');
+  saveBtn.onclick = async () => {
+    const updated = {
+      version: 1,
+      app: {
+        command: $('cfg-app-cmd').value.trim(),
+        cwd: $('cfg-app-cwd').value.trim() || '.',
+        port: parseInt($('cfg-app-port').value, 10) || 0,
+      },
+      test: {
+        command: $('cfg-test-cmd').value.trim(),
+        cwd: $('cfg-test-cwd').value.trim() || '.',
+      },
+      build: {
+        command: $('cfg-build-cmd').value.trim(),
+        cwd: $('cfg-build-cwd').value.trim() || '.',
+      },
+      services: (cfg.services || []),
+    };
+    await send('save_run_config', { config: updated });
+    toast('Run configuration saved');
+    close();
+  };
+  body.appendChild(saveBtn);
 }
 
 /* The palette is served by the controller, so a mark the app does not know about cannot be
@@ -1686,31 +1809,187 @@ function renderRail() {
       rail.appendChild(empty);
     }
   } else if (state.railSection === 'checks') {
-    if (DATA.recipes.length) {
-      const many = (DATA.targets || []).length > 1;
-      const sb = DATA.sandbox || {};
-      const c = el('div', 'card');
-      c.innerHTML = `<h5>Checks</h5>
-        ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
-        <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
-        <label class="switch" style="margin-top:8px"><input type="checkbox" id="sandboxOn"
-          ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker</label>
-        <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
-          ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace">
-        <div class="meta" dir="auto">${esc(sb.note || '')}</div>
-        <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
-        ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
-        <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
-        <div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>`;
+    const rs = DATA.runStatus || {};
+    const cfg = DATA.runConfig || {};
+    const many = (DATA.targets || []).length > 1;
+    const sb = DATA.sandbox || {};
+    const folderName = (DATA.project && DATA.project.name) || 'Project';
+
+    const c = el('div', 'card');
+    const appCmd = (cfg.app && cfg.app.command) || 'npm start';
+    const testCmd = (DATA.recipe) || (cfg.test && cfg.test.command) || 'npm test';
+    const buildCmd = (cfg.build && cfg.build.command) || 'npm run build';
+    const currentCmd = state.runActionChoice === 'app' ? appCmd : state.runActionChoice === 'build' ? buildCmd : testCmd;
+
+    c.innerHTML = `<h5>Run &amp; Checks</h5>
+      <div class="run-action-bar">
+        <button class="run-act-btn ${state.runActionChoice === 'app' ? 'primary' : ''}" id="run-app" ${rs.canRunApp ? '' : 'disabled'}>▶ Run App</button>
+        <button class="run-act-btn ${state.runActionChoice !== 'app' && state.runActionChoice !== 'build' ? 'primary' : ''}" id="run" ${rs.canRunTests ? '' : 'disabled'}>🧪 Run Tests</button>
+        <button class="run-act-btn ${state.runActionChoice === 'build' ? 'primary' : ''}" id="run-build" ${rs.canBuild ? '' : 'disabled'}>🔨 Build</button>
+      </div>
+      <div class="cmd-preview-box" title="Command that will be executed">
+        <span>📁 <b>${esc(folderName)}</b>: <code style="font-size:11px">${esc(currentCmd)}</code></span>
+      </div>
+      ${rs.disabledMessage ? `<div class="disabled-banner"><b>⚠️</b><span>${esc(rs.disabledMessage)}</span></div>` : ''}
+      ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between;margin-top:8px">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
+      ${DATA.recipes && DATA.recipes.length ? `<button class="pill" id="recipe" style="width:100%;justify-content:space-between;margin-top:7px">${esc(DATA.recipe || 'choose a test recipe')}${ICON.chev}</button>` : ''}
+      
+      <div class="row" style="margin-top:9px">
+        <button class="line-btn" style="flex:1" id="fix">🔧 Run &amp; Fix</button>
+        <button class="line-btn" style="flex:1" id="readiness-btn">🔍 Readiness</button>
+        <button class="line-btn" id="run-config-btn" title="Edit run settings">⚙</button>
+      </div>
+
+      <label class="switch" style="margin-top:10px">
+        <input type="checkbox" id="sandboxOn" ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker (optional)
+      </label>
+      <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
+        ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace;margin-top:5px">
+      <div class="meta" dir="auto">${esc(sb.note || rs.dockerNote || '')}</div>
+      ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
+      ${DATA.runInfo ? `<div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>` : ''}`;
+
+    c.querySelector('#run-app').onclick = () => {
+      state.runActionChoice = 'app';
+      send('run_app');
+    };
+    c.querySelector('#run').onclick = () => {
+      state.runActionChoice = 'tests';
+      send('run', { fix: false });
+    };
+    c.querySelector('#run-build').onclick = () => {
+      state.runActionChoice = 'build';
+      send('run_build');
+    };
+    c.querySelector('#fix').onclick = () => {
+      state.runActionChoice = 'tests';
+      send('run', { fix: true });
+    };
+    c.querySelector('#readiness-btn').onclick = () => readinessDrawer();
+    c.querySelector('#run-config-btn').onclick = () => runConfigDrawer();
+    if (c.querySelector('#recipe')) {
       c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
-      if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
-        DATA.targets.map(row => row.label));
-      c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
-      c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
-      c.querySelector('#run').onclick = () => send('run', { fix: false });
-      c.querySelector('#fix').onclick = () => send('run', { fix: true });
-      c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;
-      rail.appendChild(c);
+    }
+    if (many && c.querySelector('#target')) {
+      c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel, DATA.targets.map(row => row.label));
+    }
+    c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
+    c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
+    rail.appendChild(c);
+
+    // Active Service or Last Job Failure Card
+    const lastJob = DATA.lastJob;
+    const activeSvc = (DATA.services || []).find(s => s.status === 'failed') || (DATA.services || [])[0];
+    const diag = (lastJob && lastJob.diagnosis && lastJob.diagnosis.kind !== 'none') ? lastJob.diagnosis : (activeSvc && activeSvc.diagnosis && activeSvc.diagnosis.kind !== 'none' ? activeSvc.diagnosis : null);
+    if (diag) {
+      const fixCard = el('div', 'fix-card');
+      fixCard.innerHTML = `<div class="summary">❌ ${esc(diag.summary)}</div>
+        <div class="suggestion">${esc(diag.suggestion || '')}</div>
+        <button class="fix-card-btn" id="fix-err-btn">🔧 Fix with Agent (حل الأخطاء)</button>`;
+      fixCard.querySelector('#fix-err-btn').onclick = () => {
+        send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : '') });
+      };
+      rail.appendChild(fixCard);
+    }
+
+    // App Preview Card
+    const readySvc = (DATA.services || []).find(s => s.ready && s.url);
+    if (readySvc) {
+      const prevCard = el('div', 'card preview-card');
+      prevCard.innerHTML = `<h5>App Preview</h5>
+        <div class="preview-row">
+          <span>🟢 App Ready: <a class="preview-url" href="${esc(readySvc.url)}" target="_blank">${esc(readySvc.url)}</a></span>
+          <button class="line-btn" id="btn-open-preview" style="font-size:11px">Open ↗</button>
+        </div>
+        <div class="api-tester">
+          <div style="font-size:11.5px;font-weight:600;display:flex;justify-content:space-between">
+            <span>API Request Tester</span>
+          </div>
+          <div class="api-inputs">
+            <select class="api-method" id="api-method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+              <option value="PUT">PUT</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+            <input class="api-url-input" id="api-url" value="${esc(readySvc.url)}/">
+            <button class="line-btn" id="btn-api-send" style="font-size:11px">Send</button>
+          </div>
+          <div class="api-response-box hidden" id="api-resp-box"></div>
+        </div>`;
+      prevCard.querySelector('#btn-open-preview').onclick = () => window.open(readySvc.url, '_blank');
+      prevCard.querySelector('#btn-api-send').onclick = async () => {
+        const method = prevCard.querySelector('#api-method').value;
+        const url = prevCard.querySelector('#api-url').value;
+        const box = prevCard.querySelector('#api-resp-box');
+        box.classList.remove('hidden');
+        box.textContent = 'Sending request…';
+        try {
+          const res = await api('/api/action', { type: 'api_test', method, url });
+          const r = res && res.result;
+          if (r) {
+            box.textContent = `Status: ${r.status} (${r.duration}s)\n\n${r.body || '(empty response)'}`;
+          } else {
+            box.textContent = 'No response received.';
+          }
+        } catch (err) {
+          box.textContent = 'Error: ' + err.message;
+        }
+      };
+      rail.appendChild(prevCard);
+    }
+
+    // Terminal Panel
+    if ((DATA.services && DATA.services.length) || lastJob) {
+      const termCard = el('div', 'card terminal-card');
+      const termSvc = (DATA.services || [])[0];
+      const title = termSvc ? `Service: ${termSvc.name}` : (lastJob ? `Output: ${lastJob.type}` : 'Terminal');
+      const statusBadge = termSvc ? termSvc.status : (lastJob ? (lastJob.success ? 'passed' : 'failed') : 'ready');
+      const isRunning = termSvc && (termSvc.status === 'starting' || termSvc.status === 'ready' || termSvc.status === 'running');
+
+      termCard.innerHTML = `<div class="terminal-head">
+        <div class="terminal-title">
+          <i class="dot ${isRunning ? 'run' : statusBadge === 'passed' || statusBadge === 'ready' ? 'ok' : 'bad'}"></i>
+          <span>${esc(title)}</span>
+        </div>
+        <div class="terminal-actions">
+          ${isRunning ? `<button id="term-stop" title="Stop service">⏹ Stop</button>` : ''}
+          ${termSvc ? `<button id="term-restart" title="Restart service">↻ Restart</button>` : ''}
+          <button id="term-copy" title="Copy output log">📋 Copy</button>
+        </div>
+      </div>
+      <div class="terminal-box" id="term-box">
+        <pre style="margin:0;font-family:inherit;font-size:inherit;white-space:pre-wrap">${esc(lastJob && lastJob.output ? lastJob.output : (state.terminalLog || 'Waiting for output…'))}</pre>
+        <button class="terminal-jump-btn" id="term-jump">↓ Latest</button>
+      </div>`;
+
+      if (isRunning) {
+        termCard.querySelector('#term-stop').onclick = () => send('stop_app', { id: termSvc.id });
+      }
+      if (termSvc) {
+        termCard.querySelector('#term-restart').onclick = () => send('restart_app', { id: termSvc.id });
+      }
+      termCard.querySelector('#term-copy').onclick = () => {
+        const text = termCard.querySelector('pre').textContent;
+        navigator.clipboard.writeText(text);
+        toast('Terminal log copied to clipboard');
+      };
+
+      const termBox = termCard.querySelector('#term-box');
+      const jumpBtn = termCard.querySelector('#term-jump');
+      termBox.addEventListener('scroll', () => {
+        if (termBox.scrollHeight - termBox.scrollTop - termBox.clientHeight > 80) {
+          jumpBtn.classList.add('show');
+        } else {
+          jumpBtn.classList.remove('show');
+        }
+      });
+      jumpBtn.onclick = () => {
+        termBox.scrollTop = termBox.scrollHeight;
+        jumpBtn.classList.remove('show');
+      };
+
+      rail.appendChild(termCard);
     }
 
     const s = el('div', 'card');
