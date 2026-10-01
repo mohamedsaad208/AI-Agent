@@ -44,7 +44,7 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIEL
                       executing_line, friendly_error, fix_offers_off_line, is_arabic,
                       log_dropped_line, log_line,
                       no_branch_note, no_checkpoint_note,
-                      queue_notes, quote_reference, rejected_note,
+                      quote_reference, rejected_note,
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
                       say, state_label,
                       status_text, step_has_detail, step_line, step_missing_line,
@@ -58,7 +58,7 @@ from .. import (git_integration, host, ignore, intent, modes, overrides, planboo
                 runner, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
-from . import runresults
+from . import requestqueue, runresults
 
 DEFAULT_MODEL = "qwen2.5-coder:1.5b"
 RECOMMENDED = {
@@ -189,16 +189,6 @@ def asks_for_a_change(text: str) -> bool:
 
 def _clock() -> str:
     return datetime.now().strftime("%H:%M")
-
-
-def _queued_request(item: dict) -> tuple[str, str]:
-    """Keep structured requests intact; decode the composed text of older queues."""
-    text = item.get("text", "")
-    asked, reference = item.get("asked"), item.get("reference")
-    if isinstance(asked, str) and isinstance(reference, str) and reference + asked == text:
-        return asked, reference
-    asked = asked_of(text)
-    return asked, text[:-len(asked)] if asked else ""
 
 
 class LineFeed:
@@ -453,17 +443,9 @@ class AgentController:
             self._pending_model = self._saved_ui["model"]
         # A batch outlives the window that typed it, but it does not resume itself: a queued change
         # request can be pointed at files that moved on since it was written, so every restored row
-        # is held until the operator presses ▶, and carries the sentence that says why.
-        saved_queue = self._saved_ui.get("queue")
-        if isinstance(saved_queue, list):
-            for item in saved_queue[:20]:
-                if (isinstance(item, dict) and isinstance(item.get("text"), str)
-                        and item["text"].strip() and len(item["text"]) <= MAX_TASK_CHARS):
-                    # Migrate older queues whose text already contains the frozen quotation.
-                    asked, reference = _queued_request(item)
-                    self.queue.append({**item, "asked": asked, "reference": reference,
-                                       "restored": True})
-            self._queue_held = bool(self.queue)
+        # is held until the operator presses the strip's ▶, and carries the sentence that says why.
+        self.queue.extend(requestqueue.restore(self._saved_ui.get("queue")))
+        self._queue_held = bool(self.queue)
         last = self._saved_ui.get("last_project")
         if isinstance(last, str) and last and Path(last).is_dir():
             self.projects.setdefault(project_key(last), str(Path(last).resolve()))
@@ -679,19 +661,18 @@ class AgentController:
         task = reference + asked if reference else self.with_quote(asked, quote_of)
         if not asked:
             return
-        if len(task) > MAX_TASK_CHARS:
+        if requestqueue.too_long(task):
             self._add("tool", "Tool", say(self.arabic,
                       en=f"That message is longer than {MAX_TASK_CHARS:,} characters, so it was "
                          "not queued.",
                       ar="هذه الرسالة أطول من ٤٠٠٠ حرف، لذلك لم تُضَف إلى قائمة الانتظار."))
             return
-        if any(item.get("text") == task and item.get("chat") == self.chat_id for item in self.queue):
+        if requestqueue.is_duplicate(self.queue, task, self.chat_id):
             self._queue_held = False
             return                       # the same message twice in a row is one queue line
-        self.queue.append({"id": uuid.uuid4().hex[:8], "text": task, "asked": asked,
-                           "reference": task[:-len(asked)], "chat": self.chat_id,
-                           "branch": str(self.branch.get("key") or ""),
-                           "project": self.repo, "at": _clock()})
+        self.queue.append(requestqueue.row(
+            task=task, asked=asked, chat=self.chat_id,
+            branch=str(self.branch.get("key") or ""), project=self.repo, at=_clock()))
         self._queue_held = False
         # The message is on its way either way, so the confirmation is the server's — and it goes
         # out as the toast event the client already handles but nothing had ever sent.
@@ -706,10 +687,7 @@ class AgentController:
     def queue_edit(self, item_id: str, text: str) -> None:
         for item in self.queue:
             if item.get("id") == item_id:
-                item["text"] = (text or "").strip()[:MAX_TASK_CHARS]
-                item["asked"] = asked_of(item["text"])
-                item["reference"] = (item["text"][:-len(item["asked"])]
-                                     if item["asked"] else "")
+                requestqueue.apply_edit(item, text)
         self._queue_held = False
         self._save_state()
         self._emit({"kind": "state", "data": self.snapshot()})
@@ -722,10 +700,7 @@ class AgentController:
     def queue_now(self, item_id: str) -> None:
         """Move one item to the front. With the queue already running this is the whole of
         "run this one next", and dropping a held queue with it is what ▶ resumes."""
-        ids = [item.get("id") for item in self.queue]
-        if item_id in ids:
-            item = self.queue.pop(ids.index(item_id))
-            self.queue.insert(0, item)
+        self.queue = requestqueue.to_front(self.queue, item_id)
         self._release_restored()
         self._queue_held = False
         self._drain_queue()
@@ -734,15 +709,10 @@ class AgentController:
     def queue_detached(self, item_id: str) -> None:
         """Take an item out of this conversation and ask it in a chat of its own.
 
-        The branch cannot move while a job runs — `_select_branch` refuses so a chained apply
-        cannot find itself pointed at another folder — so an item detached mid-task waits for the
-        moment the switch is allowed, and then opens there. It never runs in the chat it left.
+        The row goes to the front with `detached` set and no chat of its own, so the drain asks it
+        in a thread of its own the moment a switch is allowed — never in the conversation it left.
         """
-        for index, item in enumerate(self.queue):
-            if item.get("id") == item_id:
-                self.queue.pop(index)
-                self.queue.insert(0, {**item, "detached": True, "chat": ""})
-                break
+        self.queue = requestqueue.detach(self.queue, item_id)
         self._queue_held = False
         self._drain_queue()
         self._emit({"kind": "state", "data": self.snapshot()})
@@ -754,13 +724,9 @@ class AgentController:
         self._emit({"kind": "state", "data": self.snapshot()})
 
     def _release_restored(self) -> None:
-        """A press on the strip is the approval a restored row was waiting for.
-
-        It covers every row rather than the one clicked, because the batch is the unit the operator
-        is resuming: pressing ▶ beside "2 waiting" and having one of them run is the surprise.
-        """
-        for item in self.queue:
-            item.pop("restored", None)
+        """A press on the strip is the approval a restored row was waiting for, for the whole
+        batch rather than the one row clicked — see `requestqueue.release_restored`."""
+        requestqueue.release_restored(self.queue)
 
     def _drain_queue(self) -> None:
         """Start the next queued message whose conversation is the one in front.
@@ -823,7 +789,7 @@ class AgentController:
             self._draining = False
 
     def _start_queued(self, item: dict) -> None:
-        asked, reference = _queued_request(item)
+        asked, reference = requestqueue.split_request(item)
         if reference:
             self.start_plan(asked, reference=reference)
         else:
@@ -831,7 +797,7 @@ class AgentController:
 
     def _open_batch_row(self, item: dict) -> None:
         """Start recording the queued task that was just taken out of the queue."""
-        first = (_queued_request(item)[0].strip().splitlines() or [""])
+        first = (requestqueue.split_request(item)[0].strip().splitlines() or [""])
         self._batch_row = {"task": (first[0] if first else "")[:60], "paths": []}
         self._batch.append(self._batch_row)
 
@@ -857,27 +823,11 @@ class AgentController:
     def _queue_view(self) -> dict:
         """What the strip shows: the messages, and whether they are held.
 
-        The sentences are built here for the same reason the banner's are: the client cannot tell
-        what language the task was asked in, and a strip that mixed English status lines into an
-        Arabic conversation would be the drift this project keeps having to undo.
-
-        Items queued for another conversation stay in the list — they belong to that chat and will
-        run when the user goes back to it — but they are not drawn here, because an invisible line
-        that fires later is exactly the surprise this strip exists to avoid.
+        The shape and its sentences come from `requestqueue.view`; this only hands it the state the
+        window is standing on, including whether a question is holding a worker right now.
         """
-        here = [{"id": item.get("id", ""), "text": item.get("text", ""),
-                 "detached": bool(item.get("detached")), "at": item.get("at", ""),
-                 "restored": bool(item.get("restored"))}
-                for item in self.queue if item.get("chat") == self.chat_id or item.get("detached")]
-        other_items = [item for item in self.queue
-                       if item.get("chat") not in {self.chat_id, ""} and not item.get("detached")]
-        elsewhere = len(other_items)
-        first_other = other_items[0] if other_items else None
-        target_chat = first_other.get("chat") if first_other else None
-        target_kind = "chat" if (target_chat and str(target_chat).startswith("c-")) else "session"
-        return {"items": here, "held": bool(self._queue_held), "elsewhere": elsewhere,
-                "chat": target_chat, "kind": target_kind,
-                **queue_notes(self.arabic, elsewhere, bool(self._replies))}
+        return requestqueue.view(self.queue, chat=self.chat_id, held=self._queue_held,
+                                 arabic=self.arabic, ask_pending=bool(self._replies))
 
     def join(self, timeout: float = 60.0) -> None:
         """Wait for every started job — including one a completion started behind it.
