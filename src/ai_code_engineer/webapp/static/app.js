@@ -324,10 +324,8 @@ function renderNav() {
   const nav = $('nav'); nav.innerHTML = '';
   const q = (state.query || '').toLowerCase();
   const proj = el('div', 'sec');
-  proj.appendChild(el('h4', '', '<span>Projects</span><span class="add" id="add-project">' + '＋ open</span>'
-    + '<span class="add" id="new-project">' + '＋ new</span>'));
+  proj.appendChild(el('h4', '', '<span>Projects</span><span class="add" id="add-project" title="Add or open project folder">＋</span>'));
   proj.querySelector('#add-project').onclick = () => send('pick_project');
-  proj.querySelector('#new-project').onclick = () => send('new_project');
   for (const group of DATA.projects) {
     if (q && !(group.name.toLowerCase().includes(q) || group.chats.some((c) => c.title.toLowerCase().includes(q)))) continue;
     // Nothing is open until the user opens it, so the tree starts collapsed on every load. A
@@ -339,11 +337,18 @@ function renderNav() {
     const matched = !!q && group.chats.some((c) => c.title.toLowerCase().includes(q));
     const open = chosen === undefined ? matched : chosen;
     const mark = avatar(group.name);
-    const node = el('div', 'node' + (open ? '' : ' closed'),
+    const isBusyProj = !!(DATA.busy && DATA.branch && DATA.branch.key === group.key);
+    const hasUnread = (group.chats || []).some((c) => c.unread || (DATA.queue && DATA.queue.chat === c.id));
+    const unreadDot = hasUnread ? '<span class="unread-dot" title="Unread activity"></span>' : '';
+    const spinDot = isBusyProj ? '<span class="spin-dot" title="Task running in this project"></span>' : '';
+    const node = el('div', 'node' + (open ? '' : ' closed') + (isBusyProj ? ' running' : ''),
       `<span class="av" style="background:${mark.bg};color:${mark.ink}">`
       + (group.icon ? esc(group.icon) : esc(group.initials)) + '</span>'
       + `<span class="nm">${esc(group.name)}</span>`
-      + '<button class="dots node-add">＋</button><button class="dots node-menu">⋯</button>'
+      + unreadDot + spinDot
+      + '<button class="dots node-add" title="New chat in this project">＋</button>'
+      + '<button class="dots node-settings" title="Project settings">⚙</button>'
+      + '<button class="dots node-menu" title="Project options">⋯</button>'
       + '<span class="chev">▾</span>');
     node.onclick = () => { state.expanded[group.key] = !open; renderNav(); };
     node.title = group.path + '\nDrop a chat here to let it read this project';
@@ -351,6 +356,10 @@ function renderNav() {
     node.querySelector('.node-add').onclick = (e) => {
       e.stopPropagation();
       send('new_chat_in', { project: group.key });
+    };
+    node.querySelector('.node-settings').onclick = (e) => {
+      e.stopPropagation();
+      projectDrawer(group);
     };
     node.querySelector('.node-menu').title = 'Project options';
     node.querySelector('.node-menu').onclick = (e) => { e.stopPropagation(); projectMenu(group); };
@@ -385,8 +394,11 @@ function renderNav() {
 /* One sidebar row. A chat leaf drags onto a project node to bind itself to that folder, and
    the same command is on its menu, because a drag is not reachable from a keyboard. */
 function leaf(chat, kind, projectKey) {
-  const leaf = el('div', 'leaf' + (chat.id === DATA.current ? ' on' : ''),
-    `<i class="dot ${chat.busy ? 'run' : (DOT[chat.state] || '')}"></i><span class="t">${esc(chat.title)}</span>`
+  const isBusyChat = !!(DATA.busy && chat.id === DATA.current);
+  const spinDot = isBusyChat ? '<span class="spin-dot" title="Task running in this chat"></span>' : '';
+  const leaf = el('div', 'leaf' + (chat.id === DATA.current ? ' on' : '') + (isBusyChat ? ' running' : ''),
+    `<i class="dot ${chat.busy || isBusyChat ? 'run' : (DOT[chat.state] || '')}"></i><span class="t">${esc(chat.title)}</span>`
+    + spinDot
     + `<time>${relTime(chat.updated)}</time>`);
   leaf.onclick = () => send('open', { id: chat.id, kind });
   if (kind === 'chat') {
@@ -665,7 +677,31 @@ function avatar(name) {
 function renderHeader() {
   $('title').textContent = DATA.header.title || 'New chat';
   $('subtitle').textContent = DATA.header.subtitle || '';
-  $('attach-top').classList.toggle('hidden', !DATA.project);
+  if ($('attach-top')) $('attach-top').classList.toggle('hidden', !DATA.project);
+
+  const btnPlan = $('mode-btn-plan');
+  const btnChange = $('mode-btn-change');
+  const btnRead = $('mode-btn-read');
+  if (btnPlan && btnChange && btnRead) {
+    const isPlan = !!DATA.plan || DATA.composer === 'plan';
+    const isChange = DATA.composer === 'change';
+    const isRead = DATA.composer === 'read';
+    btnPlan.classList.toggle('on', isPlan);
+    btnChange.classList.toggle('on', !isPlan && isChange);
+    btnRead.classList.toggle('on', !isPlan && isRead);
+
+    btnPlan.onclick = () => {
+      if (DATA.plan) toast('Plan mode is active (' + DATA.plan.name + ')');
+      else send('pick_plan');
+    };
+    btnChange.onclick = () => {
+      if (DATA.composer !== 'change') send('set_composer', { value: 'change' });
+    };
+    btnRead.onclick = () => {
+      if (DATA.composer !== 'read') send('set_composer', { value: 'read' });
+    };
+  }
+
   // The snapshot carries the activity line because the server keeps it current: a status written
   // mid-run has to survive the next push, which is exactly what used to wipe it.
   state.status = DATA.status || '';
@@ -811,7 +847,31 @@ function renderThread() {
       // dir="auto" lets the browser choose from the first strong character, so an Arabic answer
       // reads right-to-left while an English one is untouched — no per-message detection in JS.
       const reply = splitReply(m.text);
-      const bub = el('div', 'bub', mdToHtml(reply.text));
+      const isStepPrompt = m.role === 'user' && (/^(?:Implement step|Execute step|الخطوة)\s+\d+/i.test((reply.text || '').trim())) && (reply.text || '').length > 140;
+      const bub = el('div', 'bub');
+      if (isStepPrompt) {
+        const lines = reply.text.trim().split('\n');
+        const firstLine = lines[0];
+        const rest = lines.slice(1).join('\n').trim();
+        const card = el('div', 'step-prompt-card');
+        const head = el('div', 'step-prompt-head');
+        head.innerHTML = `<span>📋 ${esc(firstLine)}</span>`;
+        if (rest) {
+          const toggle = el('button', 'step-prompt-toggle', 'Show details ▾');
+          const bodyDetails = el('div', 'step-prompt-body hidden', esc(rest));
+          toggle.onclick = () => {
+            const isHidden = bodyDetails.classList.toggle('hidden');
+            toggle.textContent = isHidden ? 'Show details ▾' : 'Hide details ▴';
+          };
+          head.appendChild(toggle);
+          card.append(head, bodyDetails);
+        } else {
+          card.appendChild(head);
+        }
+        bub.appendChild(card);
+      } else {
+        bub.innerHTML = mdToHtml(reply.text);
+      }
       if (reply.preview) bub.prepend(replyPill(reply.preview,
         Number.isInteger(m.replyTo) && m.replyTo >= 0 && m.replyTo < i ? m.replyTo : replyTarget(reply.preview, i)));
       bub.dir = 'auto';
@@ -925,7 +985,11 @@ function msgActions(index) {
   quote.title = 'Answer this message';
   quote.setAttribute('aria-label', 'Answer this message');
   quote.setAttribute('aria-pressed', state.quote === index ? 'true' : 'false');
-  row.append(copy, quote);
+  const again = el('button', 'mact', '↻');
+  again.dataset.againRow = index;
+  again.title = 'Put this message back in composer to ask again';
+  again.setAttribute('aria-label', 'Put this message back in composer to ask again');
+  row.append(copy, quote, again);
   return row;
 }
 
@@ -1083,6 +1147,21 @@ $('thread').addEventListener('click', (event) => {
     toast('Copied to clipboard');
     return;
   }
+  const again = event.target.closest('[data-again-row]');
+  if (again) {
+    const message = DATA.messages[Number(again.dataset.againRow)];
+    if (!message || !message.text) return;
+    const ta = $('prompt');
+    if (ta) {
+      ta.value = message.text;
+      autosize();
+      sendQuiet('set_draft', { text: message.text });
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+      toast('Message loaded into composer');
+    }
+    return;
+  }
   const quoted = event.target.closest('[data-quote-row]');
   if (quoted) quoteRow(Number(quoted.dataset.quoteRow));
 });
@@ -1128,8 +1207,9 @@ function renderComposer() {
     const bound = !!(DATA.branch || {}).bound;
     /* Which folder this branch is on, always visible where the message is typed: the sidebar can
        be collapsed, and a name alone does not tell two same-named projects apart. */
-    const where = el('button', 'pill path mono', ICON.file + esc(DATA.project.path));
-    where.title = DATA.project.path + '\nClick to copy the path';
+    const folderName = (DATA.project && DATA.project.name) || (DATA.project && DATA.project.path ? DATA.project.path.split(/[\\/]/).filter(Boolean).pop() : 'project');
+    const where = el('button', 'pill path mono', ICON.file + ' ' + esc(folderName));
+    where.title = DATA.project.path + '\nClick to copy the full path';
     where.onclick = () => { navigator.clipboard.writeText(DATA.project.path); toast('Project folder copied'); };
     add(where);
     const git = gitChip();
@@ -1147,13 +1227,6 @@ function renderComposer() {
   }
   add(el('button', 'pill soft', esc(DATA.provider.mode))).onclick = () => choose('mode', DATA.provider.mode, DATA.provider.modes);
   add(el('button', 'pill mono', esc(shortModel(DATA.provider.model)) + ICON.chev)).onclick = () => choose('model', DATA.provider.model, DATA.provider.models);
-  add(el('button', 'pill', ICON.gear + ' Settings')).onclick = openSettings;
-  if (lastAsked()) {
-    const again = el('button', 'pill soft', '↻ Again');
-    again.title = 'Put your last message back in the box. It does not send — press Send when you want it asked again.';
-    again.onclick = askAgain;
-    add(again);
-  }
   if (DATA.busy && DATA.cancellable) {
     /* Stop shares the `.send` look but not the `.send` handle: while a task runs it is the first
        button of that class in the bar, so anything that finds the composer's button by class —
@@ -1432,7 +1505,15 @@ function renderQueue() {
     row.appendChild(act);
     box.appendChild(row);
   }
-  if (q.elsewhere) box.appendChild(el('div', 'qnote', esc(q.elsewhere_note || '')));
+  if (q.elsewhere) {
+    const note = el('div', 'qnote qnote-clickable', esc(q.elsewhere_note || '1 waiting in another chat — click to switch'));
+    note.style.cursor = 'pointer';
+    note.title = 'Switch to the waiting chat';
+    note.onclick = () => {
+      if (DATA.queue && DATA.queue.chat) send('open', { id: DATA.queue.chat, kind: 'session' });
+    };
+    box.appendChild(note);
+  }
 }
 
 function editQueued(row, item) {
@@ -1464,12 +1545,12 @@ function runPlanStep(s) {
 
 function startSequential() {
   if (!DATA || !DATA.plan || !DATA.plan.steps || !DATA.plan.steps.length) {
-    toast('لا توجد خطوات في الخطة للبدء فيها.');
+    toast('No plan steps available to execute.');
     return;
   }
   const pendingStep = DATA.plan.steps.find(s => s.status !== 'verified');
   if (!pendingStep) {
-    toast('جميع خطوات الخطة مكتملة بالفعل! ✓');
+    toast('All plan steps are already verified! ✓');
     return;
   }
   state.sequential = true;
@@ -1481,7 +1562,7 @@ function startSequential() {
   if (DATA.composer !== 'change') {
     send('set_composer', { value: 'change' });
   }
-  toast(`بدء التنفيذ التتابعي: الخطوة ${pendingStep.id}/${DATA.plan.total}`);
+  toast(`Starting sequential execution: Step ${pendingStep.id}/${DATA.plan.total}`);
   runPlanStep(pendingStep);
   renderRail();
 }
@@ -1494,7 +1575,7 @@ function stopSequential() {
     state.seqTimer = null;
   }
   send('stop');
-  toast('تم إيقاف التنفيذ التتابعي.');
+  toast('Sequential execution stopped.');
   renderRail();
 }
 
@@ -1560,18 +1641,18 @@ function renderRail() {
     if (DATA.plan) {
       const p = el('div', 'card tasks-card');
       const pct = Math.round((DATA.plan.verified / Math.max(1, DATA.plan.total)) * 100);
-      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — step ${DATA.plan.step}/${DATA.plan.total}</div>
+      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${DATA.plan.total} (${DATA.plan.verified} verified)</div>
         <div class="bar"><i style="width:${pct}%"></i></div>
         <div class="meta"><span>${DATA.plan.verified} verified</span><span>${esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
       const seqDiv = el('div', 'plan-seq-controls');
       if (!state.sequential) {
-        const startBtn = el('button', 'solid plan-seq-btn', '▶ بدء التنفيذ التتابعي');
-        startBtn.title = 'تنفيذ خطوات الخطة خطوة بخطوة تلقائياً';
+        const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
+        startBtn.title = 'Run plan steps sequentially';
         startBtn.onclick = () => startSequential();
         seqDiv.appendChild(startBtn);
       } else {
-        const stopBtn = el('button', 'line-btn plan-seq-btn running', '⏹ إيقاف التنفيذ التتابعي');
-        stopBtn.title = 'إيقاف التنفيذ التتابعي التلقائي';
+        const stopBtn = el('button', 'line-btn plan-seq-btn running', '■ Stop sequential');
+        stopBtn.title = 'Stop sequential execution';
         stopBtn.onclick = () => stopSequential();
         seqDiv.appendChild(stopBtn);
       }
@@ -1584,7 +1665,7 @@ function renderRail() {
         row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
         row.appendChild(el('span', 'task-title', esc(s.title)));
         if (!isDone) {
-          const exec = el('button', 'step-exec-btn', '▶ نفذ دي');
+          const exec = el('button', 'step-exec-btn', 'Run step ▶');
           exec.title = 'Run this step in chat';
           exec.onclick = (e) => { e.stopPropagation(); runPlanStep(s); };
           row.appendChild(exec);
@@ -2486,7 +2567,9 @@ function palette() {
     ['Open a project folder', () => send('pick_project')],
     ['New project folder', () => send('new_project')], ['Attach a plan', () => send('pick_plan')],
     ['Try the sample project', () => send('example')],
-    ['Ask your last message again', askAgain],
+  ];
+  if (lastAsked()) commands.push(['Ask your last message again', askAgain]);
+  commands.push(
     ['Run the project command', () => send('run', { fix: false })],
     ['Run and fix', () => send('run', { fix: true })], ['Check syntax', () => send('verify')],
     ['Roll back changes', () => send('rollback')], ['Apply changes', () => send('apply')],
@@ -2494,7 +2577,7 @@ function palette() {
     ['Style: Claude warm', () => setStyle('claude')], ['Style: Codex charcoal', () => setStyle('codex')],
     ['Style: Linear indigo', () => setStyle('linear')], ['Theme: light', () => { state.themeMode = 'light'; applyThemeMode(); renderThemePick(); }],
     ['Theme: dark', () => { state.themeMode = 'dark'; applyThemeMode(); renderThemePick(); }],
-  ];
+  );
   let shown = commands.slice(), at = 0;
   function draw() {
     list.innerHTML = '';
@@ -2584,7 +2667,35 @@ $('seg').addEventListener('click', (e) => { const b = e.target.closest('button')
 $('new-chat').onclick = () => send('new_chat');
 $('collapse').onclick = toggleSidebar;
 $('sidebar-expand').onclick = toggleSidebar;
-$('attach-top').onclick = () => send('pick_plan');
+if ($('attach-top')) $('attach-top').onclick = () => send('pick_plan');
+if ($('app-settings-btn')) $('app-settings-btn').onclick = openSettings;
+
+const scroller = $('scroller');
+const jumpBtn = $('jump-latest');
+if (scroller && jumpBtn) {
+  scroller.addEventListener('scroll', () => {
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 180) {
+      jumpBtn.classList.add('show');
+    } else {
+      jumpBtn.classList.remove('show');
+    }
+  });
+  jumpBtn.onclick = () => {
+    toBottom(scroller);
+    jumpBtn.classList.remove('show');
+  };
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (DATA && DATA.busy) {
+    const proj = (DATA.project && DATA.project.name) || 'the active project';
+    const msg = `Tasks are still running in ${proj}. Are you sure you want to leave?`;
+    e.preventDefault();
+    e.returnValue = msg;
+    return msg;
+  }
+});
+
 $('search').addEventListener('input', (e) => { state.query = e.target.value; renderNav(); });
 $('prompt').addEventListener('input', () => {
   autosize();
