@@ -279,6 +279,23 @@ class AgentTests(unittest.TestCase):
         del session["plan_step"]
         self.assertEqual(proposal_hash(session), session["proposal_hash"])
 
+    def test_goal_and_criteria_recorded_on_session_outside_proposal_hash(self):
+        (self.root / "plan.md").write_text("## Phase 1: one\nbody\n", encoding="utf-8")
+        provider = ScriptedProvider([{"action": "read_file", "path": "app.py"}, self.proposal()])
+        path = plan(self.ws, "Implement step 1", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None, plan_file="plan.md", plan_step=1,
+                    goal="Test goal statement", criteria=["Criterion A", "Criterion B"],
+                    accepts=[1, 2])
+        session = load_session(path)
+        self.assertEqual(session["goal"], "Test goal statement")
+        self.assertEqual(session["criteria"], ["Criterion A", "Criterion B"])
+        self.assertEqual(session["accepts"], [1, 2])
+        self.assertEqual(proposal_hash(session), session["proposal_hash"])
+        del session["goal"]
+        del session["criteria"]
+        del session["accepts"]
+        self.assertEqual(proposal_hash(session), session["proposal_hash"])
+
     def test_a_step_number_needs_a_plan_and_stays_small(self):
         provider = ScriptedProvider([self.proposal()])
         with self.assertRaises(PolicyError):

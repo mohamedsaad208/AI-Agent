@@ -23,8 +23,8 @@ from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
-                     catalog_status_line, friendly_error, is_arabic, run_warning, state_label,
-                     status_text)
+                     catalog_status_line, friendly_error, impact_lines, is_arabic, run_warning,
+                     state_label, status_text)
 from .labels import note as shared_note      # `note` is a local variable in two methods here
 from .providers import make_provider
 from .redaction import redact
@@ -153,6 +153,10 @@ class AgentWindow:
         self.memory_dir = self.app_dir / ".agent-memory"
         self.ledger_path: Path | None = None
         self.ledger: dict | None = None
+        # Tasks in this folder that stopped before they reached a result, and the parse cache behind
+        # that read. The list is computed when a folder is entered, never per repaint.
+        self.resumable: list[dict] = []
+        self._resume_cache: dict = {}
         self.session_path: Path | None = None
         self.session: dict | None = None
         self.chat: dict | None = None
@@ -484,6 +488,11 @@ class AgentWindow:
         source.configure(textvariable=self.source_name, anchor="w", wraplength=214, justify="left")
         source.pack(fill="x", pady=8)
         self.button(card.inner, "＋  Attach plan", self.browse_plan).pack(anchor="w")
+        # Packed only when something actually stopped in this folder; a button that resumes nothing is
+        # a second way to be told about a failure by pressing it.
+        self.resume_button = self.button(card.inner, "↻  Resume stopped task",
+                                         self.resume_stopped_task, track=False,
+                                         tip="Continue the task that stopped before it reached a result")
         self.button(card.inner, "Settings  ›", self.show_settings,
                     tip="API key, model filter and details").pack(anchor="w", pady=(6, 0))
         center = ttk.Frame(body, padding=(24, 0, 24, 10))
@@ -1478,6 +1487,7 @@ class AgentWindow:
         if not self._loading_session:
             self.new_task()
         self.refresh_recent()
+        self.refresh_resumable()
 
     def browse_plan(self):
         path = filedialog.askopenfilename(title="Attach a project plan", initialdir=self.repo.get() or str(self.app_dir),
@@ -1550,6 +1560,78 @@ class AgentWindow:
         self.refresh_memory_info()
         self.status.set(shared_note("notes_saved", arabic=self.arabic))
 
+    def refresh_resumable(self) -> None:
+        """Read which tasks stopped in this folder, and show or hide the resume button."""
+        raw = self.repo.get().strip()
+        self.resumable = (session_flow.resumable_runs(self.runs, raw, self._resume_cache)
+                          if raw and Path(raw).is_dir() else [])
+        if not hasattr(self, "resume_button"):
+            return
+        if self.resumable:
+            self.resume_button.pack(anchor="w", pady=(6, 0))
+            self.status.set(shared_note("resume_line", arabic=self.arabic,
+                                        count=len(self.resumable)))
+        else:
+            self.resume_button.pack_forget()
+
+    def resume_stopped_task(self) -> None:
+        """Continue the newest task that stopped here. Pressed by a person, never by the window."""
+        if self.busy:
+            self.status.set(shared_note("resume_busy", arabic=self.arabic))
+            return
+        if not self.resumable:
+            self.status.set(shared_note("resume_gone", arabic=self.arabic))
+            return
+        row = self.resumable[0]
+        run_id = row["run_id"]
+        repo = self.repo.get().strip()
+        if not repo or not Path(repo).is_dir():
+            self.status.set(status_text("need_folder_exists", arabic=self.arabic))
+            return
+        cloud, paid = self.cloud_choice()
+        if self.selected_model() is None:
+            self.status.set(status_text("pick_model", arabic=self.arabic))
+            return
+        if cloud and not self.cloud_ok.get():
+            self.status.set(status_text("consent_message", arabic=self.arabic))
+            return
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return
+        try:
+            stored = load_session(self.runs / run_id / "session.json")
+        except (AgentError, OSError):
+            self.refresh_resumable()
+            self.status.set(shared_note("resume_gone", arabic=self.arabic))
+            return
+        task = str(stored.get("task") or "")[:MAX_TASK_CHARS]
+        plan_file = str((stored.get("plan_reference") or {}).get("path") or "") or None
+        notes = str(stored.get("memory") or "")
+        key = self.key.get().strip() or None
+        self.chat_message("Tool", shared_note("resume_started", arabic=self.arabic,
+                                              task=str(row.get("task") or "")[:60]))
+
+        def work():
+            provider = make_provider(settings, allow_cloud=cloud,
+                                     data_class="public" if cloud else "restricted",
+                                     api_key=key, allow_paid=paid)
+            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+                        progress=lambda line: self.events.put(("progress", line)),
+                        cancelled=self.cancel_event.is_set, plan_file=plan_file,
+                        chat_id=stored.get("chat_id"), plan_step=stored.get("plan_step"),
+                        memory=notes, resume_run=run_id)
+
+        def done(path):
+            self.display_session(path)
+            self.refresh_resumable()
+            if self.session and self.session.get("changes"):
+                self.open_review()
+                self.status.set(status_text("proposal_ready", arabic=self.arabic))
+            else:
+                self.status.set(status_text("no_proposal", arabic=self.arabic))
+
+        self.run_job(work, done, "Continuing the stopped task…", cancellable=True)
+
     def refresh_plan_status(self):
         """Mirror the attached plan's ledger into the header chip and the Settings panel."""
         repo, plan_file = self.repo.get().strip(), self.plan_file.get().strip()
@@ -1572,6 +1654,13 @@ class AgentWindow:
         self.source_name.set(chip + " — " + (f"step {row['id']}/{len(book['steps'])}" if row
                                              else "all steps verified"))
         line = planbook.progress_line(book)
+        goal = planbook.goal_line(book)
+        if goal:
+            # The readable minimum: Tk has no plan card, so the goal and how many criteria the plan
+            # carries ride on the one line this window already shows.
+            line += " · " + shared_note("plan_goal", arabic=self.arabic) + ": " + goal[:120]
+            line += " · " + shared_note("plan_criteria", arabic=self.arabic) \
+                    + ": " + str(len(planbook.criteria_of(book)))
         if self.chained.get() and row is not None:
             line += " — Send works on it."
         self.plan_status.set(line)
@@ -1602,6 +1691,10 @@ class AgentWindow:
         if row is None or row["status"] == "verified":
             return
         if result["status"] != "passed":
+            try:
+                book = planbook.mark_failed(path, book, step_id, runner.summarize(result))
+            except (AgentError, OSError) as exc:
+                self.chat_message("Tool", "The plan ledger was not updated: " + friendly_error(exc))
             self.status.set(planbook.progress_line(book) + " — step " + str(step_id) +
                             " stays open until a command run proves it.")
             return
@@ -1840,6 +1933,8 @@ class AgentWindow:
                 self.status.set(friendly_error(exc))
                 return
         step_id = None
+        ledger_path = book = row = None
+        step_note = ""
         if chained_plan:
             try:
                 ledger_path, book = planbook.open_book(self.plans, Workspace(Path(repo)), plan_file)
@@ -1847,7 +1942,8 @@ class AgentWindow:
                 if row is None:
                     raise PolicyError("Every step of this plan is already verified by a passing run.")
                 step_id = row["id"]
-                task = planbook.task_for(book, row, task)
+                step_note = task
+                task = planbook.task_for(book, row, step_note)
             except (AgentError, OSError) as exc:
                 self.status.set(friendly_error(exc))
                 return
@@ -1879,9 +1975,35 @@ class AgentWindow:
         def work():
             provider = make_provider(settings, allow_cloud=cloud, data_class="public" if cloud else "restricted", api_key=key,
                                      allow_paid=paid)
-            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+            current_book = book
+            current_row = row
+            run_task = task
+            if (chained_plan and current_book is not None and ledger_path is not None
+                    and not planbook.has_goal(current_book)):
+                # The same rule the web window follows: a goal tree is a model round trip, so it is
+                # asked for on the job thread, and a plan that already carries one is never re-asked.
+                try:
+                    plan_text = Workspace(Path(repo)).read(current_book["plan_path"])["content"]
+                except (AgentError, OSError):
+                    plan_text = ""
+                current_book, refusal = planbook.author_goal(ledger_path, current_book, provider,
+                                                             task=step_note or task,
+                                                             plan_text=plan_text,
+                                                             cancelled=self.cancel_event.is_set)
+                self.events.put(("progress", shared_note(
+                    "goal_skipped" if refusal else "goal_written", arabic=self.arabic,
+                    **({"reason": refusal} if refusal
+                       else {"count": len(current_book.get("criteria") or [])}))))
+                if not refusal:
+                    current_row = planbook.step(current_book, step_id) or current_row
+                    run_task = planbook.task_for(current_book, current_row, step_note)
+            goal = planbook.goal_line(current_book) if current_book else ""
+            criteria = planbook.criteria_of(current_book) if current_book else None
+            accepts = (current_row.get("accepts") or []) if current_row else None
+            return plan(Workspace(Path(repo)), run_task, provider, settings, self.runs,
                         progress=lambda line: self.events.put(("progress", line)), cancelled=self.cancel_event.is_set,
-                        plan_file=plan_file, chat_id=chat_id, plan_step=step_id, memory=notes)
+                        plan_file=plan_file, chat_id=chat_id, plan_step=step_id, memory=notes,
+                        goal=goal, criteria=criteria, accepts=accepts)
 
         def done(path):
             if step_id is not None:
@@ -2111,6 +2233,12 @@ class AgentWindow:
             summary += "\nAttached plan: " + session["plan_reference"]["path"]
             if session.get("plan_step") is not None:
                 summary += f" — step {session['plan_step']}, gated on a passing command run"
+        # What the change breaks in the files it does not touch, in the same box as the proposal's own
+        # summary: this window has no second place a reviewer would look before approving.
+        findings = impact_lines(session.get("impact") or {}, arabic=self.arabic)
+        if findings:
+            summary += ("\n\n" + shared_note("impact_heading", arabic=self.arabic) + "\n"
+                        + "\n".join("• " + line for line in findings))
         text_set(self.summary, summary + "\n\nProject: " + session["root"])
         self.files.delete(*self.files.get_children())
         for index, change in enumerate(session.get("changes", [])):

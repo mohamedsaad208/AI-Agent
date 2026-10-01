@@ -125,6 +125,28 @@ GRAPH_EDGES = [
 GRAPH_COLUMNS = 4
 GRAPH_HIDDEN = 2
 
+# The change-impact card, scripted as the *structure* `impact.analyze` answers with rather than as
+# finished sentences: the preview then speaks the same words the real window does, in the same language
+# rule, and a reworded finding shows up in both previews on the same commit instead of in one.
+SAMPLE_IMPACT = {
+    "files": [
+        {"path": "src/main/java/com/acme/auth/LoginService.java",
+         "removed": ["audit"], "changed": ["login"], "added": [], "unread": False,
+         "callers": [{"name": "audit", "files": ["src/test/java/com/acme/auth/LoginServiceTest.java"],
+                      "count": 1},
+                     {"name": "login",
+                      "files": ["src/main/java/com/acme/auth/LoginController.java",
+                                "src/main/java/com/acme/web/SessionFilter.java"],
+                      "count": 3}],
+         "endpoints": [{"route": "POST /api/login", "handler": "LoginController.login", "gone": True}],
+         "tests": [{"name": "audit", "files": ["src/test/java/com/acme/auth/LoginServiceTest.java"],
+                    "count": 1}],
+         "modules": ["src", "auth"], "flags": [], "removed_more": 0, "changed_more": 0},
+    ],
+    "unknown": [{"key": "impact_unknown_searched", "searched": 12, "visible": 41}],
+    "searched": 12, "visible": 41,
+}
+
 # The state names and their tones come from labels.py rather than a copy of them here, because a
 # second table drifts: this one had no BLOCKED row and no DISCOVERING tone, so the two previews of
 # a blocked task disagreed with the real window.
@@ -389,6 +411,10 @@ class FakeController:
             "queue": {"items": self.queue, "held": self.queue_held, "elsewhere": 1,
                       "chat": "c-1", "kind": "chat",
                       **labels.queue_notes(False, 1, False)},
+            # One stopped task, so the resume strip can be reviewed in the preview. Continuing it is a
+            # disk operation the scripted window has no session files for — see PREVIEW_ONLY.
+            "resume": [{"run_id": "0" * 32, "task": "Fix the duplicate email check in create()",
+                        "turn": 3, "plan_step": None, "written": "2026-10-01T09:12:00+00:00"}],
             "artifact": labels.artifact_card(self.state, arabic=False, count=len(FILES),
                                              project="demo2",
                                              summary="Duplicate emails now raise a typed error the "
@@ -455,6 +481,8 @@ class FakeController:
             "rejected": self.declined,
             "canReopen": self.state == "WAITING_APPROVAL" and self.declined and not reading,
             "files": files, "selected": self._file, "tab": self.tab,
+            "impact": {"heading": labels.note("impact_heading", arabic=False),
+                       "lines": labels.impact_lines(SAMPLE_IMPACT, arabic=False)},
             "view": {"diff": uistate.diff_lines(chosen["before"] or "", chosen["after"], name),
                      "before": (chosen["before"] or "").splitlines(),
                      "after": chosen["after"].splitlines(),
@@ -1191,6 +1219,7 @@ PREVIEW_ONLY = {
     "example": "Preview only: the sample fills the composer with a real task.",
     "set_icon": "Preview only: the icon is saved with that project's preferences.",
     "complete_step": "Preview only: marks a plan step verified in the ledger.",
+    "resume_task": "Preview only: continuing a stopped task reads its session and turns from disk.",
 }
 
 """One drawer payload per scripted project. Every key the real controller sends is here,

@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -88,7 +89,13 @@ class CancellationTests(unittest.TestCase):
 
 
 class ScriptedModel:
-    """Answers with queued tool actions so a repair turn needs no real model."""
+    """Answers with queued tool actions so a repair turn needs no real model.
+
+    A chained run asks for the plan's goal tree before its first tool turn. That request is answered
+    here rather than queued, because it is not a tool action and every test that runs a step would
+    otherwise spend its scripted proposal on it: the reply mirrors the step numbers the request lists,
+    which is the only shape `planbook.validate_tree` accepts.
+    """
 
     model = "test-local"
 
@@ -96,8 +103,18 @@ class ScriptedModel:
         self.responses = list(responses)
         self.calls = []
 
+    @staticmethod
+    def goal_tree(messages):
+        numbers = [int(item) for item in re.findall(r"(?m)^(\d+)\. ", str(messages[-1]["content"]))]
+        return {"goal": "The plan's steps run behind one documented endpoint.",
+                "criteria": ["The endpoint answers", "The tests still pass"],
+                "steps": [{"id": number, "accepts": [1 if index == 0 else 2]}
+                          for index, number in enumerate(numbers or [1])]}
+
     def generate(self, messages, json_mode=True):
         self.calls.append(messages)
+        if str(messages[0]["content"]).startswith("You turn one work request"):
+            return json.dumps(self.goal_tree(messages))
         value = self.responses.pop(0) if self.responses else {"action": "blocked", "reason": "queue empty"}
         return json.dumps(value)
 
@@ -485,6 +502,22 @@ Validate the token.
         self.assertIn("Plan step 1/3", self.ui.plan_status.get())
         self.assertIn("plan.md — step 1/3", self.ui.source_name.get())
 
+    def test_the_goal_tree_shows_in_the_plan_line_and_its_step_task(self):
+        self.plan_draft()
+        model = ScriptedModel([self.scaffold()])
+        with patch("ai_code_engineer.gui.make_provider", return_value=model):
+            self.ui.start_plan()
+            self.wait_for_job()
+        book = self.ledger()
+        self.assertEqual(book["schema"], 2, "the tree was written by this run")
+        self.assertEqual(book["criteria"], ["The endpoint answers", "The tests still pass"])
+        self.ui.refresh_plan_status()
+        self.assertIn("The plan's steps run behind one documented endpoint", self.ui.plan_status.get())
+        sent = model.calls[-1][1]["content"]
+        self.assertIn("Acceptance criteria this step must leave true", sent)
+        self.assertIn("The endpoint answers", sent)
+        self.assertNotIn("The tests still pass", sent, "step 1 answers criterion 1 only")
+
     def test_a_passing_run_with_report_proof_opens_the_next_step(self):
         self.plan_draft()
         model = ScriptedModel([self.scaffold(),
@@ -528,7 +561,10 @@ Validate the token.
             self.ui.run_tests(False)
             self.wait_for_job()
         self.assertEqual(self.ledger()["steps"][0]["status"], "in_progress")
-        self.assertEqual(len(model.calls), 1)
+        tool_turns = [call for call in model.calls
+                      if not str(call[0]["content"]).startswith("You turn one work request")]
+        self.assertEqual(len(tool_turns), 1,
+                         "the plan's goal request is the only other call; the step took one turn")
         self.assertIn("no test was observed running",
                       "\n".join(text for _, text in self.ui.messages))
 

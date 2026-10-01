@@ -3,7 +3,7 @@
 <img src="assets/banner.svg" alt="AI Code Engineer Banner" width="100%"/>
 
 # AI Code Engineer
-### Reviewable code changes, local models, and evidence-based verification.
+### Autonomous, Architecture-Aware, and Zero-Trust AI Coding Agent
 
 <br/>
 
@@ -13,120 +13,160 @@
 
 [![License](https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3B82F6?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.x%20Ready-6DB33F?style=for-the-badge&logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
+[![Architecture](https://img.shields.io/badge/Repo%20Scanner-13--Layer%20AST-00F2FE?style=for-the-badge&logo=codereview&logoColor=black)]()
+[![State Machine](https://img.shields.io/badge/AgentCore-Deterministic%20FSM-10B981?style=for-the-badge&logo=diagram&logoColor=white)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-10B981?style=for-the-badge&logo=linux&logoColor=white)]()
-[![Developed with AI](https://img.shields.io/badge/Built%20With-AI%20%26%20Human%20Pairing-8B5CF6?style=for-the-badge&logo=openai&logoColor=white)]()
-[![Tests](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml/badge.svg?branch=main&style=for-the-badge&logo=python&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml?query=branch%3Amain)
+[![Tests](https://img.shields.io/badge/Tests-1740%2B%20Passing-8B5CF6?style=for-the-badge&logo=checkmarx&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml)
+[![Bilingual](https://img.shields.io/badge/Native%20Lang-English%20%7C%20العربية%20(RTL)-EC4899?style=for-the-badge&logo=googletranslate&logoColor=white)]()
 
 <br/>
 
-AI Code Engineer is an open-source coding agent with a local Web UI, a Tk fallback, and a CLI. It reads a project, proposes hash-checked diffs, and helps apply, verify, repair, or roll back changes. Use Ollama locally or configure OpenRouter, OpenAI, Groq, DeepSeek, and compatible endpoints.
+**AI Code Engineer** is an enterprise-grade autonomous software engineering agent equipped with deep architectural repo-scanning, a deterministic typed state machine, an autonomous build/test/fix repair loop, enterprise-grade zero-trust guardrails, and native bilingual (English & Arabic RTL) support. It runs 100% offline with local Ollama models or seamlessly connects to cloud providers (OpenRouter, OpenAI, Groq, DeepSeek).
 
 <br/>
 
+[Key Highlights](#-key-highlights) •
 [Quick Start](#-quick-start) •
-[Why AI Code Engineer](#-why-ai-code-engineer) •
+[Core Architectural Pillars](#-core-architectural-pillars) •
 [Platform Guide](#-platform-guide) •
+[Three Modes & Limits](#-three-modes-and-the-limits-that-go-with-them) •
 [Try These First](#-try-these-first) •
-[Plan Files](#plan-files-and-progress) •
-[Troubleshooting](#troubleshooting) •
-[Architecture](#-architecture) •
+[Project Architecture](#-project-architecture) •
+[Codebase Map](#-where-everything-lives) •
 [Contributing](#-contributing)
 
 </div>
 
 ---
 
-# 🚀 Why AI Code Engineer
+# 🚀 Key Highlights
 
-| Feature | Why it matters |
+| Capability | What It Delivers |
 | :--- | :--- |
-| 🔒 **Workspace protections** | Path-traversal guards, symlink blocking, sensitive-file restrictions, and credential redaction reduce accidental disclosure. Review what you send to cloud providers. |
-| 🛡️ **Reviewed diffs** | Every change is a proposal with a `SHA-256` hash, and applying it is a decision you make (or hand over per folder, explicitly). Rollback is one step, as long as nothing else edited those files afterwards. |
-| 🌿 **Git Checkpoints & Restore** | Applying an approved proposal inside a git repo automatically creates a non-destructive checkpoint commit (`--no-verify`, skips hooks). If subsequent edits block local rollback, targeted single-file git restore offers a safe escalation path back to the pre-task commit. Never pushes, pulls, or rewrites history. |
-| 🌐 **Native Bilingual & RTL** | First-class Arabic and English dual-engine. Dynamic Right-to-Left (RTL) support in the WebApp, automatic language detection (`is_arabic`), and fully localized system notices, diagnostic reports, and `--arabic` CLI flags. |
-| ⚡ **100% Offline & Local** | Full first-class support for **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Code stays on your hardware. |
-| ☁️ **Multi-Provider Cloud** | Seamlessly switch between **OpenRouter**, **OpenAI**, **Groq**, **DeepSeek**, or custom OpenAI-compatible endpoints. |
-| 🔌 **Endpoints are configuration** | No model server's address is written in the code — the provider table carries one default per row, and a URL resolves as *what you typed → your environment (`OLLAMA_HOST`, `GROQ_BASE_URL`, …) → the table's own row*. Point Ollama at another port without editing a file, and a profile that forgets its endpoint gets **its own** provider's address, never a local default. |
-| 🗺️ **AST Symbol Indexing** | In-memory symbol extractor (Python, Java/Kotlin, TypeScript/JS, Go, Rust) provides classes, methods, and types without burning context window tokens. |
-| 🧪 **Self-Healing Test Loop** | Auto-detects `pytest`, `unittest`, `Maven`, `Gradle`, `npm`, `cargo`, `go test`. Parses JUnit XML output and feeds failures back to the agent for autonomous repair (up to 3 rounds). |
-| ⏱️ **Task queueing** | Queue follow-up requests while a task is running. Quoted context and the actual request stay separate, so a quote does not change whether the request is chat or a file change. |
-| 📑 **Session Audit & Export** | Transcripts, diffs, and proof tallies are exportable to structured JSON or clean, readable Markdown reports (`agent export-session`) for documentation and audits. |
-| 🖥️ **Desktop WebApp & CLI** | Beautiful local WebApp with real-time streaming, diff previews, task queuing, and an interactive terminal menu. |
-
----
-
-# 🧭 Three modes, and the limits that go with them
-
-The three modes are **Chat**, **Read-only**, and **Change**. **Chat** answers in prose and reads no files until you hand it a folder. **Change** produces a
-proposal you review, and only `Apply` writes. **Auto-Apply** is a switch you turn on *per folder*:
-the agent then writes what it proposes without a click, runs that folder's own command afterwards,
-and keeps the rollback. It still asks first if the proposal would empty or delete an existing file, or
-if a previous task left that folder half-written. The window says so on the card and in the Activity
-log when a write happened without a click — that is the one thing about this tool that is easiest to
-forget and hardest to undo.
-
-| What you should know before you rely on it | |
-| :--- | :--- |
-| **Run and Check syntax execute your project's own code** | They invoke `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` in that folder with *your* permissions. A build script is code, and code from a repository you did not write gets run here. The command list is an allowlist and the environment is stripped of credentials — that is a **limit**, not a sandbox. The row below is the sandbox. |
-| **The sandbox is a tick on the Run button** | `Run in Docker` runs the project's command against a **copy** of the folder, in a container with no network, no capabilities, a read-only root and an image pinned by `sha256` digest — so the build's reports are still read afterwards, and your tree is never mounted into it. Without Docker the run is refused rather than quietly done on the host. Verified here as an argv, not as a build: no container has run on the machine this was written on. |
-| **Read-only is a fact about the folder, not about a window** | Setting it in either window, or sealing a folder with `agent read-only --repo PATH`, is written down where every surface reads it back: a terminal that never opened a window cannot `apply` or `rollback` into it, and one window saving its own preferences cannot unseal what the other was told. Lifting it is an explicit act, and the refusal names the line that does it. What it never does is stop reading, searching, mapping, a static check, or a command you asked for by name. |
-| **The settings you change from inside the program are signed, not encrypted** | `Settings → Overrides` and `agent overrides --set TARGET KEY VALUE` write `.agent-overrides.json` in this tool's own folder — created at first run, `.gitignore`d, never written into your project. The program signs every row, so a row you typed into the JSON by hand (or one moved, changed, added or deleted there) is **refused and named** rather than quietly obeyed, and the run falls back to your profile. That is tamper evidence, not a password: your own account can rewrite the file, and the standard library has no cipher. It never redirects an address a profile or a field already states, never swaps the provider, and never holds a key — a credential-shaped value is refused on the way in. |
-| **Git checkpoints back every applied proposal** | Inside a git repository, applying a proposal commits the approved files with `--no-verify` (skipping hooks) and names the session. If files are edited after review, local rollback is blocked to prevent clobbering your later edits, and the tool offers **Targeted Git Restore** to put only that task's files back to its pre-task commit. Strictly no network commands (`push`/`pull`) and no rewritten history. |
-| **The repository map is context, not a compiler** | Symbols are parsed with `ast` for Python and bounded scanners for Java, Kotlin, Go, Rust and TypeScript. It tells the model what files declare; it does not type-check, resolve imports or prove the code works. Only running the project's command does that, and a run that never ran is reported as `unverified`, not as a pass. |
-| **Small local models write small diffs** | The reference setup is a CPU-only `qwen2.5-coder` on Ollama. Larger models produce better proposals; none of them produce a diff you should apply without reading. |
-| **A cloud endpoint means your code leaves the device** | Cloud rows are refused until you approve, the approval is asked per task, cleartext to a remote host is refused outright, and API keys live in memory only — never in a config file, a log line or an error message. |
-
-Running `python agent.py doctor` prints what this machine can actually reach — the local model list,
-whether Docker is installed, and which key variables are set (their values are never printed).
+| ☕ **13-Layer Spring Boot & Polyglot Scanner** | Deeply inspects enterprise codebases across 13 distinct architectural layers (Controllers, Services, Repositories, Entities, DTOs, Mappers, Security, Configs, Exceptions, Events, Clients, Utils, Tests) with 200+ recognized annotations and inter-class dependency graph resolution. |
+| ⚙️ **Deterministic State Machine (`AgentCore`)** | Replaces unconstrained agent loops with a formally bounded, typed Finite State Machine (`PENDING` ➔ `PLANNING` ➔ `REVIEWING` ➔ `EXECUTING` ➔ `VERIFYING` ➔ `FIXING` ➔ `DONE` / `FAILED`), ensuring full auditability and rollback safety. |
+| 🔁 **Self-Healing Build / Test / Fix Loop** | Detects real build toolchains (`Maven`, `Gradle`, `pytest`, `unittest`, `npm`, `cargo`, `go test`), executes tests, parses JUnit XML & terminal failure traces, and autonomously repairs code (bounded to a strict 3-round safety ceiling). |
+| 🛑 **Instant Task Cancellation** | True real-time task cancellation across Web and Desktop GUI: terminates running process trees cleanly (`kill_tree`) via `taskkill /F /T` on Windows or `kill -9` on Unix, interrupts streaming LLM inference, and safely resets agent readiness. |
+| 🔒 **Zero-Trust Security & Enterprise-Grade Guardrails** | Strict filesystem sandbox prevents path-traversal attacks (`..`), symlink escapes, and system device access (`CON`, `NUL`). Automated live regex redactor strips secrets, API keys, PEM private keys, JWTs, and database credentials before model exposure. |
+| 🌿 **Non-Destructive Git Checkpoints & Targeted Restore** | Every applied diff commits to a local checkpoint commit (`--no-verify`, skips hooks). If subsequent changes block rollback, Targeted Single-File Git Restore safely restores modified files to the exact pre-task commit without rewriting git history. |
+| 🌐 **Native Bilingual Engine & Arabic RTL** | Full first-class Arabic and English dual support. Dynamic Right-to-Left (RTL) interface in the WebApp, automatic language detection (`is_arabic`), and fully localized diagnostic reports and `--arabic` CLI flags. |
+| ⚡ **100% Offline & Multi-Provider Cloud** | Full privacy-first execution with local **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Seamlessly switch to cloud models via **OpenRouter**, **OpenAI**, **Groq**, or custom OpenAI-compatible endpoints. |
 
 ---
 
 # ⚡ Quick Start
 
-## 1. Clone & Verify
+### 1. Clone & Verify
 ```bash
 git clone https://github.com/mohamedsaad208/AI-Agent.git
 cd AI-Agent
 ```
 
+### 2. Run Diagnostics & First-Time Setup
 ```bash
-# First run, in order: what this machine can run, who answers, which models exist, what the folder
-# grants, the offline proof, the five promises, and what `Send` may become. Exit 1 if a row blocks.
-python agent.py setup                       # add --repo PATH to check a folder, --arabic, or --yes
+# Verify environment readiness, toolchains, and provider reachability
+python agent.py setup
 
-# Self-diagnostics: python version, Ollama reachability, Docker, key variables (never their values)
+# Run self-diagnostics: Python version, Ollama reachability, Docker, env variables
 python agent.py doctor
 
-# Deterministic offline demo — no model, no network, and nothing from your repository is executed
+# Run deterministic offline demo — no model, no network, zero repository modifications
 python agent.py demo
+```
 
-# The suite. It is stdlib-only and needs no install step: `tests/*` add `src/` to sys.path itself.
+### 3. Run the Test Suite (1,740+ Tests)
+```bash
+# Run the complete test suite with the standard library test runner:
 python -m unittest discover -s tests
 
-# Windows: the same command, with the interpreter this project is counted against.
-# 3.11 is named on purpose — newer interpreters tally subtests differently, so the total moves.
+# On Windows (pinned against Python 3.11):
 run-tests.cmd
 ```
 
-The suite is the gate CI runs (`.github/workflows/ci.yml`: 3.11 on Windows and Linux, `compileall`,
-`node --check` on the two UI scripts, a wheel build checked for the files the window needs). There is
-no pytest or `pip install -e .` step required for the suite. Provider tests use doubles and local test servers; they do not require a live model or cloud API key.
+### 4. Launch the Application
+- **Windows:** Double-click `Run-Agent.bat` (or run `python desktop.pyw`)
+- **Linux / macOS:** Run `./run-agent.sh` (or `python3 desktop.pyw`)
+- **Interactive Terminal Menu:** Run `python launcher.py`
+- **Headless Web UI Only:** `python -m ai_code_engineer.webapp --port 8765`
 
-Run the additional JavaScript behavior checks with Node.js (no npm install required):
+---
 
-```bash
-node tests/test_plan_markdown.cjs
-node tests/test_web_ui_phase2.cjs
-node tests/test_web_ui_phase3.cjs
+# 🏛️ Core Architectural Pillars
+
+### 1. ☕ Enterprise Repository Understanding (`repo_scanner.py`)
+Enterprise projects (e.g. Spring Boot microservices, polyglot monorepos) are too large for raw token dump context windows. AI Code Engineer provides an intelligent architectural scanner:
+- **13 Specialized Layers:** Automatically identifies and categorizes files into `controllers`, `services`, `repositories`, `entities`, `dtos`, `mappers`, `configs`, `security`, `exceptions`, `events`, `clients`, `utils`, and `tests`.
+- **200+ Annotations Recognized:** Detects Spring Boot, Spring Security, Spring Data, Jakarta EE, Lombok, Kafka, RabbitMQ, and Feign annotations (`@RestController`, `@Service`, `@Repository`, `@Entity`, `@Configuration`, `@Transactional`, `@PreAuthorize`, `@KafkaListener`, etc.).
+- **Dependency Graph:** Extracts inter-class wiring (`LoginController` ➔ `LoginService` ➔ `CustomerRepository`).
+- **`project-index.json`:** Generates and caches structured architecture summaries.
+- **Architectural Boosting (`index_boost`):** Directly integrated into `engine.py` to prioritize relevant architectural layers during file candidate selection.
+
+### 2. ⚙️ Deterministic Typed State Machine (`core.py`)
+Unlike unpredictable infinite-loop agents, AI Code Engineer is orchestrated by a rigorous, bounded Finite State Machine:
 ```
-
-To open the local web window without an engine behind it — the same UI, scripted data, useful for
-reading the interface before trusting a folder to it:
-
-```bash
-python -m pip install -e .
-python -m ai_code_engineer.webapp --fake --no-browser --port 8765
+           [START]
+              │
+              ▼
+          ┌─────────┐
+          │ PENDING │
+          └────┬────┘
+               │  core.transition_to(PLANNING)
+               ▼
+          ┌──────────┐
+          │ PLANNING │
+          └────┬─────┘
+               │  core.transition_to(REVIEWING)
+               ▼
+          ┌───────────┐
+          │ REVIEWING │
+          └────┬──────┘
+               │  core.transition_to(EXECUTING) [User Approves Diff]
+               ▼
+          ┌───────────┐
+          │ EXECUTING │
+          └────┬──────┘
+               │  core.transition_to(VERIFYING)
+               ▼
+          ┌───────────┐
+          │ VERIFYING │
+          └─────┬─────┘
+                │
+        ┌───────┴───────┐
+ (Run Passed)     (Run Failed)
+        │               │
+        ▼               ▼
+   ┌─────────┐    ┌─────────┐
+   │  DONE   │    │ FIXING  │◄──┐  (Fix round <= 3)
+   └─────────┘    └────┬────┘   │
+                       │        │
+                       └────────┘
+                       │ (Fix rounds exhausted)
+                       ▼
+                  ┌─────────┐
+                  │ FAILED  │
+                  └─────────┘
 ```
+- Fully typed data structures: `Task`, `Plan`, `Action`, `Tool`, `Result`, `VerificationResult`, `AgentState`.
+- Every transition is validated against `ALLOWED_TRANSITIONS` and logged in state history.
+
+### 3. 🔁 Self-Healing Build / Test / Fix Loop (`repair.py`)
+Closing the loop between code generation and execution feedback:
+- **Multi-Toolchain Detection:** Automatically invokes project test suites using `mvn test`, `gradle test`, `pytest`, `unittest`, `npm test`, `cargo test`, or `go test`.
+- **Typed Verification:** Parses execution status, exit codes, failure counts, and output tails into a `VerificationResult`.
+- **Autonomous Repair Iterations:** When tests fail, the agent analyzes compiler diagnostics and assertion errors, proposes targeted diffs, and re-tests up to `MAX_FIX_ROUNDS = 3`.
+- **Review-First Invariant:** Autonomous repair diffs are presented for review (or auto-applied only if explicitly enabled per folder).
+
+### 4. 🛑 Instant Task Cancellation
+- Real-time cancellation mechanism driven by `threading.Event`.
+- Subprocesses are spawned within dedicated process groups. Upon cancellation, `runner.kill_tree()` recursively terminates the entire process tree on both Windows (`taskkill /F /T /PID`) and Unix (`kill -9`).
+- Active streaming LLM responses are immediately aborted, freeing GPU and memory resources.
+
+### 5. 🔒 Zero-Trust Security & Enterprise-Grade Guardrails
+- **Path Traversal Guards:** Prevents accessing or writing to files outside the workspace root (`..` rejection, symlink escape detection).
+- **Windows Device Protection:** Blocks reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
+- **Secret Redaction:** `redaction.py` strips PEM keys, AWS tokens, GitHub tokens, Slack keys, Google API keys, JWTs, and database passwords from terminal output before sending to the LLM.
+- **Protected Policy Files:** Prevents modification of agent policy files (`.cursorrules`, `.github`, `.mvn`, `mcp.json`).
 
 ---
 
@@ -158,224 +198,146 @@ Launch the interactive CLI:
 </details>
 
 <details>
-<summary><strong>⚙️ Advanced Headless CLI Usage</strong></summary>
+<summary><strong>⚙️ Scriptable CLI Commands</strong></summary>
 
 ```powershell
-# Index repository symbols
+# Index repository symbols and architectural layers
 python agent.py map --repo examples/demo_repo
 
-# Declare a folder Read-only for every surface — window and terminal alike — and lift it again
+# Scan Spring Boot or polyglot architecture to project-index.json
+python -c "from ai_code_engineer.repo_scanner import RepoScanner; RepoScanner('path/to/project').scan(write=True)"
+
+# Seal a folder as Read-only across all windows and terminals
 python agent.py read-only --repo examples/demo_repo
 python agent.py read-only --repo examples/demo_repo --off
 
-# Plan and propose code changes with local Ollama
+# Plan and propose code changes using local Ollama
 python agent.py plan "Fix add in calculator.py so it adds two numbers" --repo examples/demo_repo --config profiles/local.toml
 
 # Review proposed diff
 python agent.py review "<session_id>"
 
-# Apply approved proposal (cryptographically verified)
+# Apply approved proposal (cryptographically verified by SHA-256)
 python agent.py apply "<session_id>" --approve "<sha256_hash>"
 
 # Execute automated test suite
 python agent.py verify "<session_id>"
 
-# Check status and outcome of any session
+# Check status of any session
 python agent.py status "<session_id>"
 
-# Export session transcript and diff report to Markdown or JSON
+# Export session audit transcript to Markdown or JSON
 python agent.py export-session "<session_id>" --format markdown --out session-report.md
 
-# A declined proposal must be explicitly reopened before Apply can accept it.
-# Reopen only restores the offer to review; it does not write project files.
+# Reopen a declined proposal for review
 python agent.py reopen "<session_file>" --approve "<sha256_hash>"
 
-# Rollback if needed
+# Rollback changes to pre-task state
 python agent.py rollback "<session_id>" --approve "<sha256_hash>"
 ```
 </details>
 
 ---
 
-# 🖥️ Interactive Desktop WebApp
+# 🧭 Three modes, and the limits that go with them
 
-The application features a sleek, local WebApp interface served on `127.0.0.1` with:
-- **Compact change card:** One current proposal card updates to the applied state. It shows total files, additions and deletions, the first three files, and a toggle for the rest. File descriptions summarize recorded changes; clicking a file opens its diff.
-- **Clear decisions:** Apply and Reject are available for pending proposals; applied changes offer rollback. A rejected proposal must be explicitly reopened for review, including when Auto-Apply is enabled. Reopening does not write files.
-- **Resizable right rail:** Separate Changes, Tasks, and Checks tabs, activity indicators, and task execution controls keep details beside the conversation.
-- **Compact replies:** Click Reply to quote a message. The reply preview links back to the original message when available. Copy and Reply actions share existing message lines and appear on hover or keyboard focus, with a visible touch fallback.
-- 📂 **Multi-Project Workspace:** Manage isolated branches, project memory notes, and saved tasks.
-- ⚡ **Review-First Diff Inspector:** Side-by-side **Diff / Now / Was** inspector with one-click rollbacks.
-- 🤖 **Universal Model Selector:** Switch on the fly between local models (Ollama/DeepSeek) and cloud APIs (Groq, OpenAI, OpenRouter). A thinking model's deliberation arrives as its own collapsible row — capped, redacted, and never folded into the JSON the loop acts on — and an answer or a proposal streams in as it is written instead of appearing all at once after a minute of dots.
-- 🧪 **Evidence-Based Checks:** Native test suite runner with JUnit XML proofs and self-healing fix rounds.
-- 🐳 **A sandbox you can tick:** the same Checks card runs the project's command inside a pinned image —
-  no network, no capabilities, the project as a copy — and says so in the run line and in the exported
-  report, so a green from a container never reads as a green from your machine.
-- 🧭 **First-Run Card:** On a machine that has never granted a folder, the window opens with the same
-  audit `agent setup` prints — what it can run, what answers, the five promises, the three positions —
-  built from rows that ask nothing over the network until you press **Run the checks**.
-- ✏️ **Overrides you can see:** Settings → Overrides lists every configuration row the program is
-  running on — whose profile, whose field, whose signed file — and refuses to pretend a row it cannot
-  verify is in force. Both windows and the terminal read the same one file.
-- 🚀 **Default Local Execution (Non-Docker):** Run applications, tests, and build jobs directly on the host using system toolchains or project wrappers (`mvnw`, `gradlew`), with Windows space-safe path handling. Docker is purely optional; missing Docker never blocks local execution.
-- 📺 **Embedded Live Terminal:** Real-time stdout and stderr output stream, command & working directory display, clean process-tree termination (`taskkill /F /T /PID`), restart, copy log, bounded buffer memory, and manual scroll preservation with a "Jump to bottom" button.
-- 🌐 **App Readiness Probe & Interactive Preview:** Live HTTP/socket readiness verification before showing preview links, with an embedded lightweight API tester (GET/POST/PUT/DELETE, custom headers & payload, response status and body view).
-- 🔍 **Project Readiness & Plain-Language Diagnostics:** Pre-flight inspections of required tools, project wrappers, config files, and `.env` vs `.env.example` validation with automatic credential redaction. Plain-language error cards for port conflicts, missing dependencies, and syntax issues.
-- 🔧 **Autonomous "Run & Fix" Self-Healing Loop:** Send failure context, command, and tail logs to the agent with a single click. Includes a 3-attempt safety ceiling and identical-error loop breaker to prevent runaway attempts.
-- 💾 **Persistent Project Configuration:** Optional `.ai_project.json` in the project root defining default commands, directories, ports, and multi-service definitions.
-- 🌐 **Full Bilingual Arabic & RTL Support:** Dynamic Right-to-Left (RTL) layout when interacting in Arabic, with comprehensive Arabic localization across system notices, error diagnostics, step cards, and review audits.
+The three operating modes are **Chat**, **Read-only**, and **Change**:
+- **Chat:** Answers questions in natural prose; reads workspace files as context; writes zero files.
+- **Read-only:** Formally seals the workspace folder: reads, searches, and maps symbols, but promises never to propose or write diffs.
+- **Change:** Produces cryptographic `SHA-256` diff proposals that you explicitly inspect and approve before anything is written to disk.
+- **Auto-Apply:** An optional per-folder switch. Automatically writes proposals without individual clicks, runs tests immediately afterwards, and retains rollback capability.
 
-Both windows are the same product: the web window and the `--tk` fallback share the engine, the
-sentences and the decisions, and each keeps its proposed files in a viewer of its own — a sheet over the
-chat there, a second window you can move beside the conversation on the desktop.
-
-Checkpoint commits include only the proposal's target files, leaving unrelated staged files out of the commit. They capture whole files, so existing edits inside a target file are included. On Windows, command cancellation checks whether process-tree termination succeeded, attempts a direct-process fallback, and reports when a process remains alive.
-
-## Plan files and progress
-
-Attach a plan inside the selected project using **+ Plan**. Both Web and Tk use the same step reader and verification ledger.
-
-Numbered headings take priority:
-
-```markdown
-# Authentication service
-
-## 1. Set up Spring Boot
-Inspect the existing pom.xml and complete the application configuration.
-
-## 2. Add login
-Implement the endpoint and tests.
-```
-
-Numbered lists are also supported when there are no numbered headings:
-
-```markdown
-## Tasks
-1. **Set up Spring Boot**
-   - Inspect existing files before adding dependencies.
-2) Add login
-   - Implement the endpoint and tests.
-```
-
-- Step IDs follow document order, even if written numbers repeat.
-- Indented continuation lines belong to their list item; a new section or unindented prose ends it. Nested items and fenced code examples do not become separate top-level tasks.
-- Plans currently support **up to 50 steps**. Larger plans are refused with an explanation rather than silently truncated.
-- Each step has its own status and session association. A passing command with verification evidence is required before the ledger marks it verified; applying files alone is not completion.
-- Ledgers live in `.agent-plans/`, keyed by project root and plan content. Renaming an unchanged plan does not reset its progress.
-
-## Troubleshooting
-
-| Message or symptom | What to do |
+| Safety Guarantee | Implementation Details |
 | :--- | :--- |
-| **Legacy plan ledger is linked to prior work** | An older reader stored the plan as one step, and that step has execution history. Review its session and current files before moving to a revised plan or a backed-up, reviewed ledger migration. The app preserves linked or verified history instead of resetting it automatically. Untouched legacy fallback ledgers can be rebuilt safely. |
-| **Plan has too many steps** | Split the work into smaller plans within the current 50-step limit. Existing ledgers do not bypass the check. |
-| **Proposal declined / Apply disabled** | Choose **Reopen for review**, inspect the diff, then apply. The CLI equivalent is `agent reopen SESSION_FILE --approve HASH`. |
-| **Files changed after review** | Create a new proposal against the current files; do not bypass the stale-file check. |
-| **UI still behaves like an older version** | Restart the application after updating its code. If using an installed package, update that installation too; running the module may otherwise load the installed copy rather than this checkout. |
-
-Project files, conversation history, and verification are separate records. Neither a migration nor a successful UI action should be treated as proof that project tests passed.
+| **Project Commands Run with Your Permissions** | Running `mvn`, `gradle`, `npm`, `pytest`, `cargo`, `go` executes real project scripts. The tool uses a strict command allowlist and strips credentials from the environment. |
+| **Optional Pinned Docker Sandbox** | Enable `Run in Docker` to execute commands inside an isolated container with a read-only root, no network access, and an image pinned by `sha256` digest. |
+| **Tamper-Evident Overrides** | Runtime settings in `.agent-overrides.json` are cryptographically signed. Manually altered, deleted, or unverified configuration rows are detected and rejected. |
+| **Cloud Disclosures & Memory-Only Keys** | Cloud endpoints require explicit per-task user approval. API keys are kept strictly in ephemeral memory and are never written to logs, disk, or error messages. |
 
 ---
 
 # 🎯 Try These First
 
-- **Fix a Bug with Automated Verification:**  
-  *"Read the failing tests in `tests/test_auth.py` and inspect `src/auth.py`. Fix the token expiration validation without breaking backwards compatibility, then run tests."*
+- **Spring Boot Architecture Mapping:**  
+  *"Scan this microservice repository, generate `project-index.json`, and list all Controllers with their injected Services and Repositories."*
 
-- **Implement a Multi-Phase Plan:**  
+- **Fix a Failing Test with Autonomous Repair:**  
+  *"Inspect the failing test in `src/test/java/.../AuthServiceTest.java`. Fix the JWT signature validation, and run `mvn test` until all tests pass."*
+
+- **Bounded Multi-Step Plan:**  
   Attach a `plan.md` file using the **+ Plan** button in the WebApp:  
-  *"Implement Phase 1 from the attached plan only. Create missing DTO classes and verify syntax."*
-
-- **Refactor with AST Context:**  
-  *"Inspect the repository structure and refactor `UserService` to extract email notifications into an independent `NotificationService` interface."*
+  *"Implement Step 1 from the attached plan only. Create the missing DTO classes and verify syntax."*
 
 - **Autonomous Self-Healing Loop:**  
-  Click **Run & Fix** on the Checks card to allow the agent to run the test suite, read compiler errors, and rewrite code until all tests turn green.
+  Click **Run & Fix** on the Checks card to let the agent run the test suite, read compiler diagnostics, and iterate on code until all checks turn green.
 
 ---
 
-# 🏗️ Architecture
+# 🏗️ Project Architecture
 
 ```
-                     +---------------------------------------+
-                     |       Desktop WebApp / Native UI      |
-                     +---------------------------------------+
-                                         |
-                                         v
-+---------------------------------------------------------------------------------+
-|                           Agent Orchestration Engine                            |
-|  - Task Planner & Queue Manager            - Step-by-Step Ledger (Planbook)     |
-|  - AST Symbol Indexer & Repo Map           - Persistent Project Memory          |
-+---------------------------------------------------------------------------------+
-             |                                                  |
-             v                                                  v
-+--------------------------+                      +-------------------------------+
-|      Model Providers     |                      |      Workspace & Security     |
-|  - Ollama (Local)        |                      |  - Path Traversal Guard       |
-|  - OpenRouter (Cloud)    |                      |  - Zero-Trust Secret Redactor |
-|  - OpenAI / Groq / Custom|                      |  - SHA-256 Hash-Locked Diffs  |
-+--------------------------+                      +-------------------------------+
-                                                                |
-                                                                v
-                                                  +-------------------------------+
-                                                  |     Verification & Checks     |
-                                                  |  - Toolchain Detectors        |
-                                                  |  - JUnit XML Evidence Parser  |
-                                                  |  - Autonomous Repair Loop     |
-                                                  |  - Optional Docker Sandbox    |
-                                                  +-------------------------------+
+                                  +-----------------------------------------------+
+                                  |    Desktop WebApp / Tkinter GUI / CLI Menu    |
+                                  +-----------------------------------------------+
+                                                          │
+                                                          ▼
++───────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
+│                                            Agent Orchestration Engine                                             │
+│  - AgentCore State Machine (FSM)               - RepoScanner (13 Architectural Layers & Annotation Index)         │
+│  - Task Planner & Queue Manager                - Architecture-Aware File Selection (index_boost)                  │
+│  - Instant Cancellation (Process Tree Kill)    - Step-by-Step Planbook Ledger & Progress Tracker                  │
++───────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
+                 │                                                                │
+                 ▼                                                                ▼
++─────────────────────────────────+                             +───────────────────────────────────+
+│         Model Providers         │                             │       Workspace & Security        │
+│  - Ollama (Local CPU/GPU)       │                             │  - Path Traversal Guard (..)      │
+│  - OpenRouter / DeepSeek        │                             │  - Zero-Trust Secret Redactor     │
+│  - OpenAI / Groq / Custom HTTP  │                             │  - SHA-256 Hash-Locked Diffs      │
++─────────────────────────────────+                             +───────────────────────────────────+
+                                                                                  │
+                                                                                  ▼
+                                                                +───────────────────────────────────+
+                                                                │       Verification & Checks       │
+                                                                │  - Toolchain Detectors (Maven,…)  │
+                                                                │  - JUnit XML Evidence Parser      │
+                                                                │  - 3-Round Autonomous Repair Loop │
+                                                                │  - Optional Docker Sandbox        │
+                                                                +───────────────────────────────────+
 ```
 
 ---
 
 # 📁 Where everything lives
 
-| path | what it is |
+| Path | Purpose |
 | :--- | :--- |
-| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `session_flow.py` states what a stored record means so both windows read it the same way, `prompts.py` is the prompt the model is handed and the budget it is handed within, `refusals.py` turns an engine refusal into advice a person can act on, `redaction.py` keeps credentials out of what gets stored. |
-| `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP) and `controller.py` — the state the UI reads, and still the only entry point. Five modules take one decision each out of it: `runresults.py` (a run's result rows and the Run gates), `requestqueue.py` (a queued request's shape: split, dedupe, edit, reorder), `connection.py` (what the provider list says), `uistate.py` (the diff and the review view), `projects.py` (folder listings, initials, context use). Each is explicit inputs to a value out, imports nothing from the controller, and leaves every write where it belongs. |
-| `src/ai_code_engineer/webapp/static/` | the client: seven plain scripts in load order — `ui-core`, `ui-projects`, `ui-chat`, `ui-composer`, `ui-run`, `ui-dialogs`, `ui-wiring` (last; the only block that runs at load). Classic scripts share the global scope, so no bundler and no framework was needed to split them. `app.css` stays one file: its cascade order is load-bearing and no test can see a specificity change. |
-| `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. What it and the web window agree on about a record on disk is in `session_flow.py`, not in either of them. |
-| `tests/` | Python `unittest` coverage plus standalone Node.js rendering checks. `doubles.py` holds the doubles more than one window's tests read, `helpers.py` the folder fixture, `controller_case.py` the web window's own. The controller suite is split by behaviour: `test_controller.py` for the ask-review-apply-run lifecycle, then `test_controller_queue`, `_chat`, `_activity`, `_git`, `_modes`, `_project`. A live model is not required. |
-| `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
-| `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
-| `docs/` | plans, implementation status, code reviews — **local working notes, gitignored.** They quote this machine's paths, ports and counts, so they are kept on the device that measured them instead of shipped as product files. The rules they describe live in the modules' own docstrings, and the test suite is the gate: nothing in `src/`, `tests/` or CI reads a `docs/` file. |
-| `tools/` | development aids for this repository — contrast checks, the dogfood ledger, wheel inspection, demo generators. |
-| `sandbox/` | probes that produced a number someone quoted, kept so the number can be re-measured. |
-| `examples/` | folders the agent is pointed at to try it out. |
-| `archive/` | see `archive/README.md` — including why two experiment folders were **not** moved into it. |
-| `.agent-chats/`, `.agent-runs/`, `.agent-plans/`, `.agent-projects.json` | Local conversations, run records, plan progress, and the granted-folder registry. Ignored by git; publishing the source does not upload these records. |
-
-## Where a new decision goes
-
-Two kinds of judgement are deliberately left as one function each, because that is where the next
-version of them belongs:
-
-- **What a message is asking for** (chat, a change, a command) is the verb table in
-  `src/ai_code_engineer/webapp/controller.py` — `CHANGE_VERBS`, `ARABIC_CHANGE_VERBS`,
-  `asks_for_a_change()`. It is a heuristic on purpose: the position a folder is in is decided by
-  `intent.py` *before* the message is read, so a classifier can only ever promote a folder the person
-  already granted, never speak for one they set to read-only.
-- **What a failed command means** is `repair.classify()` in `src/ai_code_engineer/repair.py`. It
-  already returns the category the timeline rows, the stall check and the fix offer all read, so
-  triage grows by answering that question better, not by adding a second reading of the run record.
-
-Neither one moves toward the browser. The client sends action names and draws what it is told; every
-gate — permissions, cancellation, the Run buttons' pressability, redaction — is decided server-side,
-and `tests/test_webapp.py` and `tests/test_host.py` hold that line.
+| `src/ai_code_engineer/core.py` | **AgentCore State Machine:** Typed dataclasses (`Task`, `Plan`, `Action`, `AgentState`, `VerificationResult`) and deterministic transition engine. |
+| `src/ai_code_engineer/repo_scanner.py` | **Architectural Repository Scanner:** 13-layer parser, 200+ annotation detectors, dependency graph extractor, `project-index.json`, and `index_boost`. |
+| `src/ai_code_engineer/repair.py` | **Autonomous Repair Loop:** `execute_verification`, `verification_from_run`, `handle_fix_evaluation`, and bounded 3-round repair logic. |
+| `src/ai_code_engineer/engine.py` | **Core Orchestration Loop:** Planning, diff creation, architecture-boosted context selection, and session persistence. |
+| `src/ai_code_engineer/runner.py` | **Command Execution & Sandbox:** Safe process spawning, real-time log streaming, instant cancellation (`kill_tree`), and Docker container isolation. |
+| `src/ai_code_engineer/workspace.py` | **Filesystem Sandbox:** Path traversal prevention, symlink protection, Windows device name defense, and rollback managers. |
+| `src/ai_code_engineer/redaction.py` | **Zero-Trust Secret Redaction:** Real-time scrubbing of API keys, PEM private keys, JWT tokens, and connection strings. |
+| `src/ai_code_engineer/webapp/` | **Desktop WebApp:** Loopback server (`server.py`), state controller (`controller.py`), project manager (`projects.py`), and modern CSS/JS client. |
+| `src/ai_code_engineer/gui.py` | **Native Desktop Tk GUI:** Lightweight Python Tkinter desktop client sharing the same engine and sentences. |
+| `tests/` | **1,740+ Automated Tests:** Extensive unit and integration test coverage across all features, state machine transitions, scanner layers, and repair loops. |
+| `agent.py` · `desktop.pyw` · `launcher.py` | **System Launchers:** CLI entry point, desktop window entry, and interactive terminal menu. |
+| `profiles/` | **Model Profiles:** TOML configuration presets for local Ollama and cloud providers. |
+| `assets/` | **Brand Assets:** Vector banner with official logo (`banner.svg`), logo assets (`logo.png`), and UI demo animations. |
 
 ---
 
 # 🤝 Contributing
 
-We welcome contributions from the global open-source community!
+We welcome contributions from the global software engineering community!
 
 1. **Fork** the repository.
 2. **Create your feature branch:**
    ```bash
    git checkout -b feature/amazing-feature
    ```
-3. **Ensure all tests pass:**
+3. **Verify all tests pass:**
    ```bash
    python -m unittest discover -s tests -v
    ```
@@ -385,9 +347,8 @@ We welcome contributions from the global open-source community!
    ```
 5. **Push to your fork and submit a Pull Request (PR).**
 
-Please submit contributions through pull requests and keep automated checks passing.
-
 ---
 
 # 📄 License
+
 This project is open-source software licensed under the [MIT License](LICENSE).

@@ -38,7 +38,7 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIEL
                       applied_line, applied_note, artifact_card, asked_of, batch_summary_line,
                       branch_started, branch_switched,
                       catalog_status_line, checkpoint_note, detail_section, executed_line,
-                      executing_line, friendly_error, fix_offers_off_line, is_arabic,
+                      executing_line, friendly_error, fix_offers_off_line, impact_lines, is_arabic,
                       log_dropped_line, log_line,
                       no_branch_note, no_checkpoint_note,
                       quote_reference, rejected_note,
@@ -366,6 +366,9 @@ class AgentController:
         self.projects: dict[str, str] = {}
         self.icons: dict[str, str] = {}
         self._saved_ui: dict = {}
+        # Tasks in this folder that stopped before they reached a result. Read once when a folder is
+        # opened and once when a job ends — never per snapshot, because the scan walks the run tree.
+        self.resumable: list[dict] = []
         try:
             registry = json.loads((self.app_dir / ".agent-projects.json").read_text(encoding="utf-8"))
             for entry in registry["projects"]:
@@ -977,6 +980,8 @@ class AgentController:
             # The first-run card: rows computed once and stored, never probed per snapshot.
             "setup": self.setup_view(),
             "queue": self._queue_view(),
+            # Stopped tasks in this folder. A strip and a press, never an automatic resume.
+            "resume": self.resumable,
             # The questions a worker is blocked on, with their ids: a page that connects after the
             # event was sent can still answer one, which is the whole of D33.
             "asks": [dict(a) for a in self._active_asks],
@@ -997,6 +1002,7 @@ class AgentController:
             "send": lambda: self.start_plan(payload.get("text", ""), payload.get("quote_of"),
                                             step_id=payload.get("step_id")),
             "complete_step": lambda: self.complete_step(int(payload.get("step_id") or 0)),
+            "resume_task": lambda: self.resume_task(str(payload.get("run_id", ""))),
             "reopen": self.reopen,
             "queue_add": lambda: self.queue_add(payload.get("text", ""), payload.get("quote_of")),
             "queue_edit": lambda: self.queue_edit(str(payload.get("id", "")),
@@ -1139,6 +1145,10 @@ class AgentController:
         # project_changed saved the state while the branch was still the previous one, so the
         # branch that was actually selected is written once more.
         self._save_state()
+        # Which tasks stopped in this folder is read when the folder is entered — not per snapshot:
+        # the scan walks the run tree, and a poll that lagged is the failure this project has already
+        # had to undo once.
+        self.refresh_resumable()
         self.subtitle = self._subtitle()
         # Arriving at a conversation that has something waiting starts it here; without this the
         # queue would only move when a job finished, and a stopped task never finishes again.
@@ -2001,6 +2011,8 @@ class AgentController:
             except (AgentError, OSError) as exc:
                 self.status = friendly_error(exc)
                 return
+        ledger_path = book = row = None
+        step_note = ""
         if chained_plan:
             try:
                 ledger_path, book = planbook.open_book(self.plans, Workspace(Path(repo)), plan_file)
@@ -2018,7 +2030,8 @@ class AgentController:
                     else:
                         step_id = row["id"]
                 if chained_plan and row is not None:
-                    task = planbook.task_for(book, row, task if (task and task != row.get("title")) else "")
+                    step_note = task if (task and task != row.get("title")) else ""
+                    task = planbook.task_for(book, row, step_note)
             except (AgentError, OSError) as exc:
                 self.say(friendly_error(exc))
                 return
@@ -2061,11 +2074,39 @@ class AgentController:
             # reader's question during a turn is "is it still working", which is what this answers.
             feed = LineFeed(self._build_line) if getattr(provider, "supports_stream", False) else None
             try:
-                return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+                current_book = book
+                current_row = row
+                run_task = task
+                if (chained_plan and current_book is not None and ledger_path is not None
+                        and not planbook.has_goal(current_book)):
+                    # A goal tree is a model round trip, so it is asked for here on the job thread
+                    # rather than while the plan is being attached. A plan that already carries one is
+                    # never re-asked: the operator read those criteria on the first run, and rewriting
+                    # them under a later step would move the goalposts mid-plan.
+                    try:
+                        plan_text = Workspace(Path(repo)).read(current_book["plan_path"])["content"]
+                    except (AgentError, OSError):
+                        plan_text = ""
+                    current_book, refusal = planbook.author_goal(ledger_path, current_book, provider,
+                                                                 task=asked or task, plan_text=plan_text,
+                                                                 cancelled=self.cancel_event.is_set)
+                    if refusal:
+                        self._add("tool", "Tool", shared_note("goal_skipped", arabic=self.arabic,
+                                                              reason=refusal))
+                    else:
+                        self._add("tool", "Tool", shared_note("goal_written", arabic=self.arabic,
+                                                              count=len(current_book.get("criteria") or [])))
+                        current_row = planbook.step(current_book, step_id) or current_row
+                        run_task = planbook.task_for(current_book, current_row, step_note)
+                goal = planbook.goal_line(current_book) if current_book else ""
+                criteria = planbook.criteria_of(current_book) if current_book else None
+                accepts = (current_row.get("accepts") or []) if current_row else None
+                return plan(Workspace(Path(repo)), run_task, provider, settings, self.runs,
                             progress=lambda line: self._progress(line),
                             step=self._step, on_token=(feed.feed if feed else None),
                             cancelled=self.cancel_event.is_set, plan_file=plan_file, chat_id=chat_id,
-                            plan_step=step_id, memory=notes)
+                            plan_step=step_id, memory=notes,
+                            goal=goal, criteria=criteria, accepts=accepts)
             finally:
                 if feed:
                     feed.close()
@@ -3415,6 +3456,10 @@ class AgentController:
         if row is None or row["status"] == "verified":
             return
         if result["status"] != "passed":
+            try:
+                book = planbook.mark_failed(path, book, step_id, runner.summarize(result))
+            except (AgentError, OSError) as exc:
+                self._add("tool", "Tool", "The plan ledger was not updated: " + friendly_error(exc))
             self.status = (planbook.progress_line(book) + " — step " + str(step_id) +
                            " stays open until a command run proves it.")
             return
@@ -3457,7 +3502,11 @@ class AgentController:
         return True
 
     def complete_step(self, step_id: int = 0) -> None:
-        """Mark a plan step verified in the ledger when sequentially executed."""
+        """Close a plan step on recorded proof, the same gate the run-result path uses.
+
+        The button used to write `verified` straight onto the row. A step the agent never ran — or ran
+        and failed — therefore became a done fact, and `task_for` told every later step not to touch it.
+        """
         if not self.ledger or not self.ledger_path:
             self.refresh_plan_status()
         if not self.ledger or not self.ledger_path:
@@ -3470,11 +3519,100 @@ class AgentController:
         row = planbook.step(self.ledger, step_id)
         if row is None:
             return
-        row.update(status="verified", verified_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        atomic_json(self.ledger_path, self.ledger)
+        session = None
+        ident = row.get("session_id")
+        if ident:
+            found = self._load_session_cached(self.runs / str(ident) / "session.json")
+            if isinstance(found, dict) and found.get("id") == ident:
+                session = found
+        reason = (planbook.proof_reason(session) if session is not None
+                  else "no run is recorded for this step")
+        if reason:
+            note = shared_note("step_no_proof", arabic=self.arabic, step=step_id, reason=reason)
+            if not self.confirm("Plan step proof", note, ok_label="Mark verified anyway"):
+                self.status = note
+                return
+            try:
+                planbook.mark_unproven(self.ledger_path, self.ledger, step_id, reason)
+            except (AgentError, OSError) as exc:
+                self.status = friendly_error(exc)
+                return
+            self.refresh_plan_status()
+            self._add("tool", "Tool", shared_note("step_unproven", arabic=self.arabic, step=step_id))
+            self.say(f"Plan step {step_id} marked verified by you; no command run proves it.")
+            return
+        try:
+            planbook.complete(self.ledger_path, self.ledger, step_id, session)
+        except (AgentError, OSError) as exc:
+            self._add("tool", "Tool", shared_note("step_open_detail", arabic=self.arabic, step=step_id,
+                                                  reason=friendly_error(exc)))
+            self.status = shared_note("step_still_open", arabic=self.arabic, step=step_id)
+            return
         self.refresh_plan_status()
-        self.say(f"Plan step {step_id} verified.")
+        self.say(f"Plan step {step_id} verified from its recorded run.")
         self.line("tool", "Tool", f"Plan step {step_id}: {row.get('title', '')} verified.")
+
+    def refresh_resumable(self) -> None:
+        """Read which tasks stopped here. Showing them is the whole of what this decides."""
+        repo = self.repo.strip()
+        if not repo or not Path(repo).is_dir():
+            self.resumable = []
+            return
+        self.resumable = session_flow.resumable_runs(self.runs, repo, self._session_cache)
+
+    def resume_task(self, run_id: str = "") -> None:
+        """Continue a task that stopped before it reached a result. Pressed, never automatic."""
+        if self.busy:
+            self.status = shared_note("resume_busy", arabic=self.arabic)
+            return
+        found = next((row for row in self.resumable if row["run_id"] == run_id), None)
+        if found is None:
+            self.status = shared_note("resume_gone", arabic=self.arabic)
+            return
+        entry = self.selected_entry()
+        if entry is None:
+            self.status = status_text("pick_model", arabic=self.arabic)
+            return
+        cloud, paid = self.cloud_choice()
+        if cloud and not self.cloud_ok:
+            self.status = status_text("consent_message", arabic=self.arabic)
+            return
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return
+        repo = self.repo.strip()
+        try:
+            session = load_session(self.runs / run_id / "session.json")
+        except (AgentError, OSError):
+            self.resumable = [row for row in self.resumable if row["run_id"] != run_id]
+            self.status = shared_note("resume_gone", arabic=self.arabic)
+            return
+        task = str(session.get("task") or "")[:MAX_TASK_CHARS]
+        plan_file = str((session.get("plan_reference") or {}).get("path") or "") or None
+        notes = str(session.get("memory") or "")
+        self._add("tool", "Tool", shared_note("resume_started", arabic=self.arabic,
+                                              task=str(found.get("task") or "")[:60]))
+
+        def work():
+            provider = make_provider(settings, allow_cloud=cloud,
+                                     data_class="public" if cloud else "restricted",
+                                     api_key=self.key.strip() or None, allow_paid=paid)
+            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+                        progress=lambda line: self._progress(line), step=self._step,
+                        cancelled=self.cancel_event.is_set, plan_file=plan_file,
+                        chat_id=session.get("chat_id"), plan_step=session.get("plan_step"),
+                        memory=notes, resume_run=run_id)
+
+        def done(path):
+            self.display_session(path)
+            self.refresh_resumable()
+            if self.session and self.session.get("changes"):
+                self.status = status_text("proposal_ready", arabic=self.arabic)
+                self._emit({"kind": "view", "value": "preview"})
+            else:
+                self.status = status_text("no_proposal", arabic=self.arabic)
+
+        self.run_job(work, done, "Continuing the stopped task…", cancellable=True)
 
     def refresh_plan_status(self) -> None:
         repo, plan_file = self.repo.strip(), self.plan_file.strip()
@@ -3498,9 +3636,21 @@ class AgentController:
         verified = len(planbook.done_titles(book))
         return {"name": Path(book["plan_path"]).name, "step": row["id"] if row else len(book["steps"]),
                 "total": len(book["steps"]), "verified": verified,
+                "goal": planbook.goal_line(book),
+                "criteria": planbook.criteria_of(book),
+                "uncovered": planbook.uncovered_criteria(book),
+                "sub_goal": planbook.sub_goal_of(book, row),
+                "strings": {"goal": shared_note("plan_goal", arabic=self.arabic),
+                            "criteria": shared_note("plan_criteria", arabic=self.arabic),
+                            "uncovered": shared_note("plan_uncovered", arabic=self.arabic),
+                            "unproven": shared_note("plan_unproven", arabic=self.arabic)},
                 "note": planbook.progress_line(book),
                 "steps": [{"id": step["id"], "title": step["title"], "status": step["status"],
-                           "current": bool(row) and step["id"] == row["id"]} for step in book["steps"]]}
+                           "current": bool(row) and step["id"] == row["id"],
+                           "accepts": list(step.get("accepts") or []),
+                           "unproven": str(step.get("unproven") or ""),
+                           "sub_goal": planbook.sub_goal_of(book, step)}
+                          for step in book["steps"]]}
 
     # ------------------------------ sessions ------------------------------
     def _load_session_cached(self, path: Path) -> dict | None:
@@ -3817,8 +3967,22 @@ class AgentController:
             "reopenLabel": say(self.arabic, en="Reopen for review", ar="إعادة الفتح للمراجعة"),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
+            "impact": self._impact(),
             "view": {**uistate.file_view(chosen), "checks": runresults.checks_lines(session)},
         }
+
+    def _impact(self) -> dict:
+        """What this proposal breaks in the rest of the repository, in the task's own language.
+
+        The findings were computed once, when the proposal was recorded, and are stored on the session;
+        this only puts them into words. An empty dict is the honest answer for a change nothing else
+        names, and the client draws no block for it — a heading that promises findings and shows
+        nothing reads worse than no heading at all.
+        """
+        lines = impact_lines((self.session or {}).get("impact") or {}, arabic=self.arabic)
+        if not lines:
+            return {}
+        return {"heading": shared_note("impact_heading", arabic=self.arabic), "lines": lines}
 
     # ------------------------------ persistence ------------------------------
     def _sync_project(self) -> None:

@@ -97,3 +97,46 @@ def recipe_for(recipes: list[str], chosen_label: str) -> str | None:
 def label_for(targets: list[dict], target: str) -> str:
     """Which module of a multi-project folder a command runs in, as the row says it."""
     return next((row["label"] for row in targets if row["path"] == target), "")
+
+
+def resumable_runs(runs: Path, root: str, cache: dict, limit: int = 8) -> list[dict]:
+    """Tasks in this folder that stopped before they reached a result, newest first.
+
+    Only a run still in DISCOVERING counts. Every other state is a run that said something — a proposal,
+    a verdict, a cancellation — and the files on disk already answer it. A run with no continuation
+    written beside it is still listed, with turn 0, because the operator needs to know it is there even
+    when there is nothing to carry on from. Showing the list is not the same as resuming it: nothing in
+    this function starts anything, and no window may resume a task by itself.
+    """
+    from .engine import load_session, load_turns, turns_file
+
+    def identity(value: str) -> str:
+        try:
+            return str(Path(value).expanduser().resolve()).casefold()
+        except OSError:
+            return ""
+
+    wanted = identity(str(root or ""))
+    if not wanted:
+        return []
+    try:
+        files = sorted(runs.glob("*/session.json"), key=lambda path: path.stat().st_mtime,
+                       reverse=True)
+    except OSError:
+        return []
+    found: list[dict] = []
+    for path in files[:200]:
+        session = read_cached(cache, path, load_session)
+        if not session or session.get("state") != "DISCOVERING":
+            continue
+        if identity(str(session.get("root") or "")) != wanted:
+            continue
+        stored = load_turns(turns_file(path)) or {}
+        found.append({"run_id": str(session.get("id") or path.parent.name),
+                      "task": str(session.get("task") or "")[:90],
+                      "turn": int(stored.get("turn") or 0),
+                      "plan_step": session.get("plan_step"),
+                      "written": str(stored.get("written") or session.get("created") or "")})
+        if len(found) >= limit:
+            break
+    return found

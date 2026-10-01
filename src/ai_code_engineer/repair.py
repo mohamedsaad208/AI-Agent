@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 
 from .engine import (atomic_json, chat_sessions, event, load_session, shrink_warning,
                      unexpected_notice)
@@ -562,3 +563,84 @@ def choose_recipe(repo: Path, preferred: str | None = None) -> tuple[str | None,
     if preferred and preferred in options:
         return preferred, options
     return (options[0] if options else None), options
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: AgentCore State Machine Loop Integration
+# ---------------------------------------------------------------------------
+
+def verification_from_run(run: dict) -> Any:
+    """Build a typed VerificationResult from a runner output dictionary."""
+    from .core import VerificationResult
+    status = str(run.get("status", "unknown"))
+    passed = status == "passed"
+    command = str(run.get("command") or run.get("recipe", ""))
+    exit_code = int(run.get("exit_code", 0 if passed else 1))
+    summary = str(run.get("label") or run.get("recipe") or "") + ": " + status
+    failures = [str(f) for f in run.get("failures", [])]
+    tail = str(run.get("tail", ""))
+    return VerificationResult(
+        passed=passed,
+        status=status,
+        command=command,
+        exit_code=exit_code,
+        summary=summary,
+        failures=failures,
+        output_tail=tail,
+        details={"recipe": run.get("recipe"), "seconds": run.get("seconds")},
+    )
+
+
+def execute_verification(
+    core: Any,
+    state: Any,
+    repo: Path,
+    recipe: str,
+    target: str = "",
+    sandbox: str = "",
+    cancelled: Any = None,
+) -> Any:
+    """Execute a recipe via runner, construct VerificationResult, and advance AgentCore state.
+
+    Transitions AgentState:
+      VERIFYING -> DONE   (if run passed)
+      VERIFYING -> FIXING (if run failed or timed out)
+    """
+    from .core import AgentStatus
+    if state.status != AgentStatus.VERIFYING:
+        raise PolicyError(f"Cannot verify from state {state.status.value}; must be in VERIFYING.")
+
+    run_dict = runner.run(
+        repo,
+        recipe,
+        timeout=runner.timeout_for(recipe),
+        target=target,
+        sandbox=sandbox,
+        cancelled=cancelled,
+    )
+    verif = verification_from_run(run_dict)
+    core.record_verification(state, verif)
+    return verif
+
+
+def handle_fix_evaluation(
+    core: Any,
+    state: Any,
+    sessions: list,
+    round_number: int,
+    limit: int = MAX_FIX_ROUNDS,
+) -> tuple[bool, str]:
+    """Evaluate whether the fix loop should continue or terminate.
+
+    If should stop: transitions state to FAILED and returns (False, reason).
+    If should continue: keeps state in FIXING and returns (True, "continue").
+    """
+    from .core import AgentStatus
+    if state.status != AgentStatus.FIXING:
+        raise PolicyError(f"Cannot evaluate fix loop from state {state.status.value}; must be in FIXING.")
+
+    stop, reason = should_stop(sessions, round_number, limit=limit)
+    if stop:
+        core.fail(state, reason)
+        return False, reason
+    return True, "continue"

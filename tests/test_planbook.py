@@ -294,5 +294,173 @@ class LegacyLedgerTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), saved)
 
 
+class FakeProvider:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def generate(self, messages, cancelled=None):
+        self.calls.append(list(messages))
+        if not self.responses:
+            return "{}"
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class GoalEngineTests(unittest.TestCase):
+    setUp = LedgerTests.setUp
+    open = LedgerTests.open
+
+    def test_validate_tree_valid(self):
+        tree = {
+            "goal": "Build authentication with JWT tokens.",
+            "criteria": ["Login endpoint returns 200 with JWT", "Invalid credentials return 401"],
+            "sub_goals": [{"id": 1, "title": "Auth API"}],
+            "steps": [{"id": 1, "accepts": [1, 2], "sub_goal": 1},
+                      {"id": 2, "accepts": [1], "sub_goal": 1},
+                      {"id": 3, "accepts": [2], "sub_goal": None}],
+        }
+        res = planbook.validate_tree(tree, [1, 2, 3])
+        self.assertEqual(res["goal"], "Build authentication with JWT tokens.")
+        self.assertEqual(len(res["criteria"]), 2)
+        self.assertEqual(len(res["sub_goals"]), 1)
+        self.assertEqual(len(res["steps"]), 3)
+
+    def test_validate_tree_rejections(self):
+        with self.assertRaisesRegex(PolicyError, "one JSON object"):
+            planbook.validate_tree(["not", "a", "dict"], [1])
+
+        with self.assertRaisesRegex(PolicyError, "needs goal and criteria"):
+            planbook.validate_tree({"goal": "Only goal"}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "goal must be one sentence"):
+            planbook.validate_tree({"goal": "", "criteria": ["Works"]}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "goal must be one sentence"):
+            planbook.validate_tree({"goal": "x" * 350, "criteria": ["Works"]}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "criteria must be 1-8"):
+            planbook.validate_tree({"goal": "Valid", "criteria": []}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "criteria must be 1-8"):
+            planbook.validate_tree({"goal": "Valid", "criteria": ["c"] * 9}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "sub_goals must be a list"):
+            planbook.validate_tree({"goal": "Valid", "criteria": ["c"], "sub_goals": "bad"}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "sub_goal ids must be unique"):
+            planbook.validate_tree({"goal": "Valid", "criteria": ["c"],
+                                    "sub_goals": [{"id": 1, "title": "A"}, {"id": 1, "title": "B"}]}, [1])
+
+        with self.assertRaisesRegex(PolicyError, "must name exactly the plan's step numbers"):
+            planbook.validate_tree({"goal": "Valid", "criteria": ["c"],
+                                    "steps": [{"id": 99, "accepts": [1]}]}, [1, 2])
+
+    def test_author_goal_happy_path(self):
+        path, book = self.open()
+        payload = json.dumps({
+            "goal": "Deliver scaffold and auth.",
+            "criteria": ["App runs and passes unit tests", "Login endpoint returns JWT"],
+            "sub_goals": [{"id": 1, "title": "Scaffolding"}, {"id": 2, "title": "Auth"}],
+            "steps": [{"id": 1, "accepts": [1], "sub_goal": 1},
+                      {"id": 2, "accepts": [2], "sub_goal": 2},
+                      {"id": 3, "accepts": [1, 2], "sub_goal": 2}],
+        })
+        provider = FakeProvider([payload])
+        authored, refusal = planbook.author_goal(path, book, provider, task="Add login")
+        self.assertEqual(refusal, "")
+        self.assertEqual(authored["schema"], 2)
+        self.assertEqual(authored["goal"], "Deliver scaffold and auth.")
+        self.assertEqual(authored["steps"][0]["accepts"], [1])
+        self.assertEqual(authored["steps"][0]["sub_goal"], 1)
+
+        # Re-authoring when goal is already present returns book untouched without calling provider
+        again, ref = planbook.author_goal(path, authored, provider)
+        self.assertEqual(ref, "")
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_author_goal_retry_and_exhaustion(self):
+        path, book = self.open()
+        bad_payload = "not json at all"
+        valid_payload = json.dumps({
+            "goal": "Fixed on retry.",
+            "criteria": ["Criterion 1"],
+            "steps": [{"id": 1, "accepts": [1]}, {"id": 2, "accepts": [1]}, {"id": 3, "accepts": [1]}],
+        })
+        provider = FakeProvider([bad_payload, valid_payload])
+        authored, refusal = planbook.author_goal(path, book, provider, attempts=2)
+        self.assertEqual(refusal, "")
+        self.assertEqual(authored["goal"], "Fixed on retry.")
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIn("Tool observation", provider.calls[1][-1]["content"])
+
+        # Exhaustion test
+        path2, book2 = self.open()
+        book2["goal"] = ""
+        failing_provider = FakeProvider(["bad1", "bad2"])
+        _, refusal2 = planbook.author_goal(path2, book2, failing_provider, attempts=2)
+        self.assertTrue(refusal2)
+
+    def test_author_goal_cancelled(self):
+        path, book = self.open()
+        provider = FakeProvider(["{}"])
+        _, refusal = planbook.author_goal(path, book, provider, cancelled=lambda: True)
+        self.assertIn("cancelled", refusal)
+
+    def test_criteria_and_queries(self):
+        path, book = self.open()
+        book.update({
+            "goal": "Build robust auth.",
+            "criteria": ["Pass tests", "Return JWT", "Block unauthorized"],
+            "sub_goals": [{"id": 1, "title": "Core Auth"}],
+            "steps": [
+                {"id": 1, "title": "Scaffold", "accepts": [1], "sub_goal": 1, "status": "pending"},
+                {"id": 2, "title": "Login", "accepts": [2], "sub_goal": 1, "status": "pending"},
+                {"id": 3, "title": "Filter", "accepts": [], "sub_goal": None, "status": "pending"},
+            ]
+        })
+        self.assertTrue(planbook.has_goal(book))
+        self.assertEqual(planbook.goal_line(book), "Build robust auth.")
+        self.assertEqual(planbook.criteria_of(book), ["Pass tests", "Return JWT", "Block unauthorized"])
+        self.assertEqual(planbook.criteria_of(book, book["steps"][0]), ["Pass tests"])
+        self.assertEqual(planbook.criteria_of(book, book["steps"][1]), ["Return JWT"])
+        self.assertEqual(planbook.criteria_of(book, book["steps"][2]), [])
+        self.assertEqual(planbook.uncovered_criteria(book), [3])
+        self.assertEqual(planbook.sub_goal_of(book, book["steps"][0]), "Core Auth")
+        self.assertEqual(planbook.sub_goal_of(book, book["steps"][2]), "")
+
+        # Task for includes goal and criteria
+        task_text = planbook.task_for(book, book["steps"][0])
+        self.assertIn("The plan's goal is: Build robust auth.", task_text)
+        self.assertIn("- Pass tests", task_text)
+
+    def test_mark_failed_and_progress_line(self):
+        path, book = self.open()
+        self.assertEqual(planbook.failed_count(book), 0)
+        self.assertIn("(0 verified)", planbook.progress_line(book))
+
+        planbook.mark_failed(path, book, 1, "Build compilation failed with exit code 1")
+        self.assertEqual(book["steps"][0]["status"], "failed")
+        self.assertEqual(book["steps"][0]["failure_reason"], "Build compilation failed with exit code 1")
+        self.assertEqual(planbook.failed_count(book), 1)
+        self.assertIn("(0 verified, 1 failed)", planbook.progress_line(book))
+
+        # Verified step cannot be overwritten with failed
+        book["steps"][0]["status"] = "verified"
+        planbook.mark_failed(path, book, 1, "Should not overwrite")
+        self.assertEqual(book["steps"][0]["status"], "verified")
+
+    def test_mark_unproven(self):
+        path, book = self.open()
+        planbook.mark_unproven(path, book, 1, "User manual verification without test run")
+        self.assertEqual(book["steps"][0]["status"], "verified")
+        self.assertEqual(book["steps"][0]["unproven"], "User manual verification without test run")
+        self.assertIsNotNone(book["steps"][0]["verified_at"])
+        reloaded = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(reloaded["steps"][0]["unproven"], "User manual verification without test run")
+
+
 if __name__ == "__main__":
     unittest.main()

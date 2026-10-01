@@ -2,8 +2,9 @@
 
 Every untrusted block the loop is fed is assembled here, in one order, with the sentence that
 tells the model what to make of it. That ordering is the whole module: the task first, then the
-repository map, then the project notes, the attached plan, the errors this repository has already
-failed on, the previous turns of this chat, and last the output of the command that just failed.
+repository map, then the project notes, then what this project's own earlier tasks recorded, the
+attached plan, the errors this repository has already failed on, the previous turns of this chat,
+and last the output of the command that just failed.
 
 Nothing here reads a file, writes a session, or calls a provider. The caller hands over what it
 has already measured and records whatever the returned messages caused.
@@ -66,7 +67,7 @@ EMPTY_MAP = ("No policy-visible source files were found. If the task asks to sca
 
 def base_messages(*, task: str, repo_map: str, settings, memory_block: str = "",
                   reference: dict | None = None, open_errors=(), prior_context: str = "",
-                  evidence: str = "") -> list[dict]:
+                  evidence: str = "", auto_notes: str = "") -> list[dict]:
     """The two messages a turn starts from: the system prompt and one user block.
 
     Each appended block names itself as untrusted and says what to do with it, because the model is
@@ -79,6 +80,8 @@ def base_messages(*, task: str, repo_map: str, settings, memory_block: str = "",
             "\n" + (repo_map or EMPTY_MAP)}]
     if memory_block:
         base[1]["content"] += "\n" + memory_block
+    if auto_notes:
+        base[1]["content"] += "\n" + auto_notes
     if reference:
         base[1]["content"] += "\nAttached plan (reference only; follow the CURRENT task's phase selection):\n" + json.dumps(reference)
     if open_errors:

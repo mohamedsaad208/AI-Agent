@@ -85,6 +85,37 @@ function renderRail() {
         seqDiv.appendChild(stopBtn);
       }
       p.appendChild(seqDiv);
+      (DATA.resume || []).slice(0, 3).forEach(row => {
+        const strip = el('div', 'plan-resume');
+        strip.appendChild(el('span', 'quiet', '⏸ ' + esc(row.task)
+                                + (row.turn ? ` · turn ${row.turn}` : '')));
+        const btn = el('button', 'line-btn', 'Resume');
+        btn.title = 'Continue this task from where it stopped';
+        btn.onclick = () => send('resume_task', { run_id: row.run_id });
+        strip.appendChild(btn);
+        p.appendChild(strip);
+      });
+      if (DATA.plan.goal) {
+        const strings = DATA.plan.strings || {};
+        const goal = el('div', 'plan-goal');
+        goal.appendChild(el('div', 't', '🎯 ' + esc(strings.goal || 'Goal') + ': ' + esc(DATA.plan.goal)));
+        const crit = DATA.plan.criteria || [];
+        if (crit.length) {
+          goal.appendChild(el('div', 't quiet', esc(strings.criteria || 'Acceptance criteria')));
+          const shown = el('div', 'plan-criteria');
+          crit.forEach((text, index) => {
+            const number = index + 1;
+            const holders = steps.filter(step => (step.accepts || []).indexOf(number) >= 0).map(step => step.id);
+            const line = el('div', 'plan-criterion' + (holders.length ? '' : ' uncovered'));
+            line.innerHTML = `<b>${number}</b> ${esc(text)}`
+              + (holders.length ? ` <span class="quiet">· steps ${holders.join(', ')}</span>`
+                                : ` <span class="quiet">· ${esc(strings.uncovered || '')}</span>`);
+            shown.appendChild(line);
+          });
+          goal.appendChild(shown);
+        }
+        p.appendChild(goal);
+      }
       const list = el('div', 'tasks-list');
       for (const s of DATA.plan.steps) {
         const isDone = s.status === 'verified';
@@ -92,6 +123,14 @@ function renderRail() {
         const row = el('div', 'task-item ' + (isDone ? 'done' : isNow ? 'now' : 'pending'));
         row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
         row.appendChild(el('span', 'task-title', esc(s.title)));
+        if ((s.accepts || []).length) {
+          row.appendChild(el('span', 'task-crit quiet', '▸ ' + s.accepts.join(',')));
+        }
+        if (s.unproven) {
+          const badge = el('span', 'task-unproven', '!');
+          badge.title = (DATA.plan.strings || {}).unproven || 'unproven';
+          row.appendChild(badge);
+        }
         if (!isDone) {
           const exec = el('button', 'step-exec-btn', 'Run step ▶');
           exec.title = 'Run this step in chat';
@@ -621,6 +660,27 @@ function fileCaption(f, rail = false) {
     + `<span class="file-summary" dir="auto" title="${esc(summary)}">${esc(summary)}</span></span>`;
 }
 
+/* What this proposal breaks in the files it does not touch. Every sentence is built server-side from
+   the symbol index and the task's own language, so this draws textContent only: a finding names paths
+   and identifiers that came out of the repository, and a card that approved a change was never a
+   place to let that markup through. */
+function impactBlock(r) {
+  const imp = r.impact || {};
+  const lines = imp.lines || [];
+  if (!lines.length) return null;
+  const box = el('div', 'impact-block');
+  box.dir = 'auto';
+  const head = el('div', 'impact-head');
+  head.textContent = imp.heading || '';
+  box.appendChild(head);
+  for (const line of lines) {
+    const row = el('div', 'impact-line');
+    row.textContent = line;
+    box.appendChild(row);
+  }
+  return box;
+}
+
 function chipCard(r) {
   const card = el('div', 'chat-task-card');
   card.dir = 'auto';
@@ -656,6 +716,8 @@ function chipCard(r) {
     more.onclick = () => { state.expandedProposal = expanded ? '' : key; state.lockScroll = true; renderThread(); };
     card.appendChild(more);
   }
+  const impact = impactBlock(r);
+  if (impact) card.appendChild(impact);
   changeActions(r, card, true);
   return card;
 }

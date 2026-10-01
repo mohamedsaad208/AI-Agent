@@ -296,6 +296,140 @@ class JvmIndexTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in row["types"]], ["One"])
 
 
+class EndpointTests(unittest.TestCase):
+    """Routes and supertypes: the two structures a change-impact answer is built from.
+
+    A map that names `LoginController` but not `POST /login` makes the model open the file to find out
+    whether a change is local, and a type that records no `extends` cannot say who else inherits the
+    behaviour being edited. Both are read off the source with the same brace-depth scan the members
+    use, so an endpoint is only reported for a method that is really in the class body it belongs to.
+    """
+
+    SPRING = '''
+package com.acme.web;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1")
+public class LoginController extends BaseController implements UserDetailsService {
+    @PostMapping("/login")
+    public String login(String email, String password) { return ""; }
+
+    @GetMapping
+    public java.util.List<String> list() { return null; }
+
+    @RequestMapping(value = "/search", method = RequestMethod.GET)
+    public String search(String q) { return ""; }
+
+    @DeleteMapping("/session/{id}") public void drop(String id) { }
+}
+'''
+
+    JAXRS = '''
+package com.acme.res;
+
+import jakarta.ws.rs.*;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/{id}")
+    public String get(long id) { return ""; }
+
+    @POST
+    public String create(OrderPayload payload) { return ""; }
+}
+'''
+
+    def spring(self):
+        return row_for("src/main/java/com/acme/web/LoginController.java", self.SPRING)
+
+    def test_a_spring_controller_names_every_route_it_answers(self):
+        # The class-level mapping is a prefix, not an endpoint of its own, and a bare `@GetMapping`
+        # answers at that prefix. The last one is the compact style: route and signature on one line.
+        self.assertEqual([(item["verb"], item["path"], item["handler"])
+                          for item in self.spring()["endpoints"]],
+                         [("POST", "/api/v1/login", "LoginController.login"),
+                          ("GET", "/api/v1", "LoginController.list"),
+                          ("GET", "/api/v1/search", "LoginController.search"),
+                          ("DELETE", "/api/v1/session/{id}", "LoginController.drop")])
+
+    def test_a_type_header_records_what_it_extends_and_implements(self):
+        self.assertEqual(self.spring()["types"][0]["extends"],
+                         ["BaseController", "UserDetailsService"])
+
+    def test_a_class_that_extends_nothing_carries_no_extends_key(self):
+        # `render` and the scanner both read `.get("extends")`, and a type with no supertype is not a
+        # type that extends the empty set: an absent key is the answer that cannot be misread.
+        self.assertNotIn("extends", row_for("Plain.java", "public class Plain {\n}\n")["types"][0])
+
+    def test_a_generic_bound_is_not_read_as_a_supertype(self):
+        row = row_for("Repos.java", "public interface Repos<T extends Comparable<T>> "
+                                    "extends BaseRepo<T> {}\n")
+        self.assertEqual(row["types"][0]["extends"], ["BaseRepo"])
+
+    def test_jax_rs_reads_the_verb_and_the_path_in_whichever_order_they_come(self):
+        row = row_for("src/main/java/OrderResource.java", self.JAXRS)
+        self.assertEqual([(item["verb"], item["path"]) for item in row["endpoints"]],
+                         [("GET", "/orders/{id}"), ("POST", "/orders")])
+
+    def test_a_path_above_no_verb_is_not_carried_down_to_the_next_handler(self):
+        # `@Path` on a method the code never maps (a helper, a `@CacheKey`) would otherwise arm the
+        # next real handler with this one's URL.
+        row = row_for("Mixed.java", "@Path(\"/orders\")\npublic class Mixed {\n"
+                                    "    @Path(\"/{id}\")\n    public String key() { return \"\"; }\n"
+                                    "    @GET\n    public String all() { return \"\"; }\n}\n")
+        self.assertEqual([(item["verb"], item["path"]) for item in row["endpoints"]],
+                         [("GET", "/orders")])
+
+    def test_a_mapping_in_a_string_or_a_comment_is_not_a_route(self):
+        row = row_for("Trap.java", "public class Trap {\n"
+                                   '    static final String DOC = "@GetMapping(\\"/nope\\")";\n'
+                                   "    // @GetMapping(\"/commented\")\n"
+                                   "    public void run() { }\n}\n")
+        self.assertEqual(row["endpoints"], [])
+
+    def test_an_annotation_that_is_not_a_mapping_names_no_route(self):
+        # MapStruct puts `@Mapping(target = …)` above a converter method, and a scanner that matched a
+        # bare `@Mapping` would invent a route for a class that answers no request.
+        row = row_for("Conv.java", "public interface Conv {\n"
+                                   '    @Mapping(target = "name", source = "old")\n'
+                                   "    Dto toDto(Entity e);\n}\n")
+        self.assertEqual(row["endpoints"], [])
+
+    def test_the_routes_are_capped_and_the_map_says_it_stopped_listing(self):
+        tail = "".join('    @GetMapping("/x%d")\n    public String h%d() { return ""; }\n' % (n, n)
+                       for n in range(symbols.MAX_ENDPOINTS + 3))
+        row = row_for("Big.java", "@RestController\npublic class Big {\n" + tail + "}\n")
+        self.assertEqual(len(row["endpoints"]), symbols.MAX_ENDPOINTS)
+        self.assertTrue(row["routes_capped"], "a list that stopped must be able to say it did")
+        text = symbols.render([row], ["Big.java"])
+        self.assertIn("route GET /x0 ", text)
+        self.assertIn("routes +" + str(symbols.MAX_ENDPOINTS - 6) + " more", text)
+        self.assertIn("lists at most " + str(symbols.MAX_ENDPOINTS), text)
+        self.assertNotIn("route GET /x42 ", text)
+
+    def test_a_controller_that_fits_under_the_cap_does_not_claim_it_was_cut(self):
+        row = row_for("Two.java", "@RestController\npublic class Two {\n"
+                                  '    @GetMapping("/a") public String a() { return ""; }\n'
+                                  '    @GetMapping("/b") public String b() { return ""; }\n}\n')
+        self.assertNotIn("routes_capped", row)
+        self.assertNotIn("lists at most", symbols.render([row], ["Two.java"]))
+
+    def test_a_file_with_no_routes_renders_no_route_lines(self):
+        row = row_for("Plain.java", "public class Plain {\n    public int n() { return 1; }\n}\n")
+        self.assertNotIn("route ", symbols.render([row], ["Plain.java"]))
+
+    def test_kotlin_puts_a_route_and_its_function_on_one_line(self):
+        row = row_for("src/main/kotlin/Web.kt",
+                      '@RestController\n@RequestMapping("/api")\nclass ApiController {\n'
+                      '    @GetMapping("/health") fun health(): String = "ok"\n}\n')
+        self.assertEqual([(item["verb"], item["path"], item["handler"])
+                          for item in row["endpoints"]],
+                         [("GET", "/api/health", "ApiController.health")])
+
+
 class DependencyTests(unittest.TestCase):
     def test_only_project_internal_edges_survive(self):
         rows = [row_for("src/main/java/com/acme/auth/AuthService.java", JAVA),
@@ -826,6 +960,108 @@ class RankingTests(unittest.TestCase):
         self.assertTrue(used <= set(labels.CONTEXT_REASON), used - set(labels.CONTEXT_REASON))
 
 
+class SnippetTests(unittest.TestCase):
+    """The block around one declaration, for a file too large for what is left of the budget."""
+
+    BIG = 'package a;\n@RestController\n@RequestMapping("/api")\npublic class LoginController {\n' \
+          '    private String note = "login is only a word in this string";\n' \
+          '    // login in a comment\n' \
+          '    @PostMapping("/login")\n    public String login(String u, String p) {\n' \
+          '        String[] parts = new String[]{"login"};\n        return service.login(u, p) + parts[0];\n' \
+          '    }\n\n    public void logout() {\n        service.end();\n    }\n}\n'
+
+    def test_the_window_opens_on_the_declaration_not_on_the_first_line_holding_the_word(self):
+        text, line, more = symbols.snippet(self.BIG, "login")
+        self.assertEqual(line, 8, "line 5 is a string and line 6 a comment; neither is the symbol")
+        self.assertTrue(text.startswith("    public String login("))
+        self.assertTrue(more, "the file continues past what is shown")
+
+    def test_the_window_closes_at_the_next_declaration_of_the_same_level(self):
+        text = symbols.snippet(self.BIG, "login")[0]
+        self.assertNotIn("logout", text, "the body ends where the next method begins")
+        self.assertIn("service.login", text)
+
+    def test_a_name_that_lives_only_in_a_comment_gives_no_window(self):
+        self.assertEqual(symbols.snippet("// logout is discussed here\nclass Other { }\n", "logout"),
+                         ("", 0, False))
+
+    def test_a_name_that_appears_nowhere_gives_no_window(self):
+        self.assertEqual(symbols.snippet(self.BIG, "nothing"), ("", 0, False))
+
+    def test_the_last_declaration_in_a_file_runs_to_the_cap(self):
+        body = "class A {\n" + "".join(f"    public void m{n}() {{\n        x{n}();\n    }}\n\n"
+                                       for n in range(30)) + "}\n"
+        text, line, _more = symbols.snippet(body, "m29")
+        self.assertLessEqual(len(text.splitlines()), symbols.SNIPPET_LINES)
+        self.assertGreater(line, 1)
+
+    def test_a_dotted_or_called_name_is_looked_up_by_its_last_part(self):
+        text, line, _more = symbols.snippet(self.BIG, "LoginController.login")
+        self.assertEqual(line, 8)
+        self.assertIn("public String login", text)
+
+
+class RouteSeedTests(unittest.TestCase):
+    """A URL in the sentence is a name of a file, now that the map knows the routes.
+
+    Two tiers on purpose: a path typed out is as specific as a filename, and one spoken segment is a
+    guess that ranks like the other guesses here — with the reason kept, so the window says why.
+    """
+
+    ROUTE = {"verb": "POST", "path": "/api/v1/orders/{id}/pay", "handler": "OrderController.pay"}
+
+    def words(self, task):
+        return symbols.task_words(task)
+
+    def score(self, task):
+        return symbols.names_route(task, self.words(task), self.ROUTE)
+
+    def test_a_path_typed_out_loud_ranks_like_a_filename(self):
+        self.assertEqual(self.score("change the /api/v1/orders/{id}/pay contract"), 8)
+
+    def test_one_spoken_segment_is_a_guess_and_scores_like_one(self):
+        self.assertEqual(self.score("what do we do about orders here"), 5)
+        self.assertEqual(self.score("the pay call is timing out"), 5)
+
+    def test_a_singular_sentence_finds_a_plural_segment(self):
+        # The URL says `orders` and the person says "order"; neither spelling alone finds the other.
+        self.assertEqual(self.score("one order cannot be paid twice"), 5)
+
+    def test_a_variable_segment_is_never_required_of_a_sentence(self):
+        # Nobody types `{id}`. Requiring it would mean this endpoint could only be reached by its
+        # literal text, which is the one case the map exists to cover.
+        self.assertEqual(self.score("the paid order should close the session"), 5)
+
+    def test_a_generic_segment_names_nothing_on_its_own(self):
+        self.assertEqual(self.score("the v1 api needs a version header"), 0)
+
+    def test_a_name_the_route_never_carries_does_not_match(self):
+        self.assertEqual(self.score("rename the package declaration"), 0)
+
+    def test_a_task_with_no_words_at_all_matches_nothing(self):
+        self.assertEqual(self.score("the and for"), 0)
+
+    def test_the_seed_reaches_the_file_that_serves_it(self):
+        rows = [symbols.parse("src/main/java/a/OrderResource.java",
+                              'package a;\n@RestController\n@RequestMapping("/api")\n'
+                              'public class OrderResource {\n'
+                              '    @PostMapping("/orders/{id}/charge")\n'
+                              '    public String charge(long id) { return ""; }\n}\n')]
+        got = symbols.rank(rows, "the orders total is wrong", limit=3)
+        self.assertEqual([(e["path"].rsplit("/", 1)[-1], e["why"], e["score"], e["symbol"])
+                          for e in got],
+                         [("OrderResource.java", "route", 5, "POST /api/orders/{id}/charge")])
+
+    def test_a_declared_name_the_task_says_still_outranks_a_matched_route(self):
+        rows = [symbols.parse("src/main/java/a/OrderResource.java",
+                              'package a;\n@RestController\n@RequestMapping("/api")\n'
+                              'public class OrderResource {\n'
+                              '    @PostMapping("/orders/{id}/charge")\n'
+                              '    public String charge(long id) { return ""; }\n}\n')]
+        got = symbols.rank(rows, "OrderResource and its orders", limit=3)
+        self.assertEqual(got[0]["why"], "declares")
+
+
 class ConfigFactTests(unittest.TestCase):
     """The map's other half: what the build files and the runtime files say about the project.
 
@@ -869,6 +1105,55 @@ class ConfigFactTests(unittest.TestCase):
                                      "<module>auth-service</module><module>web</module>"
                                      "</modules></project>"))
         self.assertEqual(got["modules"], "auth-service, web")
+
+    def test_a_pom_states_the_java_and_the_boot_versions_it_builds_with(self):
+        # Which Boot is the difference between `javax.` and `jakarta.` imports, and a model that was
+        # never told reads whichever one it has seen most recently.
+        got = dict(self.facts("pom.xml",
+                              '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+                              "<parent><groupId>org.springframework.boot</groupId>"
+                              "<artifactId>spring-boot-starter-parent</artifactId>"
+                              "<version>3.2.2</version></parent>"
+                              "<artifactId>api</artifactId>"
+                              "<properties><java.version>17</java.version></properties>"
+                              "</project>"))
+        self.assertEqual(got["java"], "17")
+        self.assertEqual(got["spring boot"], "3.2.2")
+
+    def test_a_property_that_points_at_another_property_is_not_an_answer(self):
+        # `${java.target}` is a pointer. The next spelling Maven accepts is the literal, and a map that
+        # printed the placeholder would hand the model a string no compiler understands.
+        got = dict(self.facts("pom.xml", "<project><properties>"
+                                         "<java.version>${java.target}</java.version>"
+                                         "<maven.compiler.release>11</maven.compiler.release>"
+                                         "</properties></project>"))
+        self.assertEqual(got["java"], "11")
+
+    def test_a_parent_that_is_not_the_boot_starter_names_no_boot_version(self):
+        got = dict(self.facts("pom.xml", "<project>"
+                                         "<parent><artifactId>shop-parent</artifactId>"
+                                         "<version>1.0</version></parent></project>"))
+        self.assertNotIn("spring boot", got)
+
+    def test_a_gradle_build_states_its_toolchain_and_boot_version(self):
+        got = dict(self.facts("build.gradle",
+                              "plugins { id 'org.springframework.boot' version '3.2.2' }\n"
+                              "java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }\n"))
+        self.assertEqual(got["java"], "21")
+        self.assertEqual(got["spring boot"], "3.2.2")
+
+    def test_an_old_style_compatibility_line_is_still_a_version(self):
+        # `VERSION_1_8` is Java 8, and the underscore is a decimal point rather than a separator: the
+        # whole spelling predates the toolchain block and is still what many builds carry.
+        got = dict(self.facts("build.gradle",
+                              "sourceCompatibility = JavaVersion.VERSION_1_8\n"
+                              "targetCompatibility = '11'\n"))
+        self.assertEqual(got["java"], "1.8")
+
+    def test_a_build_file_states_its_versions_and_still_declares_no_symbols(self):
+        row = symbols.parse("pom.xml", "<project><properties><java.version>17</java.version>"
+                                       "</properties></project>")
+        self.assertIsNone(row, "an xml file is not source, whatever facts it carries")
 
     def test_a_pom_with_a_doctype_is_not_parsed(self):
         """An internal DTD expands inside ElementTree, and this file comes from a repository the tool
