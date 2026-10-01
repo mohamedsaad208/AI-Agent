@@ -6,7 +6,6 @@ decisions can be made against a running window instead of a screenshot.
 """
 from __future__ import annotations
 
-import difflib
 import secrets
 import threading
 import time
@@ -16,6 +15,7 @@ from pathlib import Path
 from .. import config, git_integration, intent, labels, modes, overrides, repair, runner, setup
 from ..errors import PolicyError
 from .controller import PROJECT_ICONS as ICONS
+from . import uistate
 
 BEFORE = """package com.demo.users;
 
@@ -134,11 +134,6 @@ TONE = labels.TONE
 
 def _ago(minutes: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
-
-
-def _diff(before: str, after: str, name: str) -> list[str]:
-    return list(difflib.unified_diff(before.splitlines(), after.splitlines(),
-                                     fromfile="a/" + name, tofile="b/" + name, lineterm=""))
 
 
 class FakeController:
@@ -440,7 +435,7 @@ class FakeController:
         reading = self.reading_only
         files = []
         for change in FILES:
-            lines = _diff(change["before"] or "", change["after"], change["path"])
+            lines = uistate.diff_lines(change["before"] or "", change["after"], change["path"])
             add = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
             dele = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
             files.append({"path": Path(change["path"]).name, "kind": "A" if change["before"] is None else "M",
@@ -460,7 +455,7 @@ class FakeController:
             "rejected": self.declined,
             "canReopen": self.state == "WAITING_APPROVAL" and self.declined and not reading,
             "files": files, "selected": self._file, "tab": self.tab,
-            "view": {"diff": _diff(chosen["before"] or "", chosen["after"], name),
+            "view": {"diff": uistate.diff_lines(chosen["before"] or "", chosen["after"], name),
                      "before": (chosen["before"] or "").splitlines(),
                      "after": chosen["after"].splitlines(),
                      "checks": ["Proposed checks (not execution results):",

@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ai_code_engineer import intent
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp import server as server_module
-from ai_code_engineer.webapp.controller import AgentController, initials_for
+from ai_code_engineer.webapp.controller import AgentController
+from ai_code_engineer.webapp.projects import initials_for
 from ai_code_engineer.webapp.fake import PROJECT_INFO, FakeController
 
 

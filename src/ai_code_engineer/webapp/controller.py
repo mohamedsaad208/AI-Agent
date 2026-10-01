@@ -8,14 +8,11 @@ front-end and block until it answers.
 """
 from __future__ import annotations
 
-import ctypes
 import copy
-import difflib
 import json
 import os
 import re
 import secrets
-import shlex
 import subprocess
 import sys
 import time
@@ -26,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from ..catalog import LIVE, models_for
-from ..chat import (context_block, context_use, create_chat, load_chat, project_of, respond,
+from ..chat import (context_block, create_chat, load_chat, project_of, respond,
                     title_for)
 from .. import config
 from .. import service_runner
@@ -58,7 +55,7 @@ from .. import (git_integration, host, ignore, intent, modes, overrides, planboo
                 runner, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
-from . import connection, requestqueue, runresults
+from . import connection, projects, requestqueue, runresults, uistate
 
 # The provider rows and the recommended models are the table's (`config.py`), not this window's:
 # a second copy of `MODES` was how the web window and Tk ended up disagreeing about a provider's
@@ -1087,27 +1084,8 @@ class AgentController:
         return handler()
 
     def list_dir(self, path: str, want_files=None) -> dict:
-        root = Path(path or Path.home())
-        if not root.is_dir():
-            root = Path.home()
-        dirs, files = [], []
-        for entry in sorted(root.iterdir(), key=lambda p: p.name.casefold()):
-            try:
-                if entry.is_dir():
-                    if not _hidden(entry) and not ignore.picker_dir(entry.name):
-                        dirs.append(entry)
-                elif want_files:
-                    want_set = {str(s).lower() if str(s).startswith(".") else "." + str(s).lower() for s in want_files}
-                    if entry.suffix.lower() in want_set:
-                        files.append(entry)
-            except OSError:
-                continue
-        # A drive root has no parent, so without the drive list the picker is a dead end on C: and
-        # a project on another disk cannot be reached at all.
-        return {"path": str(root), "parent": str(root.parent) if root.parent != root else None,
-                "roots": drive_roots(),
-                "dirs": [{"name": p.name, "path": str(p)} for p in dirs[:400]],
-                "files": [{"name": p.name, "path": str(p)} for p in files[:400]]}
+        """One directory level for the in-page picker — see `projects.listing` for the rules."""
+        return projects.listing(path, want_files)
 
     # --------------------------- selection setters ---------------------------
     def _select_branch(self, kind: str, key: str = "", *, chat_id: str | None = None,
@@ -1849,45 +1827,20 @@ class AgentController:
                 "toolchain": self._toolchain_info(path, key, exists)}
 
     def _context_use(self, path: Path, key: str, notes: str) -> dict:
-        """Map, conversation and what is left, against the configured context budget."""
-        settings = Settings()
-        blank = {"system": 0, "context": 0, "turns": 0, "kept": 0, "used": len(notes),
-                 "budget": settings.context_chars, "remaining": settings.context_chars,
-                 "est_tokens": 0, "map": 0, "notes": len(notes), "files": 0, "bound": False}
-        if not path.is_dir():
-            return blank
-        try:
-            repo = Workspace(path)
-            text = repo.repo_map()
-            files = len(repo.files(limit=symbols.MAX_FILES))
-        except (PolicyError, OSError):
-            return blank
-        # Only a conversation that reads this folder can spend its budget here.
+        """Map, conversation and what is left — see `projects.context_use`.
+
+        Only a conversation that reads this folder can spend its budget here, which is the one thing
+        this side has to answer before the measurement is taken.
+        """
         chat = self.chat if self.branch.get("key") == key and self.chat else None
-        context = context_block(text, notes) if text or notes else ""
-        use = context_use(chat, settings, context)
-        return {**use, "map": len(text), "notes": len(notes), "files": files,
-                "bound": bool(chat)}
+        return projects.context_use(path, notes, chat)
 
     def _toolchain_info(self, path: Path, key: str, exists: bool) -> dict:
-        if not exists:
-            return {"detected": [], "selected": "", "timeout": 0, "proof": "",
-                    "request_timeout": self.request_timeout}
-        detected = runner.detect(path)
-        # ``self.recipe`` is a label chosen for the branch in front of the user; another
-        # project's drawer can only report what would be picked by default.
-        selected = self.selected_recipe() if self.branch.get("key") == key else None
-        selected = selected or (detected[0] if detected else "")
-        entry = runner.RECIPES.get(selected) or {}
-        writes_report = bool(entry.get("reports") or entry.get("junit_arg"))
-        return {"detected": [{"name": name, "label": runner.RECIPES[name]["label"],
-                              "command": shlex.join(runner.RECIPES[name]["command"])}
-                             for name in detected],
-                "selected": selected,
-                "timeout": runner.timeout_for(selected) if selected else 0,
-                "proof": (entry.get("proof_source", "JUnit XML report") if writes_report
-                          else "the command's own summary line") if selected else "",
-                "request_timeout": self.request_timeout}
+        # ``self.recipe`` is a label chosen for the branch in front of the user; another project's
+        # drawer can only report what would be picked by default.
+        return projects.toolchain(path, exists=exists, request_timeout=self.request_timeout,
+                                  selected_hint=(self.selected_recipe()
+                                                 if self.branch.get("key") == key else None))
 
     def reveal(self, key: str) -> None:
         """Show a granted project folder in the file manager.
@@ -3639,7 +3592,7 @@ class AgentController:
             items.extend(bound.get(root, []))
             items.sort(key=lambda item: item["updated"], reverse=True)
             out.append({"key": root, "name": folder.name, "path": str(folder),
-                        "initials": initials_for(folder.name), "icon": self.icons.get(root, ""),
+                        "initials": projects.initials_for(folder.name), "icon": self.icons.get(root, ""),
                         "chats": items})
         return sorted(out, key=lambda group: group["name"].casefold())
 
@@ -3862,37 +3815,14 @@ class AgentController:
                              rejected=bool(changes) and self.rejected())
 
     def _review(self) -> dict:
+        """The change set as the card reads it: the file rows and the view are `uistate`'s, the
+        permissions below are this window's — they depend on the mode, the busy flag and the answer
+        the user already gave."""
         session = self.session or {}
         changes = session.get("changes", [])
         state = session.get("state")
         declined = self.rejected()
-        files = []
-        for change in changes:
-            lines = _diff(change["before"] or "", change["after"] or "", change["path"])
-            added = [line[1:] for line in lines if line.startswith("+") and not line.startswith("+++")]
-            removed = [line[1:] for line in lines if line.startswith("-") and not line.startswith("---")]
-            summary = change.get("summary") or change.get("description")
-            if not summary:
-                # Describe observable edits, without guessing the model's intent or making another call.
-                names = list(dict.fromkeys(re.findall(
-                    r"^\s*(?:(?:async\s+)?def|class|function)\s+([\w$]+)",
-                    "\n".join(added + removed), re.MULTILINE)))[:3]
-                if not names:
-                    names = list(dict.fromkeys(re.findall(
-                        r"^\s*(?:export\s+)?(?:const|let|var)\s+([\w$]+)\s*=",
-                        "\n".join(added + removed), re.MULTILINE)))[:3]
-                if not names and Path(change["path"]).suffix.lower() in {".html", ".htm", ".vue", ".jsx", ".tsx"}:
-                    names = list(dict.fromkeys(re.findall(
-                        r"<([A-Za-z][\w-]*)\b", "\n".join(added + removed))))[:3]
-                action = "Removed" if change.get("delete") else "Added" if change["before"] is None else "Updated"
-                summary = (f"{action} {', '.join(names)}" if names else
-                           f"{action} file content: {len(added)} lines added, {len(removed)} removed")
-            files.append({"path": change["path"],
-                          "summary": " ".join(str(summary).split())[:160],
-                          "kind": ("D" if change.get("delete")
-                                   else "A" if change["before"] is None else "M"),
-                          "add": sum(1 for line in lines if line.startswith("+") and not line.startswith("+++")),
-                          "del": sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))})
+        files = uistate.review_files(changes)
         chosen = changes[min(self.review_file, len(changes) - 1)] if changes else None
         return {
             "id": str(session.get("id", "")) + ":" + str(session.get("proposal_hash", "")),
@@ -3916,16 +3846,7 @@ class AgentController:
             "reopenLabel": say(self.arabic, en="Reopen for review", ar="إعادة الفتح للمراجعة"),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
-            "view": {
-                # A delete has no `after` at all, and the viewer shows the removal as the whole
-                # file going out with minus signs -- which is only readable if the empty side is
-                # built here rather than assumed by the caller.
-                "diff": _diff(chosen["before"] or "", chosen["after"] or "", chosen["path"]) if chosen else [],
-                "before": (chosen["before"] or "").splitlines() if chosen else [],
-                "after": (chosen["after"] or "").splitlines() if chosen else [],
-                "checks": runresults.checks_lines(session),
-            } if chosen else {"diff": [], "before": [], "after": [],
-                              "checks": runresults.checks_lines(session)},
+            "view": {**uistate.file_view(chosen), "checks": runresults.checks_lines(session)},
         }
 
     # ------------------------------ persistence ------------------------------
@@ -3990,44 +3911,3 @@ class AgentController:
         with self._state:
             self.key = ""
 
-
-def _hidden(path: Path) -> bool:
-    """The picker's own rule, older than the shared one: a dot folder is not where the project is.
-
-    `ignore.picker_dir` decides the rest beside it. This stays separate because it is a *navigation*
-    choice — the file-system gate that protects `.git` and the credentials lives in `ignore`, and a
-    folder being tedious to browse is not the same reason to refuse it.
-    """
-    return path.name.startswith(".")
-
-
-def drive_roots() -> list[str]:
-    """Every mounted root, so the folder picker can leave the drive it started on."""
-    if os.name != "nt":
-        return ["/"]
-    try:
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
-    except (OSError, AttributeError):
-        mask = 1
-    return [letter for letter in
-            (chr(ord("A") + index) + ":\\" for index in range(26) if mask & (1 << index))
-            if Path(letter).is_dir()]
-
-
-def initials_for(name: str) -> str:
-    """A two-letter mark that survives near-identical folder names.
-
-    ``demo2`` and ``demo_repo`` both start with "de", which made the sidebar avatars
-    indistinguishable; segment boundaries and a trailing digit separate them.
-    """
-    parts = [part for part in re.split(r"[\s._\-]+", name) if part]
-    if len(parts) >= 2:
-        return (parts[0][0] + parts[1][0]).casefold()
-    word = parts[0] if parts else "?"
-    digit = next((char for char in word[1:] if char.isdigit()), "")
-    return (word[0] + (digit or (word[1] if len(word) > 1 else ""))).casefold()
-
-
-def _diff(before: str, after: str, name: str) -> list[str]:
-    return list(difflib.unified_diff(before.splitlines(), after.splitlines(),
-                                     fromfile="a/" + name, tofile="b/" + name, lineterm=""))
