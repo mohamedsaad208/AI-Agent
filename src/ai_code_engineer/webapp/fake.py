@@ -392,6 +392,7 @@ class FakeController:
                          "consent": self.consent},
             "draft": self.draft,
             "queue": {"items": self.queue, "held": self.queue_held, "elsewhere": 1,
+                      "chat": "c-1", "kind": "chat",
                       **labels.queue_notes(False, 1, False)},
             "artifact": labels.artifact_card(self.state, arabic=False, count=len(FILES),
                                              project="demo2",
@@ -424,6 +425,15 @@ class FakeController:
                                      "updated": _ago(5760), "busy": False}]}],
             "chats": [{"id": "c-1", "title": "Explain Maven surefire reports", "updated": _ago(360)},
                       {"id": "c-2", "title": "Best way to gate a plan step?", "updated": _ago(2880)}],
+            "runStatus": {"canRun": True, "canRunApp": True, "canRunTests": True, "canBuild": True, "reasons": [], "disabledMessage": ""},
+            "services": [],
+            "runConfig": {},
+            "lastJob": None,
+            "readiness": None,
+            "autoNotes": {"enabled": True, "updated_at": "", "purpose_and_stack": "", "components": [], "execution_commands": {}, "implemented_changes": [], "verification_results": "", "remaining_issues": []},
+            "cmdHistory": {"history": [], "favorites": []},
+            "diagnosis": None,
+            "repairBatch": None,
         }
 
     def _review(self) -> dict:
@@ -825,6 +835,42 @@ class FakeController:
             # The one scripted verb that answers with data rather than with an event: the sheet is drawn
             # from the reply, so the preview has to hand back the same shape the real window does.
             return self.open_graph()
+        elif type == "run_app":
+            return {"name": "app", "started": True}
+        elif type == "stop_app":
+            return {"stopped": True}
+        elif type == "restart_app":
+            return {"restarted": True}
+        elif type == "stop_all_apps":
+            return {"stopped_all": True}
+        elif type == "run_build":
+            return {"success": True, "exit_code": 0, "output": "Build passed"}
+        elif type == "get_run_config":
+            return {}
+        elif type == "save_run_config":
+            return {"saved": True}
+        elif type == "get_readiness":
+            return {"tools": [], "wrappers": [], "configs": [], "recommendations": []}
+        elif type == "service_lines":
+            return {"lines": [], "status": "running"}
+        elif type == "api_test":
+            return {"status": 200, "headers": {}, "body": "OK"}
+        elif type == "fix_errors":
+            return {"status": "fix_requested"}
+        elif type == "run_custom":
+            return {"success": True, "exit_code": 0, "output": "Custom command executed"}
+        elif type == "get_cmd_history":
+            return {"history": [], "favorites": []}
+        elif type == "save_favorite_cmd":
+            return {"history": [], "favorites": []}
+        elif type == "diagnose_terminal":
+            return {"what_failed": "None", "likely_cause": "None", "evidence": "", "facts": [], "uncertainties": [], "solutions": []}
+        elif type == "toggle_auto_notes":
+            return {"enabled": True}
+        elif type == "save_auto_notes":
+            return {"saved": True}
+        elif type == "get_auto_notes":
+            return {"enabled": True}
         elif type in PREVIEW_ONLY:
             emit({"kind": "toast", "text": PREVIEW_ONLY[type]})
         else:

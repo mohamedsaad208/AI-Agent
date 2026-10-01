@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-style="claude" data-theme="light">
+<html lang="en" data-style="linear" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -22,10 +22,10 @@
       </button>
     </div>
 
-    <button class="newbtn" id="new-chat" title="New chat (Ctrl+Shift+K). Ctrl+K opens the command palette.">
+    <button class="newbtn" id="new-chat" aria-label="New chat" title="New chat (Ctrl+Shift+K). Ctrl+K opens the command palette.">
       <span class="l">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>
-        New chat
+        <span class="new-chat-label">New chat</span>
       </span><span class="kbd">Ctrl ⇧ K</span>
     </button>
 
@@ -37,8 +37,10 @@
     <nav class="nav" id="nav"></nav>
 
     <div class="foot">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 4v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V7l7-4z"/></svg>
-      You always review first
+      <button class="icon-btn app-settings-btn" id="app-settings-btn" title="Global Settings (Models, Endpoints, Overrides)" aria-label="App Settings">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+      <span>Settings & Themes</span>
       <div class="themepick" id="themepick"></div>
     </div>
   </aside>
@@ -48,21 +50,26 @@
       <button class="icon-btn" id="sidebar-expand" title="Expand sidebar (Ctrl+B)" aria-label="Expand sidebar">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M10 5v14"/><path d="M6.6 12h2.2M6.6 9.4h2.2M6.6 14.6h2.2"/></svg>
       </button>
-      <div style="min-width:0">
+      <div style="min-width:0;flex:1">
         <h1 id="title">New chat</h1>
         <div class="sub" id="subtitle">Standalone chat — no folder attached, nothing to change</div>
+      </div>
+      <div class="seg" id="mode-seg" role="tablist" aria-label="Mode switcher">
+        <button id="mode-btn-plan" title="Plan & Discuss: brainstorm, formulate plan, and structure tasks">Plan</button>
+        <button id="mode-btn-change" title="Change Mode: propose reviewed code edits">Change</button>
+        <button id="mode-btn-read" title="Read-only Mode: read and explain code, write nothing">Read-only</button>
       </div>
       <div class="seg" id="seg" role="tablist" aria-label="Switch view">
         <button data-view="details" role="tab" aria-selected="false" aria-controls="view-details">Activity</button>
         <button data-view="task" role="tab" aria-selected="true" aria-controls="view-task" class="on">Chat</button>
       </div>
-      <button class="ghost" id="attach-top" title="Attach a project plan">＋ Plan</button>
     </header>
     <div class="busybar hidden" id="busybar"></div>
 
     <!-- chat -->
     <section class="view on" id="view-task" role="tabpanel" aria-label="Chat">
       <div class="scroll" id="scroller"><div class="thread" id="thread"></div></div>
+      <button class="jump-latest" id="jump-latest" title="Jump to latest update">↓ Latest update</button>
       <div class="dock">
         <div class="setup" id="setup" role="region" aria-label="First-run checks"></div>
         <div class="queue" id="queue" aria-live="polite"></div>

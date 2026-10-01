@@ -217,6 +217,12 @@ The application features a sleek, local WebApp interface served on `127.0.0.1` w
 - ✏️ **Overrides you can see:** Settings → Overrides lists every configuration row the program is
   running on — whose profile, whose field, whose signed file — and refuses to pretend a row it cannot
   verify is in force. Both windows and the terminal read the same one file.
+- 🚀 **Default Local Execution (Non-Docker):** Run applications, tests, and build jobs directly on the host using system toolchains or project wrappers (`mvnw`, `gradlew`), with Windows space-safe path handling. Docker is purely optional; missing Docker never blocks local execution.
+- 📺 **Embedded Live Terminal:** Real-time stdout and stderr output stream, command & working directory display, clean process-tree termination (`taskkill /F /T /PID`), restart, copy log, bounded buffer memory, and manual scroll preservation with a "Jump to bottom" button.
+- 🌐 **App Readiness Probe & Interactive Preview:** Live HTTP/socket readiness verification before showing preview links, with an embedded lightweight API tester (GET/POST/PUT/DELETE, custom headers & payload, response status and body view).
+- 🔍 **Project Readiness & Plain-Language Diagnostics:** Pre-flight inspections of required tools, project wrappers, config files, and `.env` vs `.env.example` validation with automatic credential redaction. Plain-language error cards for port conflicts, missing dependencies, and syntax issues.
+- 🔧 **Autonomous "Run & Fix" Self-Healing Loop:** Send failure context, command, and tail logs to the agent with a single click. Includes a 3-attempt safety ceiling and identical-error loop breaker to prevent runaway attempts.
+- 💾 **Persistent Project Configuration:** Optional `.ai_project.json` in the project root defining default commands, directories, ports, and multi-service definitions.
 - 🌐 **Full Bilingual Arabic & RTL Support:** Dynamic Right-to-Left (RTL) layout when interacting in Arabic, with comprehensive Arabic localization across system notices, error diagnostics, step cards, and review audits.
 
 Both windows are the same product: the web window and the `--tk` fallback share the engine, the

@@ -324,10 +324,8 @@ function renderNav() {
   const nav = $('nav'); nav.innerHTML = '';
   const q = (state.query || '').toLowerCase();
   const proj = el('div', 'sec');
-  proj.appendChild(el('h4', '', '<span>Projects</span><span class="add" id="add-project">' + '＋ open</span>'
-    + '<span class="add" id="new-project">' + '＋ new</span>'));
+  proj.appendChild(el('h4', '', '<span>Projects</span><span class="add" id="add-project" title="Add or open project folder">＋</span>'));
   proj.querySelector('#add-project').onclick = () => send('pick_project');
-  proj.querySelector('#new-project').onclick = () => send('new_project');
   for (const group of DATA.projects) {
     if (q && !(group.name.toLowerCase().includes(q) || group.chats.some((c) => c.title.toLowerCase().includes(q)))) continue;
     // Nothing is open until the user opens it, so the tree starts collapsed on every load. A
@@ -338,12 +336,18 @@ function renderNav() {
     const chosen = state.expanded[group.key];
     const matched = !!q && group.chats.some((c) => c.title.toLowerCase().includes(q));
     const open = chosen === undefined ? matched : chosen;
-    const mark = avatar(group.name);
-    const node = el('div', 'node' + (open ? '' : ' closed'),
-      `<span class="av" style="background:${mark.bg};color:${mark.ink}">`
-      + (group.icon ? esc(group.icon) : esc(group.initials)) + '</span>'
+    const isBusyProj = !!(DATA.busy && DATA.branch && DATA.branch.key === group.key);
+    const hasUnread = (group.chats || []).some((c) => c.unread || (DATA.queue && DATA.queue.chat === c.id));
+    const unreadDot = hasUnread ? '<span class="unread-dot" title="Unread activity"></span>' : '';
+    const spinDot = isBusyProj ? '<span class="spin-dot" title="Task running in this project"></span>' : '';
+    const node = el('div', 'node' + (open ? '' : ' closed') + (isBusyProj ? ' running' : ''),
+      '<span class="av project-icon" aria-hidden="true">'
+      + esc(group.icon || '📁') + '</span>'
       + `<span class="nm">${esc(group.name)}</span>`
-      + '<button class="dots node-add">＋</button><button class="dots node-menu">⋯</button>'
+      + unreadDot + spinDot
+      + '<button class="dots node-add" title="New chat in this project">＋</button>'
+      + '<button class="dots node-settings" title="Project settings">⚙</button>'
+      + '<button class="dots node-menu" title="Project options">⋯</button>'
       + '<span class="chev">▾</span>');
     node.onclick = () => { state.expanded[group.key] = !open; renderNav(); };
     node.title = group.path + '\nDrop a chat here to let it read this project';
@@ -351,6 +355,10 @@ function renderNav() {
     node.querySelector('.node-add').onclick = (e) => {
       e.stopPropagation();
       send('new_chat_in', { project: group.key });
+    };
+    node.querySelector('.node-settings').onclick = (e) => {
+      e.stopPropagation();
+      projectDrawer(group);
     };
     node.querySelector('.node-menu').title = 'Project options';
     node.querySelector('.node-menu').onclick = (e) => { e.stopPropagation(); projectMenu(group); };
@@ -385,8 +393,11 @@ function renderNav() {
 /* One sidebar row. A chat leaf drags onto a project node to bind itself to that folder, and
    the same command is on its menu, because a drag is not reachable from a keyboard. */
 function leaf(chat, kind, projectKey) {
-  const leaf = el('div', 'leaf' + (chat.id === DATA.current ? ' on' : ''),
-    `<i class="dot ${chat.busy ? 'run' : (DOT[chat.state] || '')}"></i><span class="t">${esc(chat.title)}</span>`
+  const isBusyChat = !!(DATA.busy && chat.id === DATA.current);
+  const spinDot = isBusyChat ? '<span class="spin-dot" title="Task running in this chat"></span>' : '';
+  const leaf = el('div', 'leaf' + (chat.id === DATA.current ? ' on' : '') + (isBusyChat ? ' running' : ''),
+    `<i class="dot ${chat.busy || isBusyChat ? 'run' : (DOT[chat.state] || '')}"></i><span class="t">${esc(chat.title)}</span>`
+    + spinDot
     + `<time>${relTime(chat.updated)}</time>`);
   leaf.onclick = () => send('open', { id: chat.id, kind });
   if (kind === 'chat') {
@@ -616,6 +627,130 @@ async function graphSheet() {
   body.appendChild(list);
 }
 
+async function readinessDrawer() {
+  const s = sheet('Project Readiness Check', 'Toolchain & Environment verification');
+  const body = el('div', 'content');
+  body.appendChild(el('div', 'quiet', 'Checking installed tools and project configs…'));
+  s.appendChild(body);
+  modal(s);
+
+  let data;
+  try {
+    const res = await api('/api/action', { type: 'get_readiness' });
+    data = (res && res.result) || {};
+  } catch (err) {
+    body.innerHTML = `<div class="warnbox">${esc(err.message)}</div>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  const toolsSec = el('div', 'dsec');
+  toolsSec.appendChild(el('h6', '', 'Runtimes & Toolchains'));
+  const toolsList = el('div', 'readiness-list');
+  (data.tools || []).forEach(t => {
+    const row = el('div', 'readiness-item');
+    row.innerHTML = `<span><b>${esc(t.name)}</b></span>
+      <span class="mono quiet">${esc(t.available ? '✓ installed' : '✗ not found')}</span>`;
+    toolsList.appendChild(row);
+  });
+  toolsSec.appendChild(toolsList);
+  body.appendChild(toolsSec);
+
+  if (data.wrappers && data.wrappers.length) {
+    const wrapSec = el('div', 'dsec');
+    wrapSec.appendChild(el('h6', '', 'Project Wrappers'));
+    wrapSec.appendChild(el('div', 'quiet small', 'Found wrappers: ' + data.wrappers.map(w => esc(w)).join(', ')));
+    body.appendChild(wrapSec);
+  }
+
+  const envSec = el('div', 'dsec');
+  envSec.appendChild(el('h6', '', 'Environment (.env)'));
+  const env = data.env || {};
+  envSec.appendChild(el('div', 'quiet small', `Has .env: ${env.has_env ? 'Yes ✓' : 'No ✗'} · Has .env.example: ${env.has_example ? 'Yes ✓' : 'No ✗'}`));
+  if (env.missing_keys && env.missing_keys.length) {
+    envSec.appendChild(el('div', 'warn small', 'Missing keys in .env: ' + env.missing_keys.map(k => esc(k)).join(', ')));
+  }
+  body.appendChild(envSec);
+
+  if (data.recommendations && data.recommendations.length) {
+    const recSec = el('div', 'dsec');
+    recSec.appendChild(el('h6', '', 'Recommendations'));
+    data.recommendations.forEach(r => {
+      recSec.appendChild(el('div', 'quiet small', '💡 ' + esc(r)));
+    });
+    body.appendChild(recSec);
+  }
+}
+
+async function runConfigDrawer() {
+  const s = sheet('Run & Test Configuration', 'Configure run, test, and build commands for this project');
+  const body = el('div', 'content');
+  body.appendChild(el('div', 'quiet', 'Loading configuration…'));
+  s.appendChild(body);
+  const close = modal(s);
+
+  let cfg;
+  try {
+    const res = await api('/api/action', { type: 'get_run_config' });
+    cfg = (res && res.result) || {};
+  } catch (err) {
+    body.innerHTML = `<div class="warnbox">${esc(err.message)}</div>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  const appSec = el('div', 'dsec');
+  appSec.innerHTML = `<h6>App (Run)</h6>
+    <label class="quiet small">Run Command</label>
+    <input class="cfg-input" id="cfg-app-cmd" value="${esc((cfg.app && cfg.app.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-app-cwd" value="${esc((cfg.app && cfg.app.cwd) || '.')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Port (e.g. 3000, 8080)</label>
+    <input class="cfg-input" type="number" id="cfg-app-port" value="${esc((cfg.app && cfg.app.port) || 0)}" style="width:100%">`;
+  body.appendChild(appSec);
+
+  const testSec = el('div', 'dsec');
+  testSec.innerHTML = `<h6>Tests</h6>
+    <label class="quiet small">Test Command</label>
+    <input class="cfg-input" id="cfg-test-cmd" value="${esc((cfg.test && cfg.test.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-test-cwd" value="${esc((cfg.test && cfg.test.cwd) || '.')}" style="width:100%">`;
+  body.appendChild(testSec);
+
+  const buildSec = el('div', 'dsec');
+  buildSec.innerHTML = `<h6>Build</h6>
+    <label class="quiet small">Build Command</label>
+    <input class="cfg-input" id="cfg-build-cmd" value="${esc((cfg.build && cfg.build.command) || '')}" style="width:100%;margin-bottom:6px">
+    <label class="quiet small">Working Directory</label>
+    <input class="cfg-input" id="cfg-build-cwd" value="${esc((cfg.build && cfg.build.cwd) || '.')}" style="width:100%">`;
+  body.appendChild(buildSec);
+
+  const saveBtn = el('button', 'solid', 'Save Configuration');
+  saveBtn.onclick = async () => {
+    const updated = {
+      version: 1,
+      app: {
+        command: $('cfg-app-cmd').value.trim(),
+        cwd: $('cfg-app-cwd').value.trim() || '.',
+        port: parseInt($('cfg-app-port').value, 10) || 0,
+      },
+      test: {
+        command: $('cfg-test-cmd').value.trim(),
+        cwd: $('cfg-test-cwd').value.trim() || '.',
+      },
+      build: {
+        command: $('cfg-build-cmd').value.trim(),
+        cwd: $('cfg-build-cwd').value.trim() || '.',
+      },
+      services: (cfg.services || []),
+    };
+    await send('save_run_config', { config: updated });
+    toast('Run configuration saved');
+    close();
+  };
+  body.appendChild(saveBtn);
+}
+
 /* The palette is served by the controller, so a mark the app does not know about cannot be
    painted into the sidebar no matter what the registry file contains. */
 function iconPicker(group) {
@@ -665,7 +800,38 @@ function avatar(name) {
 function renderHeader() {
   $('title').textContent = DATA.header.title || 'New chat';
   $('subtitle').textContent = DATA.header.subtitle || '';
-  $('attach-top').classList.toggle('hidden', !DATA.project);
+  if ($('attach-top')) $('attach-top').classList.toggle('hidden', !DATA.project);
+
+  const btnPlan = $('mode-btn-plan');
+  const btnChange = $('mode-btn-change');
+  const btnRead = $('mode-btn-read');
+  const declared = DATA.declared || {};
+  if (btnRead) {
+    btnRead.classList.toggle('sealed', !!declared.sealed);
+    btnRead.innerHTML = (declared.sealed ? ICON.lock + ' ' : '') + 'Read-only';
+    btnRead.title = declared.sealed
+      ? (declared.note || (declared.by ? 'Read-only set by ' + declared.by : 'This folder is locked to read-only'))
+      : 'Read-only Mode: read and explain code, write nothing';
+  }
+  if (btnPlan && btnChange && btnRead) {
+    const isChange = DATA.composer === 'change';
+    const isRead = DATA.composer === 'read' || !!(DATA.declared && DATA.declared.sealed);
+    const isPlan = !isChange && !isRead;
+    btnPlan.classList.toggle('on', isPlan);
+    btnChange.classList.toggle('on', isChange);
+    btnRead.classList.toggle('on', isRead);
+
+    btnPlan.onclick = () => {
+      if (DATA.composer !== 'chat') send('set_composer', { value: 'chat' });
+    };
+    btnChange.onclick = () => {
+      if (DATA.composer !== 'change') send('set_composer', { value: 'change' });
+    };
+    btnRead.onclick = () => {
+      if (DATA.composer !== 'read') send('set_composer', { value: 'read' });
+    };
+  }
+
   // The snapshot carries the activity line because the server keeps it current: a status written
   // mid-run has to survive the next push, which is exactly what used to wipe it.
   state.status = DATA.status || '';
@@ -811,7 +977,37 @@ function renderThread() {
       // dir="auto" lets the browser choose from the first strong character, so an Arabic answer
       // reads right-to-left while an English one is untouched — no per-message detection in JS.
       const reply = splitReply(m.text);
-      const bub = el('div', 'bub', mdToHtml(reply.text));
+      const isStepPrompt = m.role === 'user' && (/^(?:Implement step|Execute step|الخطوة)\s+\d+/i.test((reply.text || '').trim())) && (reply.text || '').length > 140;
+      const bub = el('div', 'bub');
+      if (isStepPrompt) {
+        const lines = reply.text.trim().split('\n');
+        const firstLine = lines[0];
+        const rest = lines.slice(1).join('\n').trim();
+        const card = el('div', 'step-prompt-card');
+        const head = el('div', 'step-prompt-head');
+        head.innerHTML = `<span>📋 ${esc(firstLine)}</span>`;
+        if (rest) {
+          const toggle = el('button', 'step-prompt-toggle', ICON.chev);
+          toggle.title = 'Show details';
+          toggle.setAttribute('aria-label', 'Show details');
+          toggle.setAttribute('aria-expanded', 'false');
+          const bodyDetails = el('div', 'step-prompt-body hidden', esc(rest));
+          toggle.onclick = () => {
+            const isHidden = bodyDetails.classList.toggle('hidden');
+            toggle.title = isHidden ? 'Show details' : 'Hide details';
+            toggle.setAttribute('aria-label', toggle.title);
+            toggle.setAttribute('aria-expanded', String(!isHidden));
+            toggle.style.transform = isHidden ? '' : 'rotate(180deg)';
+          };
+          head.appendChild(toggle);
+          card.append(head, bodyDetails);
+        } else {
+          card.appendChild(head);
+        }
+        bub.appendChild(card);
+      } else {
+        bub.innerHTML = mdToHtml(reply.text);
+      }
       if (reply.preview) bub.prepend(replyPill(reply.preview,
         Number.isInteger(m.replyTo) && m.replyTo >= 0 && m.replyTo < i ? m.replyTo : replyTarget(reply.preview, i)));
       bub.dir = 'auto';
@@ -925,7 +1121,11 @@ function msgActions(index) {
   quote.title = 'Answer this message';
   quote.setAttribute('aria-label', 'Answer this message');
   quote.setAttribute('aria-pressed', state.quote === index ? 'true' : 'false');
-  row.append(copy, quote);
+  const again = el('button', 'mact', '↻');
+  again.dataset.againRow = index;
+  again.title = 'Put this message back in composer to ask again';
+  again.setAttribute('aria-label', 'Put this message back in composer to ask again');
+  row.append(copy, quote, again);
   return row;
 }
 
@@ -1083,6 +1283,21 @@ $('thread').addEventListener('click', (event) => {
     toast('Copied to clipboard');
     return;
   }
+  const again = event.target.closest('[data-again-row]');
+  if (again) {
+    const message = DATA.messages[Number(again.dataset.againRow)];
+    if (!message || !message.text) return;
+    const ta = $('prompt');
+    if (ta) {
+      ta.value = message.text;
+      autosize();
+      sendQuiet('set_draft', { text: message.text });
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+      toast('Message loaded into composer');
+    }
+    return;
+  }
   const quoted = event.target.closest('[data-quote-row]');
   if (quoted) quoteRow(Number(quoted.dataset.quoteRow));
 });
@@ -1123,13 +1338,14 @@ function askAgain() {
 function renderComposer() {
   const bar = $('cbar'); bar.innerHTML = '';
   const add = (node) => bar.appendChild(node);
-  add(modeBadge());
+  updatePromptPlaceholder();
   if (DATA.project) {
     const bound = !!(DATA.branch || {}).bound;
     /* Which folder this branch is on, always visible where the message is typed: the sidebar can
        be collapsed, and a name alone does not tell two same-named projects apart. */
-    const where = el('button', 'pill path mono', ICON.file + esc(DATA.project.path));
-    where.title = DATA.project.path + '\nClick to copy the path';
+    const folderName = (DATA.project && DATA.project.name) || (DATA.project && DATA.project.path ? DATA.project.path.split(/[\\/]/).filter(Boolean).pop() : 'project');
+    const where = el('button', 'pill path mono', ICON.file + ' ' + esc(folderName));
+    where.title = DATA.project.path + '\nClick to copy the full path';
     where.onclick = () => { navigator.clipboard.writeText(DATA.project.path); toast('Project folder copied'); };
     add(where);
     const git = gitChip();
@@ -1147,13 +1363,6 @@ function renderComposer() {
   }
   add(el('button', 'pill soft', esc(DATA.provider.mode))).onclick = () => choose('mode', DATA.provider.mode, DATA.provider.modes);
   add(el('button', 'pill mono', esc(shortModel(DATA.provider.model)) + ICON.chev)).onclick = () => choose('model', DATA.provider.model, DATA.provider.models);
-  add(el('button', 'pill', ICON.gear + ' Settings')).onclick = openSettings;
-  if (lastAsked()) {
-    const again = el('button', 'pill soft', '↻ Again');
-    again.title = 'Put your last message back in the box. It does not send — press Send when you want it asked again.';
-    again.onclick = askAgain;
-    add(again);
-  }
   if (DATA.busy && DATA.cancellable) {
     /* Stop shares the `.send` look but not the `.send` handle: while a task runs it is the first
        button of that class in the bar, so anything that finds the composer's button by class —
@@ -1172,7 +1381,7 @@ function renderComposer() {
   /* Typable during a run, because typing is how the next message gets written; Send is the button
      that changes meaning, not the box. */
   ta.disabled = false;
-  // modeBadge() has already chosen the normal placeholder for this mode; a run overrides it.
+  // The selected mode supplies the placeholder; an active run overrides it.
   if (DATA.busy) ta.placeholder = 'Ask the next thing — it queues until this task ends.';
   $('composer').classList.toggle('busy', !!DATA.busy);
 }
@@ -1264,39 +1473,13 @@ function modeMenu() {
   const close = modal(s);
 }
 
-function modeBadge() {
+function updatePromptPlaceholder() {
   const branch = DATA.branch || {};
   const change = DATA.composer === 'change', reading = DATA.composer === 'read';
-  const name = branch.projectName ? ' · ' + esc(branch.projectName) : '';
-  const b = el('button', 'pill mode ' + (reading ? 'read' : change ? 'change' : 'chat'));
-  b.innerHTML = modeRow(DATA.composer)[1] + name + ICON.chev;
   if (branch.bound) {
-    // A bound chat is not a mode choice: the folder's remembered mode and switch stay with the
-    // project branch, and asking for Change here is refused. So no chevron and no click.
-    b.innerHTML = modeRow(DATA.composer)[1] + name;
-    b.title = 'A chat moved into ' + (branch.projectName || 'a project') + ' answers in prose and reads '
-      + 'that folder as context. A message that asks for files is still planned as a proposal you '
-      + 'approve, but the mode and Auto-Apply belong to the project — open it in the sidebar to change them.';
-    b.onclick = () => toast('That belongs to the project. Open ' + (branch.projectName || 'it') + ' in the sidebar.');
-    const ta0 = $('prompt');
-    if (ta0) ta0.placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
-    return b;
+    $('prompt').placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
+    return;
   }
-  b.title = modeRow(DATA.composer)[2] + ' Click to choose what the next Send will do.';
-  const declared = DATA.declared || {};
-  if (declared.sealed) {
-    // A folder can carry a position written by another surface — the other window, or a terminal that
-    // never opened one. Without the lock here that seal looks like a button that forgot to work, so
-    // the badge says who set it and when before it says why the click did nothing.
-    b.classList.add('sealed');
-    b.insertAdjacentHTML('afterbegin', ICON.lock + ' ');
-    if (declared.note) b.title = declared.note;
-    else if (declared.by) b.title = modeRow(DATA.composer)[2] + ' Set by ' + declared.by + '.';
-  }
-  b.onclick = () => {
-    if (!DATA.project) { toast('Choose a project first — then Chat, Read-only and Change each mean something'); return; }
-    modeMenu();
-  };
   const ta = $('prompt');
   /* The one field where the user decides what Send will do, so it has to describe the folder's
      actual behaviour: with the switch on, "review before applying" is a promise this window will
@@ -1310,7 +1493,6 @@ function modeBadge() {
       ? 'Ask what is wrong here, where it is, and what a fix would touch. Nothing is written.'
       : branch.key ? 'Ask about ' + branch.projectName + ' — it answers in prose and writes nothing.'
         : 'Ask anything. Choose a project to work on its files.';
-  return b;
 }
 
 function submit() {
@@ -1432,7 +1614,18 @@ function renderQueue() {
     row.appendChild(act);
     box.appendChild(row);
   }
-  if (q.elsewhere) box.appendChild(el('div', 'qnote', esc(q.elsewhere_note || '')));
+  if (q.elsewhere) {
+    const note = el('div', 'qnote qnote-clickable', esc(q.elsewhere_note || '1 waiting in another chat — click to switch'));
+    note.style.cursor = 'pointer';
+    note.title = 'Switch to the waiting chat';
+    note.onclick = () => {
+      if (DATA.queue && DATA.queue.chat) {
+        const destKind = DATA.queue.kind || (String(DATA.queue.chat).startsWith('c-') ? 'chat' : 'session');
+        send('open', { id: DATA.queue.chat, kind: destKind });
+      }
+    };
+    box.appendChild(note);
+  }
 }
 
 function editQueued(row, item) {
@@ -1464,12 +1657,12 @@ function runPlanStep(s) {
 
 function startSequential() {
   if (!DATA || !DATA.plan || !DATA.plan.steps || !DATA.plan.steps.length) {
-    toast('لا توجد خطوات في الخطة للبدء فيها.');
+    toast('No plan steps available to execute.');
     return;
   }
   const pendingStep = DATA.plan.steps.find(s => s.status !== 'verified');
   if (!pendingStep) {
-    toast('جميع خطوات الخطة مكتملة بالفعل! ✓');
+    toast('All plan steps are already verified! ✓');
     return;
   }
   state.sequential = true;
@@ -1481,7 +1674,7 @@ function startSequential() {
   if (DATA.composer !== 'change') {
     send('set_composer', { value: 'change' });
   }
-  toast(`بدء التنفيذ التتابعي: الخطوة ${pendingStep.id}/${DATA.plan.total}`);
+  toast(`Starting sequential execution: Step ${pendingStep.id}/${DATA.plan.total}`);
   runPlanStep(pendingStep);
   renderRail();
 }
@@ -1494,7 +1687,7 @@ function stopSequential() {
     state.seqTimer = null;
   }
   send('stop');
-  toast('تم إيقاف التنفيذ التتابعي.');
+  toast('Sequential execution stopped.');
   renderRail();
 }
 
@@ -1559,19 +1752,25 @@ function renderRail() {
   } else if (state.railSection === 'tasks') {
     if (DATA.plan) {
       const p = el('div', 'card tasks-card');
-      const pct = Math.round((DATA.plan.verified / Math.max(1, DATA.plan.total)) * 100);
-      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — step ${DATA.plan.step}/${DATA.plan.total}</div>
+      const total = DATA.plan.total || 0;
+      const verified = DATA.plan.verified || 0;
+      const steps = DATA.plan.steps || [];
+      const needingAttention = steps.filter(s => s.status === 'failed' || s.status === 'rejected' || s.status === 'needs_review' || (s.current && DATA.artifact && DATA.artifact.state === 'VERIFICATION_FAILED')).length;
+      const pct = Math.round((verified / Math.max(1, total)) * 100);
+      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${total} · ${verified} verified · ${needingAttention} needing attention</div>
         <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="meta"><span>${DATA.plan.verified} verified</span><span>${esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
+        <div class="meta"><span>${verified} verified</span><span>${needingAttention ? needingAttention + ' needing attention' : esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
       const seqDiv = el('div', 'plan-seq-controls');
       if (!state.sequential) {
-        const startBtn = el('button', 'solid plan-seq-btn', '▶ بدء التنفيذ التتابعي');
-        startBtn.title = 'تنفيذ خطوات الخطة خطوة بخطوة تلقائياً';
+        const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
+        const complete = steps.length > 0 && steps.every(s => s.status === 'verified');
+        startBtn.disabled = complete || steps.length === 0;
+        startBtn.title = complete ? 'Plan complete — all steps are verified' : 'Run plan steps sequentially';
         startBtn.onclick = () => startSequential();
         seqDiv.appendChild(startBtn);
       } else {
-        const stopBtn = el('button', 'line-btn plan-seq-btn running', '⏹ إيقاف التنفيذ التتابعي');
-        stopBtn.title = 'إيقاف التنفيذ التتابعي التلقائي';
+        const stopBtn = el('button', 'line-btn plan-seq-btn running', '■ Stop sequential');
+        stopBtn.title = 'Stop sequential execution';
         stopBtn.onclick = () => stopSequential();
         seqDiv.appendChild(stopBtn);
       }
@@ -1584,7 +1783,7 @@ function renderRail() {
         row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
         row.appendChild(el('span', 'task-title', esc(s.title)));
         if (!isDone) {
-          const exec = el('button', 'step-exec-btn', '▶ نفذ دي');
+          const exec = el('button', 'step-exec-btn', 'Run step ▶');
           exec.title = 'Run this step in chat';
           exec.onclick = (e) => { e.stopPropagation(); runPlanStep(s); };
           row.appendChild(exec);
@@ -1605,31 +1804,318 @@ function renderRail() {
       rail.appendChild(empty);
     }
   } else if (state.railSection === 'checks') {
-    if (DATA.recipes.length) {
-      const many = (DATA.targets || []).length > 1;
-      const sb = DATA.sandbox || {};
-      const c = el('div', 'card');
-      c.innerHTML = `<h5>Checks</h5>
-        ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
-        <button class="pill" id="recipe" style="width:100%;justify-content:space-between;${many ? 'margin-top:7px' : ''}">${esc(DATA.recipe || 'choose a command')}${ICON.chev}</button>
-        <label class="switch" style="margin-top:8px"><input type="checkbox" id="sandboxOn"
-          ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker</label>
-        <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
-          ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace">
-        <div class="meta" dir="auto">${esc(sb.note || '')}</div>
-        <div class="row" style="margin-top:9px"><button class="line-btn" style="flex:1" id="run">▶ Run</button><button class="line-btn" style="flex:1" id="fix">Run &amp; fix</button></div>
-        ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
-        <div class="warn" dir="auto">${esc(DATA.runWarning || '')}</div>
-        <div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>`;
+    const rs = DATA.runStatus || {};
+    const cfg = DATA.runConfig || {};
+    const many = (DATA.targets || []).length > 1;
+    const sb = DATA.sandbox || {};
+    const folderName = (DATA.project && DATA.project.name) || 'Project';
+
+    const c = el('div', 'card');
+    const appCmd = (cfg.app && cfg.app.command) || 'npm start';
+    const testCmd = (DATA.recipe) || (cfg.test && cfg.test.command) || 'npm test';
+    const buildCmd = (cfg.build && cfg.build.command) || 'npm run build';
+    const currentCmd = state.runActionChoice === 'app' ? appCmd : state.runActionChoice === 'build' ? buildCmd : testCmd;
+
+    c.innerHTML = `<h5>Run &amp; Checks</h5>
+      <div class="run-action-bar">
+        <button class="run-act-btn ${state.runActionChoice === 'app' ? 'primary' : ''}" id="run-app" ${rs.canRunApp ? '' : 'disabled'}>▶ Run App</button>
+        <button class="run-act-btn ${state.runActionChoice !== 'app' && state.runActionChoice !== 'build' ? 'primary' : ''}" id="run" ${rs.canRunTests ? '' : 'disabled'}>🧪 Run Tests</button>
+        <button class="run-act-btn ${state.runActionChoice === 'build' ? 'primary' : ''}" id="run-build" ${rs.canBuild ? '' : 'disabled'}>🔨 Build</button>
+      </div>
+      <div class="cmd-preview-box" title="Command that will be executed">
+        <span>📁 <b>${esc(folderName)}</b>: <code style="font-size:11px">${esc(currentCmd)}</code></span>
+      </div>
+      ${rs.disabledMessage ? `<div class="disabled-banner"><b>⚠️</b><span>${esc(rs.disabledMessage)}</span></div>` : ''}
+      ${many ? `<button class="pill" id="target" style="width:100%;justify-content:space-between;margin-top:8px">${esc(DATA.targetLabel || 'choose a module')}${ICON.chev}</button>` : ''}
+      ${DATA.recipes && DATA.recipes.length ? `<button class="pill" id="recipe" style="width:100%;justify-content:space-between;margin-top:7px">${esc(DATA.recipe || 'choose a test recipe')}${ICON.chev}</button>` : ''}
+      
+      <div class="row" style="margin-top:9px">
+        <button class="line-btn" style="flex:1" id="fix">🔧 Run &amp; Fix</button>
+        <button class="line-btn" style="flex:1" id="readiness-btn">🔍 Readiness</button>
+        <button class="line-btn" id="run-config-btn" title="Edit run settings">⚙</button>
+      </div>
+
+      <label class="switch" style="margin-top:10px">
+        <input type="checkbox" id="sandboxOn" ${sb.on ? 'checked' : ''} ${sb.available ? '' : 'disabled'}> Run in Docker (optional)
+      </label>
+      <input id="sandboxImage" placeholder="image@sha256:…" value="${esc(sb.image || '')}" dir="ltr"
+        ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace;margin-top:5px">
+      <div class="meta" dir="auto">${esc(sb.note || rs.dockerNote || '')}</div>
+      ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
+      ${DATA.runInfo ? `<div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>` : ''}`;
+
+    c.querySelector('#run-app').onclick = () => {
+      state.runActionChoice = 'app';
+      send('run_app');
+    };
+    c.querySelector('#run').onclick = () => {
+      state.runActionChoice = 'tests';
+      send('run', { fix: false });
+    };
+    c.querySelector('#run-build').onclick = () => {
+      state.runActionChoice = 'build';
+      send('run_build');
+    };
+    c.querySelector('#fix').onclick = () => {
+      state.runActionChoice = 'tests';
+      send('run', { fix: true });
+    };
+    c.querySelector('#readiness-btn').onclick = () => readinessDrawer();
+    c.querySelector('#run-config-btn').onclick = () => runConfigDrawer();
+    if (c.querySelector('#recipe')) {
       c.querySelector('#recipe').onclick = () => choose('recipe', DATA.recipe, DATA.recipes);
-      if (many) c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel,
-        DATA.targets.map(row => row.label));
-      c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
-      c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
-      c.querySelector('#run').onclick = () => send('run', { fix: false });
-      c.querySelector('#fix').onclick = () => send('run', { fix: true });
-      c.querySelector('#run').disabled = c.querySelector('#fix').disabled = !DATA.canRun;
-      rail.appendChild(c);
+    }
+    if (many && c.querySelector('#target')) {
+      c.querySelector('#target').onclick = () => choose('target', DATA.targetLabel, DATA.targets.map(row => row.label));
+    }
+    c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
+    c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
+    rail.appendChild(c);
+
+    // Active Service or Last Job Failure Card
+    const lastJob = DATA.lastJob;
+    const activeSvc = (DATA.services || []).find(s => s.status === 'failed') || (DATA.services || [])[0];
+    const diag = (lastJob && lastJob.diagnosis && lastJob.diagnosis.kind !== 'none') ? lastJob.diagnosis : (activeSvc && activeSvc.diagnosis && activeSvc.diagnosis.kind !== 'none' ? activeSvc.diagnosis : null);
+    if (diag) {
+      const fixCard = el('div', 'fix-card');
+      const isBatch = DATA.repairBatch && DATA.repairBatch.status === 'in_progress';
+      fixCard.innerHTML = `<div class="summary">❌ ${esc(diag.summary)}</div>
+        <div class="suggestion">${esc(diag.suggestion || '')}</div>
+        <div style="display:flex;gap:6px;margin-top:4px">
+          ${isBatch ? `<div class="muted" style="align-self:center">Attempt ${DATA.repairBatch.current_attempt} of ${DATA.repairBatch.max_attempts} in progress…</div>
+          <button class="fix-card-btn" id="fix-stop-btn" style="background:var(--bad)">⏹ Stop</button>` : `
+          <button class="fix-card-btn" id="fix-btn-single">🔧 Fix (1 attempt)</button>
+          <button class="fix-card-btn" id="fix-btn-batch" style="background:var(--accent-hover)">⚡ Fix batch (up to 3)</button>`}
+        </div>`;
+      if (isBatch) {
+        fixCard.querySelector('#fix-stop-btn').onclick = () => send('stop');
+      } else {
+        fixCard.querySelector('#fix-btn-single').onclick = () => {
+          send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : ''), batch_approved: false });
+        };
+        fixCard.querySelector('#fix-btn-batch').onclick = () => {
+          send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : ''), batch_approved: true, max_attempts: 3 });
+        };
+      }
+      rail.appendChild(fixCard);
+    }
+
+    // App Preview Card
+    const readySvc = (DATA.services || []).find(s => s.ready && s.url);
+    if (readySvc) {
+      const prevCard = el('div', 'card preview-card');
+      prevCard.innerHTML = `<h5>App Preview</h5>
+        <div class="preview-row">
+          <span>🟢 App Ready: <a class="preview-url" href="${esc(readySvc.url)}" target="_blank">${esc(readySvc.url)}</a></span>
+          <button class="line-btn" id="btn-open-preview" style="font-size:11px">Open ↗</button>
+        </div>
+        <div class="api-tester">
+          <div style="font-size:11.5px;font-weight:600;display:flex;justify-content:space-between">
+            <span>API Request Tester</span>
+          </div>
+          <div class="api-inputs">
+            <select class="api-method" id="api-method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+              <option value="PUT">PUT</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+            <input class="api-url-input" id="api-url" value="${esc(readySvc.url)}/">
+            <button class="line-btn" id="btn-api-send" style="font-size:11px">Send</button>
+          </div>
+          <div class="api-response-box hidden" id="api-resp-box"></div>
+        </div>`;
+      prevCard.querySelector('#btn-open-preview').onclick = () => window.open(readySvc.url, '_blank');
+      prevCard.querySelector('#btn-api-send').onclick = async () => {
+        const method = prevCard.querySelector('#api-method').value;
+        const url = prevCard.querySelector('#api-url').value;
+        const box = prevCard.querySelector('#api-resp-box');
+        box.classList.remove('hidden');
+        box.textContent = 'Sending request…';
+        try {
+          const res = await api('/api/action', { type: 'api_test', method, url });
+          const r = res && res.result;
+          if (r) {
+            box.textContent = `Status: ${r.status} (${r.duration}s)\n\n${r.body || '(empty response)'}`;
+          } else {
+            box.textContent = 'No response received.';
+          }
+        } catch (err) {
+          box.textContent = 'Error: ' + err.message;
+        }
+      };
+      rail.appendChild(prevCard);
+    }
+
+    // Custom Terminal Command Section
+    if (DATA.project) {
+      const customCard = el('div', 'card custom-cmd-card');
+      customCard.innerHTML = `<h5>Run custom command</h5>
+        <div class="custom-cmd-row">
+          <input class="custom-cmd-input" id="custom-cmd-input" placeholder="e.g. mvn clean, npm run lint" />
+          <input class="custom-cmd-sub" id="custom-cmd-sub" placeholder="subdir (opt)" title="Subdirectory within project (optional)" />
+          <button class="run-act-btn primary" id="custom-cmd-run" style="flex:none;padding:6px 12px">▶ Run</button>
+          <button class="icon-btn" id="custom-cmd-fav" title="Save as favorite" style="flex:none">★</button>
+        </div>
+        <div class="cmd-chips" id="custom-cmd-chips"></div>`;
+      const inp = customCard.querySelector('#custom-cmd-input');
+      const subInp = customCard.querySelector('#custom-cmd-sub');
+      const runBtn = customCard.querySelector('#custom-cmd-run');
+      const favBtn = customCard.querySelector('#custom-cmd-fav');
+      const chipsDiv = customCard.querySelector('#custom-cmd-chips');
+      
+      const history = (DATA.cmdHistory && DATA.cmdHistory.history) || [];
+      const favorites = (DATA.cmdHistory && DATA.cmdHistory.favorites) || [];
+      favorites.forEach(fav => {
+        const chip = el('button', 'cmd-chip', `★ ${esc(fav.name || fav.command)}`);
+        chip.onclick = () => { inp.value = fav.command; subInp.value = fav.subdir || ''; };
+        chipsDiv.appendChild(chip);
+      });
+      history.slice(0, 3).forEach(h => {
+        const chip = el('button', 'cmd-chip', esc(h.command));
+        chip.onclick = () => { inp.value = h.command; subInp.value = h.subdir || ''; };
+        chipsDiv.appendChild(chip);
+      });
+
+      runBtn.onclick = () => {
+        const cmd = inp.value.trim();
+        if (!cmd) return toast('Please enter a command to run');
+        send('run_custom', { command: cmd, subdir: subInp.value.trim() });
+      };
+      favBtn.onclick = () => {
+        const cmd = inp.value.trim();
+        if (!cmd) return toast('Please enter a command first');
+        const name = prompt('Favorite name:', cmd);
+        if (name) send('save_favorite_cmd', { command: cmd, subdir: subInp.value.trim(), name });
+      };
+      rail.appendChild(customCard);
+    }
+
+    // Terminal Panel
+    if ((DATA.services && DATA.services.length) || lastJob) {
+      const termCard = el('div', 'card terminal-card');
+      const termSvc = (DATA.services || [])[0];
+      const title = termSvc ? `Service: ${termSvc.name}` : (lastJob ? `Output: ${lastJob.type}` : 'Terminal');
+      const statusBadge = termSvc ? termSvc.status : (lastJob ? (lastJob.success ? 'passed' : 'failed') : 'ready');
+      const isRunning = termSvc && (termSvc.status === 'starting' || termSvc.status === 'ready' || termSvc.status === 'running');
+
+      termCard.innerHTML = `<div class="terminal-head">
+        <div class="terminal-title">
+          <i class="dot ${isRunning ? 'run' : statusBadge === 'passed' || statusBadge === 'ready' ? 'ok' : 'bad'}"></i>
+          <span>${esc(title)}</span>
+        </div>
+        <div class="terminal-actions">
+          ${(lastJob && !lastJob.success) ? `<button id="term-debug" style="color:var(--bad-ink);background:var(--bad-bg)">🔍 Debug</button>` : ''}
+          ${isRunning ? `<button id="term-stop" title="Stop service">⏹ Stop</button>` : ''}
+          ${termSvc ? `<button id="term-restart" title="Restart service">↻ Restart</button>` : ''}
+          <button id="term-copy" title="Copy output log">📋 Copy</button>
+        </div>
+      </div>
+      <div class="terminal-box" id="term-box">
+        <pre style="margin:0;font-family:inherit;font-size:inherit;white-space:pre-wrap">${esc(lastJob && lastJob.output ? lastJob.output : (state.terminalLog || 'Waiting for output…'))}</pre>
+        <button class="terminal-jump-btn" id="term-jump">↓ Latest</button>
+      </div>`;
+
+      if (termCard.querySelector('#term-debug')) {
+        termCard.querySelector('#term-debug').onclick = () => {
+          send('diagnose_terminal', { output: lastJob.output, command: lastJob.command, exit_code: lastJob.exit_code, cwd: lastJob.cwd });
+        };
+      }
+      if (isRunning) {
+        termCard.querySelector('#term-stop').onclick = () => send('stop_app', { id: termSvc.id });
+      }
+      if (termSvc) {
+        termCard.querySelector('#term-restart').onclick = () => send('restart_app', { id: termSvc.id });
+      }
+      termCard.querySelector('#term-copy').onclick = () => {
+        const text = termCard.querySelector('pre').textContent;
+        navigator.clipboard.writeText(text);
+        toast('Terminal log copied to clipboard');
+      };
+
+      const termBox = termCard.querySelector('#term-box');
+      const jumpBtn = termCard.querySelector('#term-jump');
+      termBox.addEventListener('scroll', () => {
+        if (termBox.scrollHeight - termBox.scrollTop - termBox.clientHeight > 80) {
+          jumpBtn.classList.add('show');
+        } else {
+          jumpBtn.classList.remove('show');
+        }
+      });
+      jumpBtn.onclick = () => {
+        termBox.scrollTop = termBox.scrollHeight;
+        jumpBtn.classList.remove('show');
+      };
+
+      termBox.addEventListener('mouseup', () => {
+        const sel = window.getSelection().toString().trim();
+        if (sel && sel.length > 5) {
+          state.selectedTerminalText = sel;
+          if (!termCard.querySelector('#term-analyze-btn')) {
+            const analyzeBtn = el('button', 'solid', '🔎 Analyze selection');
+            analyzeBtn.id = 'term-analyze-btn';
+            analyzeBtn.style.fontSize = '10.5px';
+            analyzeBtn.style.padding = '2px 7px';
+            analyzeBtn.onclick = () => {
+              send('diagnose_terminal', { output: state.selectedTerminalText, is_selection: true });
+            };
+            termCard.querySelector('.terminal-actions').prepend(analyzeBtn);
+          }
+        }
+      });
+
+      // Completion Summary Box
+      if (lastJob) {
+        const summary = el('div', 'exec-summary');
+        const outcome = lastJob.success ? '✅ Passed' : '❌ Failed';
+        summary.innerHTML = `<div><b>Execution Summary:</b> ${outcome} (exit ${lastJob.exit_code}, ${lastJob.duration}s)</div>
+          <div><b>Ran:</b> <span class="mono">${esc(lastJob.command || lastJob.type)}</span></div>
+          <div><b>Working Dir:</b> <span class="mono">${esc(lastJob.cwd || '.')}</span></div>
+          <div class="step-next"><b>Next Step:</b> ${lastJob.success ? 'Service/build verified. You may proceed with testing or code changes.' : 'Check the diagnosis card below or click "Prepare fix" to repair.'}</div>`;
+        termCard.appendChild(summary);
+      }
+
+      rail.appendChild(termCard);
+    }
+
+    // On-demand Terminal Diagnosis Card
+    if (DATA.diagnosis) {
+      const diagData = DATA.diagnosis;
+      const diagCard = el('div', 'card diag-card');
+      diagCard.innerHTML = `<div class="diag-head">
+        <span>🔍 Diagnosis: ${esc(diagData.what_failed)}</span>
+        <span class="muted" style="font-size:11px">${diagData.is_selection ? 'Selection' : 'Exit ' + diagData.exit_code}</span>
+      </div>
+      <div class="diag-sec"><b>Likely Cause:</b> ${esc(diagData.likely_cause)}</div>
+      <div class="diag-sec"><b>Evidence:</b> <span class="mono">${esc(diagData.evidence)}</span></div>
+      ${diagData.facts && diagData.facts.length ? `<div class="diag-sec"><b>Confirmed Facts:</b><ul style="margin:2px 0 0 16px">${diagData.facts.map(f => `<li>${esc(f)}</li>`).join('')}</ul></div>` : ''}
+      ${diagData.uncertainties && diagData.uncertainties.length ? `<div class="diag-sec"><b>Uncertainties:</b><ul style="margin:2px 0 0 16px">${diagData.uncertainties.map(u => `<li>${esc(u)}</li>`).join('')}</ul></div>` : ''}
+      <div class="diag-sec"><b>Practical Solutions:</b>
+        ${(diagData.solutions || []).map(s => `<div class="diag-sol-item">${s.order}. <b>${esc(s.action)}</b>: ${esc(s.suggestion)}</div>`).join('')}
+      </div>
+      <div class="diag-acts">
+        <button class="primary" id="diag-prep-fix">🔧 Prepare fix</button>
+        <button id="diag-run-again">↻ Run again</button>
+        <button id="diag-copy">📋 Copy diagnosis</button>
+      </div>`;
+      
+      diagCard.querySelector('#diag-prep-fix').onclick = () => {
+        const text = `Please investigate and fix the following issue:\nCommand: ${diagData.command}\nCause: ${diagData.likely_cause}\nEvidence: ${diagData.evidence}`;
+        const promptEl = $('prompt');
+        if (promptEl) {
+          promptEl.value = text;
+          promptEl.focus();
+        }
+        toast('Fix instructions copied to message prompt');
+      };
+      diagCard.querySelector('#diag-run-again').onclick = () => {
+        if (diagData.command) send('run_custom', { command: diagData.command, subdir: '' });
+      };
+      diagCard.querySelector('#diag-copy').onclick = () => {
+        navigator.clipboard.writeText(JSON.stringify(diagData, null, 2));
+        toast('Diagnosis copied to clipboard');
+      };
+      rail.appendChild(diagCard);
     }
 
     const s = el('div', 'card');
@@ -2371,10 +2857,21 @@ function openSettings(tab) {
     models: () => `
       <div class="field"><label>Filter models by name</label><input id="filter" placeholder="qwen"></div>
       <div class="field"><label>${esc(st.model_info || '')}</label></div>`,
-    notes: () => `
-      <div class="field"><label>Project notes — sent with every task in this folder</label>
+    notes: () => {
+      const an = DATA.autoNotes || {};
+      return `
+      <div class="field"><label>Handwritten project notes — sent with every task in this folder</label>
         <textarea id="memory" ${st.project ? '' : 'disabled placeholder="Choose a project folder first."'}>${esc(st.memory || '')}</textarea>
-        <div class="hint">${esc(st.memory_info || '')}</div></div>`,
+        <div class="hint">${esc(st.memory_info || '')}</div></div>
+      <div class="hr" style="margin:14px 0"></div>
+      <div class="field">
+        <label>Automatic project summary (grounded in files and verification proofs)</label>
+        <label class="switch"><input type="checkbox" id="auto-notes-toggle" ${an.enabled ? 'checked' : ''}> Automatically observe and summarize project stack, files, and verification proofs</label>
+        <div class="hint">Updated: ${esc(an.updated_at ? new Date(an.updated_at).toLocaleString() : 'Never')}</div>
+        ${an.purpose_and_stack ? `<div class="hint"><b>Observed Stack:</b> ${esc(an.purpose_and_stack)}</div>` : ''}
+        ${an.verification_results ? `<div class="hint"><b>Verification:</b> ${esc(an.verification_results)}</div>` : ''}
+      </div>`;
+    },
     overrides: () => {
       const o = DATA.overrides || {};
       const rows = (o.rows || []).map((r) => `
@@ -2433,6 +2930,7 @@ function openSettings(tab) {
     body.querySelector('#timeout')?.addEventListener('change', (e) => send('set_timeout', { value: +e.target.value }));
     body.querySelector('#filter')?.addEventListener('input', (e) => send('set_filter', { value: e.target.value }));
     body.querySelector('#memory')?.addEventListener('change', (e) => send('save_memory', { text: e.target.value }));
+    body.querySelector('#auto-notes-toggle')?.addEventListener('change', (e) => send('toggle_auto_notes', { enabled: e.target.checked }));
     body.querySelector('#profile')?.addEventListener('change', (e) => send('set_profile', { value: e.target.value }));
     body.querySelector('#mode')?.addEventListener('change', (e) => send('set_mode', { value: e.target.value }));
     // change, not input: the endpoint is checked on the server and a rejected value must not be
@@ -2486,7 +2984,9 @@ function palette() {
     ['Open a project folder', () => send('pick_project')],
     ['New project folder', () => send('new_project')], ['Attach a plan', () => send('pick_plan')],
     ['Try the sample project', () => send('example')],
-    ['Ask your last message again', askAgain],
+  ];
+  if (lastAsked()) commands.push(['Ask your last message again', askAgain]);
+  commands.push(
     ['Run the project command', () => send('run', { fix: false })],
     ['Run and fix', () => send('run', { fix: true })], ['Check syntax', () => send('verify')],
     ['Roll back changes', () => send('rollback')], ['Apply changes', () => send('apply')],
@@ -2494,7 +2994,7 @@ function palette() {
     ['Style: Claude warm', () => setStyle('claude')], ['Style: Codex charcoal', () => setStyle('codex')],
     ['Style: Linear indigo', () => setStyle('linear')], ['Theme: light', () => { state.themeMode = 'light'; applyThemeMode(); renderThemePick(); }],
     ['Theme: dark', () => { state.themeMode = 'dark'; applyThemeMode(); renderThemePick(); }],
-  ];
+  );
   let shown = commands.slice(), at = 0;
   function draw() {
     list.innerHTML = '';
@@ -2584,7 +3084,35 @@ $('seg').addEventListener('click', (e) => { const b = e.target.closest('button')
 $('new-chat').onclick = () => send('new_chat');
 $('collapse').onclick = toggleSidebar;
 $('sidebar-expand').onclick = toggleSidebar;
-$('attach-top').onclick = () => send('pick_plan');
+if ($('attach-top')) $('attach-top').onclick = () => send('pick_plan');
+if ($('app-settings-btn')) $('app-settings-btn').onclick = openSettings;
+
+const scroller = $('scroller');
+const jumpBtn = $('jump-latest');
+if (scroller && jumpBtn) {
+  scroller.addEventListener('scroll', () => {
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 180) {
+      jumpBtn.classList.add('show');
+    } else {
+      jumpBtn.classList.remove('show');
+    }
+  });
+  jumpBtn.onclick = () => {
+    toBottom(scroller);
+    jumpBtn.classList.remove('show');
+  };
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (DATA && DATA.busy) {
+    const proj = (DATA.project && DATA.project.name) || 'the active project';
+    const msg = `Tasks are still running in ${proj}. Are you sure you want to leave?`;
+    e.preventDefault();
+    e.returnValue = msg;
+    return msg;
+  }
+});
+
 $('search').addEventListener('input', (e) => { state.query = e.target.value; renderNav(); });
 $('prompt').addEventListener('input', () => {
   autosize();

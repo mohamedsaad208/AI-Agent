@@ -2934,8 +2934,8 @@ class QueueTests(unittest.TestCase):
 
     def test_the_snapshot_describes_the_strip(self):
         payload = self.controller.snapshot()["queue"]
-        self.assertEqual(sorted(payload), ["elsewhere", "elsewhere_note", "held", "held_note",
-                                           "items", "when", "when_detached", "when_restored"],
+        self.assertEqual(sorted(payload), ["chat", "elsewhere", "elsewhere_note", "held", "held_note",
+                                           "items", "kind", "when", "when_detached", "when_restored"],
                          "the strip needs identity, state and the server's own sentences")
         self.assertEqual(payload["items"], [])
         self.assertFalse(payload["held"])

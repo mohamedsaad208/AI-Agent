@@ -14,7 +14,7 @@
   --mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
   --side-w: 270px;
   --rail-w: 322px;
-  --thread-w: 760px;
+  --thread-w: 980px;
   /* The spacing scale. Every gap in the chat is one of these, so "compact" is a decision in one place
      rather than two hundred magic numbers that drift apart between rounds. */
   --sp-1: 4px; --sp-2: 7px; --sp-3: 12px; --sp-4: 18px; --sp-5: 26px;

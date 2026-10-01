@@ -118,7 +118,7 @@ assert.ok(!tasksTab.html.includes('unread-dot'), 'Active Tasks tab does not show
 // Check sequential controls button before start
 const seqBtns = find(context.$('rail'), 'plan-seq-btn');
 assert.equal(seqBtns.length, 1, 'Sequential execution button rendered');
-assert.ok(seqBtns[0].html.includes('بدء التنفيذ التتابعي'), 'Start sequential button label present');
+assert.ok(seqBtns[0].html.includes('Start sequential'), 'Start sequential button label present');
 
 // Start sequential execution
 seqBtns[0].onclick();
@@ -130,7 +130,7 @@ context.renderRail();
 const stopBtns = find(context.$('rail'), 'plan-seq-btn');
 assert.equal(stopBtns.length, 1);
 assert.ok(stopBtns[0].cls.includes('running'), 'Sequential button has running class');
-assert.ok(stopBtns[0].html.includes('إيقاف التنفيذ التتابعي'), 'Stop sequential button label present');
+assert.ok(stopBtns[0].html.includes('Stop sequential'), 'Stop sequential button label present');
 
 // Click stop button
 stopBtns[0].onclick();
