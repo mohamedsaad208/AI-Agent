@@ -2165,13 +2165,19 @@ class AgentController:
                 else:
                     row = planbook.current(book)
                     if row is None:
-                        raise PolicyError("Every step of this plan is already verified by a passing run.")
-                    step_id = row["id"]
-                task = planbook.task_for(book, row, task if (task and task != row.get("title")) else "")
+                        if not asked:
+                            raise PolicyError("Every step of this plan is already verified by a passing run.")
+                        chained_plan = False
+                        self.plan_file = ""
+                    else:
+                        step_id = row["id"]
+                if chained_plan and row is not None:
+                    task = planbook.task_for(book, row, task if (task and task != row.get("title")) else "")
             except (AgentError, OSError) as exc:
-                self.status = friendly_error(exc)
+                self.say(friendly_error(exc))
                 return
-            self.ledger_path, self.ledger = ledger_path, book
+            if chained_plan:
+                self.ledger_path, self.ledger = ledger_path, book
         prior = self._unverified_prior(self.chat_id, repo)
         if prior:
             note = shared_note("prior_write", arabic=self.arabic,
