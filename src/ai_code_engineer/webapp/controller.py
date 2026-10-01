@@ -8,14 +8,11 @@ front-end and block until it answers.
 """
 from __future__ import annotations
 
-import ctypes
 import copy
-import difflib
 import json
 import os
 import re
 import secrets
-import shlex
 import subprocess
 import sys
 import time
@@ -26,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from ..catalog import LIVE, models_for
-from ..chat import (context_block, context_use, create_chat, load_chat, project_of, respond,
+from ..chat import (context_block, create_chat, load_chat, project_of, respond,
                     title_for)
 from .. import config
 from .. import service_runner
@@ -44,7 +41,7 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIEL
                       executing_line, friendly_error, fix_offers_off_line, is_arabic,
                       log_dropped_line, log_line,
                       no_branch_note, no_checkpoint_note,
-                      queue_notes, quote_reference, rejected_note,
+                      quote_reference, rejected_note,
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
                       say, state_label,
                       status_text, step_has_detail, step_line, step_missing_line,
@@ -55,44 +52,14 @@ from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
 from .. import (git_integration, host, ignore, intent, modes, overrides, planbook, repair,
-                runner, setup, symbols)
+                runner, session_flow, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
+from . import connection, projects, requestqueue, runresults, uistate
 
-DEFAULT_MODEL = "qwen2.5-coder:1.5b"
-RECOMMENDED = {
-    "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
-    "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
-}
-
-
-def _mode_rows() -> tuple[tuple[str, config.Kind], ...]:
-    """One row per provider the windows offer, as ``(label, kind)``.
-
-    OpenRouter is two rows on purpose: its free list and its paid list differ in what they cost,
-    which is a decision the user makes per task, not a setting. Every other row is one provider.
-    """
-    rows = []
-    for kind in config.KINDS:
-        if kind.free_only:
-            rows.append((f"{kind.label} \u00b7 Free", kind))
-            rows.append((f"{kind.label} \u00b7 Paid", kind))
-        else:
-            rows.append((kind.label, kind))
-    return tuple(rows)
-
-
-MODE_ROWS = _mode_rows()
-MODES = tuple(label for label, _ in MODE_ROWS)
-MODE_KIND = dict(MODE_ROWS)
-
-
-def free_mode(kind: config.Kind) -> str:
-    return f"{kind.label} \u00b7 Free"
-
-
-def paid_mode(kind: config.Kind) -> str:
-    return f"{kind.label} \u00b7 Paid"
+# The provider rows and the recommended models are the table's (`config.py`), not this window's:
+# a second copy of `MODES` was how the web window and Tk ended up disagreeing about a provider's
+# name once already, and `test_connection` now refuses to let the copy come back.
 PLAN_SUFFIXES = (".md", ".txt")
 # A sidebar entry is a branch, and a branch is the only thing that owns a folder. "chat" never
 # has one unless a project was bound to it by name, so the program cannot start pointed at a
@@ -188,16 +155,6 @@ def asks_for_a_change(text: str) -> bool:
 
 def _clock() -> str:
     return datetime.now().strftime("%H:%M")
-
-
-def _queued_request(item: dict) -> tuple[str, str]:
-    """Keep structured requests intact; decode the composed text of older queues."""
-    text = item.get("text", "")
-    asked, reference = item.get("asked"), item.get("reference")
-    if isinstance(asked, str) and isinstance(reference, str) and reference + asked == text:
-        return asked, reference
-    asked = asked_of(text)
-    return asked, text[:-len(asked)] if asked else ""
 
 
 class LineFeed:
@@ -327,7 +284,7 @@ class AgentController:
         self.request_timeout = config.REQUEST_TIMEOUT_DEFAULT
         self.recipe = ""
         self.run_info = "No command has run yet."
-        self.catalogs: dict[str, list[dict]] = {mode: [] for mode in MODES}
+        self.catalogs: dict[str, list[dict]] = {mode: [] for mode in config.MODES}
         self.selections: dict[str, str] = {}
         self.active_mode = "Ollama"
         self.busy = False
@@ -452,17 +409,9 @@ class AgentController:
             self._pending_model = self._saved_ui["model"]
         # A batch outlives the window that typed it, but it does not resume itself: a queued change
         # request can be pointed at files that moved on since it was written, so every restored row
-        # is held until the operator presses ▶, and carries the sentence that says why.
-        saved_queue = self._saved_ui.get("queue")
-        if isinstance(saved_queue, list):
-            for item in saved_queue[:20]:
-                if (isinstance(item, dict) and isinstance(item.get("text"), str)
-                        and item["text"].strip() and len(item["text"]) <= MAX_TASK_CHARS):
-                    # Migrate older queues whose text already contains the frozen quotation.
-                    asked, reference = _queued_request(item)
-                    self.queue.append({**item, "asked": asked, "reference": reference,
-                                       "restored": True})
-            self._queue_held = bool(self.queue)
+        # is held until the operator presses the strip's ▶, and carries the sentence that says why.
+        self.queue.extend(requestqueue.restore(self._saved_ui.get("queue")))
+        self._queue_held = bool(self.queue)
         last = self._saved_ui.get("last_project")
         if isinstance(last, str) and last and Path(last).is_dir():
             self.projects.setdefault(project_key(last), str(Path(last).resolve()))
@@ -678,19 +627,18 @@ class AgentController:
         task = reference + asked if reference else self.with_quote(asked, quote_of)
         if not asked:
             return
-        if len(task) > MAX_TASK_CHARS:
+        if requestqueue.too_long(task):
             self._add("tool", "Tool", say(self.arabic,
                       en=f"That message is longer than {MAX_TASK_CHARS:,} characters, so it was "
                          "not queued.",
                       ar="هذه الرسالة أطول من ٤٠٠٠ حرف، لذلك لم تُضَف إلى قائمة الانتظار."))
             return
-        if any(item.get("text") == task and item.get("chat") == self.chat_id for item in self.queue):
+        if requestqueue.is_duplicate(self.queue, task, self.chat_id):
             self._queue_held = False
             return                       # the same message twice in a row is one queue line
-        self.queue.append({"id": uuid.uuid4().hex[:8], "text": task, "asked": asked,
-                           "reference": task[:-len(asked)], "chat": self.chat_id,
-                           "branch": str(self.branch.get("key") or ""),
-                           "project": self.repo, "at": _clock()})
+        self.queue.append(requestqueue.row(
+            task=task, asked=asked, chat=self.chat_id,
+            branch=str(self.branch.get("key") or ""), project=self.repo, at=_clock()))
         self._queue_held = False
         # The message is on its way either way, so the confirmation is the server's — and it goes
         # out as the toast event the client already handles but nothing had ever sent.
@@ -705,10 +653,7 @@ class AgentController:
     def queue_edit(self, item_id: str, text: str) -> None:
         for item in self.queue:
             if item.get("id") == item_id:
-                item["text"] = (text or "").strip()[:MAX_TASK_CHARS]
-                item["asked"] = asked_of(item["text"])
-                item["reference"] = (item["text"][:-len(item["asked"])]
-                                     if item["asked"] else "")
+                requestqueue.apply_edit(item, text)
         self._queue_held = False
         self._save_state()
         self._emit({"kind": "state", "data": self.snapshot()})
@@ -721,10 +666,7 @@ class AgentController:
     def queue_now(self, item_id: str) -> None:
         """Move one item to the front. With the queue already running this is the whole of
         "run this one next", and dropping a held queue with it is what ▶ resumes."""
-        ids = [item.get("id") for item in self.queue]
-        if item_id in ids:
-            item = self.queue.pop(ids.index(item_id))
-            self.queue.insert(0, item)
+        self.queue = requestqueue.to_front(self.queue, item_id)
         self._release_restored()
         self._queue_held = False
         self._drain_queue()
@@ -733,15 +675,10 @@ class AgentController:
     def queue_detached(self, item_id: str) -> None:
         """Take an item out of this conversation and ask it in a chat of its own.
 
-        The branch cannot move while a job runs — `_select_branch` refuses so a chained apply
-        cannot find itself pointed at another folder — so an item detached mid-task waits for the
-        moment the switch is allowed, and then opens there. It never runs in the chat it left.
+        The row goes to the front with `detached` set and no chat of its own, so the drain asks it
+        in a thread of its own the moment a switch is allowed — never in the conversation it left.
         """
-        for index, item in enumerate(self.queue):
-            if item.get("id") == item_id:
-                self.queue.pop(index)
-                self.queue.insert(0, {**item, "detached": True, "chat": ""})
-                break
+        self.queue = requestqueue.detach(self.queue, item_id)
         self._queue_held = False
         self._drain_queue()
         self._emit({"kind": "state", "data": self.snapshot()})
@@ -753,13 +690,9 @@ class AgentController:
         self._emit({"kind": "state", "data": self.snapshot()})
 
     def _release_restored(self) -> None:
-        """A press on the strip is the approval a restored row was waiting for.
-
-        It covers every row rather than the one clicked, because the batch is the unit the operator
-        is resuming: pressing ▶ beside "2 waiting" and having one of them run is the surprise.
-        """
-        for item in self.queue:
-            item.pop("restored", None)
+        """A press on the strip is the approval a restored row was waiting for, for the whole
+        batch rather than the one row clicked — see `requestqueue.release_restored`."""
+        requestqueue.release_restored(self.queue)
 
     def _drain_queue(self) -> None:
         """Start the next queued message whose conversation is the one in front.
@@ -822,7 +755,7 @@ class AgentController:
             self._draining = False
 
     def _start_queued(self, item: dict) -> None:
-        asked, reference = _queued_request(item)
+        asked, reference = requestqueue.split_request(item)
         if reference:
             self.start_plan(asked, reference=reference)
         else:
@@ -830,7 +763,7 @@ class AgentController:
 
     def _open_batch_row(self, item: dict) -> None:
         """Start recording the queued task that was just taken out of the queue."""
-        first = (_queued_request(item)[0].strip().splitlines() or [""])
+        first = (requestqueue.split_request(item)[0].strip().splitlines() or [""])
         self._batch_row = {"task": (first[0] if first else "")[:60], "paths": []}
         self._batch.append(self._batch_row)
 
@@ -856,27 +789,11 @@ class AgentController:
     def _queue_view(self) -> dict:
         """What the strip shows: the messages, and whether they are held.
 
-        The sentences are built here for the same reason the banner's are: the client cannot tell
-        what language the task was asked in, and a strip that mixed English status lines into an
-        Arabic conversation would be the drift this project keeps having to undo.
-
-        Items queued for another conversation stay in the list — they belong to that chat and will
-        run when the user goes back to it — but they are not drawn here, because an invisible line
-        that fires later is exactly the surprise this strip exists to avoid.
+        The shape and its sentences come from `requestqueue.view`; this only hands it the state the
+        window is standing on, including whether a question is holding a worker right now.
         """
-        here = [{"id": item.get("id", ""), "text": item.get("text", ""),
-                 "detached": bool(item.get("detached")), "at": item.get("at", ""),
-                 "restored": bool(item.get("restored"))}
-                for item in self.queue if item.get("chat") == self.chat_id or item.get("detached")]
-        other_items = [item for item in self.queue
-                       if item.get("chat") not in {self.chat_id, ""} and not item.get("detached")]
-        elsewhere = len(other_items)
-        first_other = other_items[0] if other_items else None
-        target_chat = first_other.get("chat") if first_other else None
-        target_kind = "chat" if (target_chat and str(target_chat).startswith("c-")) else "session"
-        return {"items": here, "held": bool(self._queue_held), "elsewhere": elsewhere,
-                "chat": target_chat, "kind": target_kind,
-                **queue_notes(self.arabic, elsewhere, bool(self._replies))}
+        return requestqueue.view(self.queue, chat=self.chat_id, held=self._queue_held,
+                                 arabic=self.arabic, ask_pending=bool(self._replies))
 
     def join(self, timeout: float = 60.0) -> None:
         """Wait for every started job — including one a completion started behind it.
@@ -1018,7 +935,7 @@ class AgentController:
             # to be visible or every refusal below looks like a bug.
             "declared": self._declared_info(),
             "plan": plan_info,
-            "provider": {"mode": self.mode, "modes": list(MODES), "model": self.model,
+            "provider": {"mode": self.mode, "modes": list(config.MODES), "model": self.model,
                          "models": self.visible_models(), "metrics": self._metrics_info()},
             # The whole connection row: a drawer that offered a provider without saying where it
             # points, or whether it wants a key, could only be filled by trial and error.
@@ -1167,27 +1084,8 @@ class AgentController:
         return handler()
 
     def list_dir(self, path: str, want_files=None) -> dict:
-        root = Path(path or Path.home())
-        if not root.is_dir():
-            root = Path.home()
-        dirs, files = [], []
-        for entry in sorted(root.iterdir(), key=lambda p: p.name.casefold()):
-            try:
-                if entry.is_dir():
-                    if not _hidden(entry) and not ignore.picker_dir(entry.name):
-                        dirs.append(entry)
-                elif want_files:
-                    want_set = {str(s).lower() if str(s).startswith(".") else "." + str(s).lower() for s in want_files}
-                    if entry.suffix.lower() in want_set:
-                        files.append(entry)
-            except OSError:
-                continue
-        # A drive root has no parent, so without the drive list the picker is a dead end on C: and
-        # a project on another disk cannot be reached at all.
-        return {"path": str(root), "parent": str(root.parent) if root.parent != root else None,
-                "roots": drive_roots(),
-                "dirs": [{"name": p.name, "path": str(p)} for p in dirs[:400]],
-                "files": [{"name": p.name, "path": str(p)} for p in files[:400]]}
+        """One directory level for the in-page picker — see `projects.listing` for the rules."""
+        return projects.listing(path, want_files)
 
     # --------------------------- selection setters ---------------------------
     def _select_branch(self, kind: str, key: str = "", *, chat_id: str | None = None,
@@ -1569,7 +1467,7 @@ class AgentController:
         self.refresh_plan_status()
 
     def set_mode(self, value: str) -> None:
-        if value not in MODES:
+        if value not in config.MODES:
             return
         with self._state:
             self.selections[self.active_mode] = self.model
@@ -1584,11 +1482,11 @@ class AgentController:
 
     # ------------------------------- connection -------------------------------
     def active_kind(self) -> config.Kind:
-        return MODE_KIND.get(self.mode, config.DEFAULT_KIND)
+        return config.MODE_KIND.get(self.mode, config.DEFAULT_KIND)
 
     def endpoint_for(self, mode: str = "") -> str:
         """Where this provider row actually is — typed value, saved value, or its own default."""
-        kind = MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
+        kind = config.MODE_KIND.get(mode or self.mode, config.DEFAULT_KIND)
         return self.endpoints.get(kind.key, "") or config.default_endpoint(kind, self.app_dir)
 
     def set_endpoint(self, value: str) -> None:
@@ -1610,7 +1508,7 @@ class AgentController:
                 except AgentError as exc:
                     self.status = friendly_error(exc)
                     return
-            for label, row in MODE_ROWS:
+            for label, row in config.mode_rows():
                 if row is kind:
                     self.catalogs[label] = []
                     self.catalog_source.pop(label, None)
@@ -1659,27 +1557,17 @@ class AgentController:
     def connection_info(self) -> dict:
         kind = self.active_kind()
         endpoint = self.endpoint_for()
-        needs_consent = config.needs_consent(kind, endpoint)
-        return {"kind": kind.key, "label": kind.label, "endpoint": endpoint,
-                "default_endpoint": config.default_endpoint(kind, self.app_dir), "cloud": kind.cloud,
-                "shape": kind.shape,
-                "needs_key": kind.needs_key, "key_env": kind.key_env or "",
-                "consent": needs_consent, "paid": self.mode.endswith(" \u00b7 Paid"),
-                "profile": self.profile, "profiles": self.available_profiles(),
-                "source": self.catalog_source.get(self.mode, ""),
-                "key_present": bool(self.key.strip() or os.environ.get(kind.key_env or ""))}
+        return connection.info(kind=kind, mode=self.mode, endpoint=endpoint,
+                               default_endpoint=config.default_endpoint(kind, self.app_dir),
+                               profile=self.profile, profiles=self.available_profiles(),
+                               source=self.catalog_source.get(self.mode, ""),
+                               key_present=bool(self.key.strip()
+                                                or os.environ.get(kind.key_env or "")))
 
     def cloud_choice(self) -> tuple[bool, bool]:
-        """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths.
-
-        Two things can make a task leave the device: the provider row itself, and a model entry the
-        catalog marked cloud (an Ollama "cloud" tag answers over the internet from a local URL).
-        """
-        kind = self.active_kind()
-        entry = self.selected_entry()
-        paid = kind.free_only and self.mode == paid_mode(kind)
-        cloud = config.needs_consent(kind, self.endpoint_for()) or bool(entry and entry.get("cloud"))
-        return cloud, paid
+        """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths."""
+        return connection.cloud_choice(self.active_kind(), self.mode, self.selected_entry(),
+                                       self.endpoint_for())
 
     def task_settings(self, cloud: bool) -> Settings | None:
         """The Settings for a task on the current row, or None with the reason on the status line.
@@ -1774,20 +1662,11 @@ class AgentController:
     def visible_models(self, mode: str | None = None) -> list[dict]:
         """The catalog as filtered — a view, never a mutation of what was loaded.
 
-        ``filter_models`` used to write the subset back into ``self.catalogs``, so searching the
-        list cost you every dropped entry until the next Refresh, and then cleared ``self.model``
-        when the query stopped matching it: typing three letters could deselect the model running
-        your task.
+        See `connection.filter_models` for why the subset is a new list and why a search cannot
+        deselect the model a running task is using.
         """
-        query = self.model_filter.strip().casefold()
-        entries = self.catalogs.get(mode if mode is not None else self.mode, [])
-        if not query:
-            return list(entries)
-        kept = [entry for entry in entries
-                if query in " ".join([entry.get("id", ""), entry.get("name", ""),
-                                      entry.get("description", "")]).casefold()]
-        kept.sort(key=lambda entry: entry.get("id") != DEFAULT_MODEL)
-        return kept
+        return connection.filter_models(
+            self.catalogs.get(mode if mode is not None else self.mode, []), self.model_filter)
 
     def model_changed(self) -> None:
         self.selections[self.mode] = self.model
@@ -1795,18 +1674,10 @@ class AgentController:
         self._save_state()
 
     def _model_info(self) -> str:
-        entry = self.selected_entry()
-        if entry:
-            text = entry["name"] + " — " + entry["description"]
-            if entry["id"] in RECOMMENDED:
-                text += " · ★ " + RECOMMENDED[entry["id"]]
-            return text
-        loaded = len(self.catalogs.get(self.mode, []))
-        shown = len(self.visible_models())
-        if shown != loaded:
-            return (f"{shown} of {loaded} models match \"{self.model_filter.strip()}\". "
-                    "Clear the filter to see the rest.")
-        return f"{loaded} models available at {self.endpoint_for()}. Select one from the list."
+        return connection.model_info(self.selected_entry(),
+                                     loaded=len(self.catalogs.get(self.mode, [])),
+                                     shown=len(self.visible_models()),
+                                     query=self.model_filter, endpoint=self.endpoint_for())
 
     def check_setup(self) -> None:
         """Ask the selected provider what it has. Read-only: no code leaves, no token is generated."""
@@ -1829,8 +1700,8 @@ class AgentController:
             catalog = self.catalogs.get(self.mode, [])
             if pending and not self.model and any(entry["id"] == pending for entry in catalog):
                 self.model = pending
-            elif not self.model and any(entry["id"] == DEFAULT_MODEL for entry in catalog):
-                self.model = DEFAULT_MODEL
+            elif not self.model and any(entry["id"] == config.DEFAULT_MODEL for entry in catalog):
+                self.model = config.DEFAULT_MODEL
             self.model_changed()
             self.status = catalog_status_line(arabic=self.arabic, count=len(catalog),
                                               model=self.model, label=selected_mode,
@@ -1956,45 +1827,20 @@ class AgentController:
                 "toolchain": self._toolchain_info(path, key, exists)}
 
     def _context_use(self, path: Path, key: str, notes: str) -> dict:
-        """Map, conversation and what is left, against the configured context budget."""
-        settings = Settings()
-        blank = {"system": 0, "context": 0, "turns": 0, "kept": 0, "used": len(notes),
-                 "budget": settings.context_chars, "remaining": settings.context_chars,
-                 "est_tokens": 0, "map": 0, "notes": len(notes), "files": 0, "bound": False}
-        if not path.is_dir():
-            return blank
-        try:
-            repo = Workspace(path)
-            text = repo.repo_map()
-            files = len(repo.files(limit=symbols.MAX_FILES))
-        except (PolicyError, OSError):
-            return blank
-        # Only a conversation that reads this folder can spend its budget here.
+        """Map, conversation and what is left — see `projects.context_use`.
+
+        Only a conversation that reads this folder can spend its budget here, which is the one thing
+        this side has to answer before the measurement is taken.
+        """
         chat = self.chat if self.branch.get("key") == key and self.chat else None
-        context = context_block(text, notes) if text or notes else ""
-        use = context_use(chat, settings, context)
-        return {**use, "map": len(text), "notes": len(notes), "files": files,
-                "bound": bool(chat)}
+        return projects.context_use(path, notes, chat)
 
     def _toolchain_info(self, path: Path, key: str, exists: bool) -> dict:
-        if not exists:
-            return {"detected": [], "selected": "", "timeout": 0, "proof": "",
-                    "request_timeout": self.request_timeout}
-        detected = runner.detect(path)
-        # ``self.recipe`` is a label chosen for the branch in front of the user; another
-        # project's drawer can only report what would be picked by default.
-        selected = self.selected_recipe() if self.branch.get("key") == key else None
-        selected = selected or (detected[0] if detected else "")
-        entry = runner.RECIPES.get(selected) or {}
-        writes_report = bool(entry.get("reports") or entry.get("junit_arg"))
-        return {"detected": [{"name": name, "label": runner.RECIPES[name]["label"],
-                              "command": shlex.join(runner.RECIPES[name]["command"])}
-                             for name in detected],
-                "selected": selected,
-                "timeout": runner.timeout_for(selected) if selected else 0,
-                "proof": (entry.get("proof_source", "JUnit XML report") if writes_report
-                          else "the command's own summary line") if selected else "",
-                "request_timeout": self.request_timeout}
+        # ``self.recipe`` is a label chosen for the branch in front of the user; another project's
+        # drawer can only report what would be picked by default.
+        return projects.toolchain(path, exists=exists, request_timeout=self.request_timeout,
+                                  selected_hint=(self.selected_recipe()
+                                                 if self.branch.get("key") == key else None))
 
     def reveal(self, key: str) -> None:
         """Show a granted project folder in the file manager.
@@ -2484,7 +2330,8 @@ class AgentController:
             try:
                 return respond(chat, provider, task, settings, self.chats,
                                context=self._chat_context(repo),
-                               on_token=(feed.feed if feed else None))
+                               on_token=(feed.feed if feed else None),
+                               cancelled=self.cancel_event.is_set)
             finally:
                 if feed:
                     feed.close()
@@ -2499,7 +2346,7 @@ class AgentController:
 
         typed = asked or asked_of(task)
         reference = task[:-len(typed)] if typed else ""
-        self.run_job(work, done, "Thinking…",
+        self.run_job(work, done, "Thinking…", cancellable=True,
                      on_busy=lambda: self.queue_add(typed, reference=reference))
 
     def _chat_project(self) -> dict | None:
@@ -2977,14 +2824,10 @@ class AgentController:
             self.refresh_recipes()
 
     def target_label(self) -> str:
-        return next((row["label"] for row in self.targets if row["path"] == self.target), "")
+        return session_flow.label_for(self.targets, self.target)
 
     def selected_recipe(self) -> str | None:
-        labels = [runner.RECIPES[name]["label"] for name in self.recipes]
-        try:
-            return self.recipes[labels.index(self.recipe)]
-        except ValueError:
-            return None
+        return session_flow.recipe_for(self.recipes, self.recipe)
 
     # The only states that lock the Run control: work in front of the user that has not been written
     # yet. Every other state -- including a task that blocked, cancelled or rolled back, and a folder
@@ -2993,51 +2836,23 @@ class AgentController:
     RUN_LOCKED_STATES = {"DISCOVERING", "WAITING_APPROVAL"}
 
     def run_status_info(self) -> dict:
+        """Whether each Run control is pressable — the answer `runresults.gate` builds from what
+        this window holds, because the gate is presentation and the state underneath it is ours."""
         state = self.session.get("state") if self.session else ""
-        reasons = []
-        has_project = bool(self.repo and Path(self.repo).is_dir())
-        if not has_project:
-            reasons.append({
-                "code": "no_project",
-                "title": "No project selected",
-                "action": "Select or open a project folder in the sidebar."
-            })
-        if self.busy:
-            reasons.append({
-                "code": "agent_busy",
-                "title": "Agent is busy",
-                "action": "Wait for the current operation to complete or press Stop."
-            })
-        if state in self.RUN_LOCKED_STATES:
-            reasons.append({
-                "code": "waiting_approval",
-                "title": "Changes waiting for approval",
-                "action": "Review the pending changes and click Apply or Rollback before running."
-            })
-
-        can_run_general = has_project and not self.busy and state not in self.RUN_LOCKED_STATES
-        can_run_app = can_run_general
-        can_run_tests = can_run_general and bool(self.recipes)
-        can_build = can_run_general
-        disabled_msg = (reasons[0]["title"] + ": " + reasons[0]["action"]) if reasons else ""
-
-        docker_avail = runner.sandbox_available()
-        return {
-            "canRun": can_run_general,
-            "canRunApp": can_run_app,
-            "canRunTests": can_run_tests,
-            "canBuild": can_build,
-            "reasons": reasons,
-            "disabledMessage": disabled_msg,
-            "dockerAvailable": docker_avail,
-            "dockerOn": bool(self.sandbox_on and docker_avail),
-            "dockerNote": "Docker is optional. Local execution runs directly using your system tools.",
-        }
+        return runresults.gate(
+            has_project=bool(self.repo and Path(self.repo).is_dir()),
+            busy=self.busy,
+            waiting_approval=state in self.RUN_LOCKED_STATES,
+            has_recipes=bool(self.recipes),
+            sandbox_requested=self.sandbox_on,
+            docker_available=runner.sandbox_available())
 
     def _can_run(self) -> bool:
         state = self.session.get("state") if self.session else ""
-        return (not self.busy and bool(self.recipes) and bool(self.repo)
-                and Path(self.repo).is_dir() and state not in self.RUN_LOCKED_STATES)
+        return runresults.can_run(has_project=bool(self.repo and Path(self.repo).is_dir()),
+                                  busy=self.busy,
+                                  waiting_approval=state in self.RUN_LOCKED_STATES,
+                                  has_recipes=bool(self.recipes))
 
     def sandbox_info(self) -> dict:
         """The container choice as the card draws it: the two values, whether this machine can honour
@@ -3108,8 +2923,13 @@ class AgentController:
                                     action="executing", fields={"command": command})
 
         def work():
-            result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=self._build_line, target=target, sandbox=sandbox)
+            try:
+                result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
+                                    progress=self._build_line, target=target, sandbox=sandbox,
+                                    cancelled=self.cancel_event.is_set)
+            except TypeError:
+                result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
+                                    progress=self._build_line, target=target, sandbox=sandbox)
             return (repair.record_run(path, result) if recordable else None), result
 
         def done(pair):
@@ -3122,40 +2942,20 @@ class AgentController:
                 self._add("tool", "Checks",
                           run_unrecorded_line(arabic=self.arabic, project=Path(repo).name))
 
-        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
+        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""),
+                     cancellable=True)
 
     def report_run(self, result) -> None:
         self._last_job = {"type": "tests", **result}
         summary = runner.summarize(result)
         self.run_info = summary
         self._settle_run_step(result)
+        # One row either way: the sentence is `runresults`' business, the state under it is ours.
+        self._add("tool", "Checks", runresults.result_row(result, summary))
         if result["status"] == "passed":
-            self._add("tool", "Checks", "✅ " + summary)
             self._auto_fix = False
             self.status = status_text("command_passed", arabic=self.arabic) + summary
         else:
-            # A tool row is plain text — the thread escapes it and never runs markdown — and the
-            # pill collapses newlines, so this line has to read as one sentence with no markup.
-            # And this row is built from the raw runner result rather than the slimmed record the
-            # session stores, and `runner` does not scrub: the two other paths that show command
-            # output redact it (`repair.record_run` for storage and the model, `_build_line` for the
-            # stream). A test that prints its own connection string must not find the chat to do it
-            # in — every row here can be copied out with one click.
-            msg = "❌ " + summary + " — command: " + redact(str(result.get("command", "")))
-            failures = result.get("failures") or []
-            if failures:
-                msg += (" · Errors: " + " | ".join(redact(str(f).strip())
-                                                   for f in failures[:repair.FAILURES_KEPT]))
-            elif result.get("reason"):
-                msg += " · Reason: " + redact(str(result["reason"]))
-            elif result.get("tail"):
-                err_lines = [l.strip() for l in result["tail"].strip().splitlines()
-                             if "[ERROR]" in l or "Error" in l or "Exception" in l]
-                sample = err_lines[-6:] or [l.strip() for l in result["tail"].strip().splitlines()][-6:]
-                if sample:
-                    msg += " · Output: " + " | ".join(redact(line) for line in sample)
-            msg += " · The full output is in Activity."
-            self._add("tool", "Checks", msg)
             if self._auto_fix and result["status"] in {"failed", "timeout"}:
                 self.ask_for_fix(result)
                 return
@@ -3462,17 +3262,12 @@ class AgentController:
         return memory_store.read_auto_notes(self.memory_dir, self.repo)
 
     def round_history(self) -> list:
-        """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window
-        only knows where its own chat lives."""
-        if not self.session:
-            return []
-        return repair.round_history(self.runs, self.session["root"], self.chat_id)
+        """Every attempt in this chat and folder, oldest first."""
+        return session_flow.attempt_history(self.runs, self.session, self.chat_id)
 
     def fix_rounds(self) -> list:
-        """The attempt rows the offer, the stop line and the report all read: what ran, what it cost."""
-        if not self.session:
-            return []
-        return repair.attempts_of(self.runs, self.session["root"], self.chat_id)
+        """The attempt rows the offer, the stop line and the report all read."""
+        return session_flow.attempt_rows(self.runs, self.session, self.chat_id)
 
     def _show_rounds(self) -> None:
         """Put the attempts on record where they stay readable after the round counter has moved on."""
@@ -3596,17 +3391,16 @@ class AgentController:
 
     # ------------------------------ plan ledger ------------------------------
     def ledger_for(self, session: dict) -> tuple[Path, dict] | None:
-        reference, step_id = session.get("plan_reference"), session.get("plan_step")
-        if not reference or step_id is None:
+        """The ledger a stored session belongs to, or None when it is not a plan step.
+
+        Which pair this window is standing on is state, so it is recorded here; the rule that decides
+        whether a ledger may be trusted at all is `session_flow.ledger_for`, shared with Tk.
+        """
+        found = session_flow.ledger_for(self.plans, session)
+        if found is None:
             return None
-        try:
-            path, book = planbook.open_book(self.plans, Workspace(Path(session["root"])), reference["path"])
-        except (AgentError, OSError):
-            return None
-        if book.get("plan_sha256") != reference["sha256"]:
-            return None
-        self.ledger_path, self.ledger = path, book
-        return path, book
+        self.ledger_path, self.ledger = found
+        return found
 
     def advance_plan(self, result) -> None:
         session = self.session
@@ -3710,36 +3504,10 @@ class AgentController:
 
     # ------------------------------ sessions ------------------------------
     def _load_session_cached(self, path: Path) -> dict | None:
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._session_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            session = load_session(path)
-        except (AgentError, OSError):
-            session = None
-        self._session_cache[path] = (key, session)
-        return session
+        return session_flow.read_cached(self._session_cache, path, load_session)
 
     def _load_chat_cached(self, path: Path) -> dict | None:
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._chat_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            chat = load_chat(path)
-        except (AgentError, OSError):
-            chat = None
-        self._chat_cache[path] = (key, chat)
-        return chat
+        return session_flow.read_cached(self._chat_cache, path, load_chat)
 
     def _nav_projects(self) -> list[dict]:
         """The sidebar's project nodes: one per granted folder, holding its tasks and bound chats.
@@ -3795,7 +3563,7 @@ class AgentController:
             items.extend(bound.get(root, []))
             items.sort(key=lambda item: item["updated"], reverse=True)
             out.append({"key": root, "name": folder.name, "path": str(folder),
-                        "initials": initials_for(folder.name), "icon": self.icons.get(root, ""),
+                        "initials": projects.initials_for(folder.name), "icon": self.icons.get(root, ""),
                         "chats": items})
         return sorted(out, key=lambda group: group["name"].casefold())
 
@@ -4018,37 +3786,14 @@ class AgentController:
                              rejected=bool(changes) and self.rejected())
 
     def _review(self) -> dict:
+        """The change set as the card reads it: the file rows and the view are `uistate`'s, the
+        permissions below are this window's — they depend on the mode, the busy flag and the answer
+        the user already gave."""
         session = self.session or {}
         changes = session.get("changes", [])
         state = session.get("state")
         declined = self.rejected()
-        files = []
-        for change in changes:
-            lines = _diff(change["before"] or "", change["after"] or "", change["path"])
-            added = [line[1:] for line in lines if line.startswith("+") and not line.startswith("+++")]
-            removed = [line[1:] for line in lines if line.startswith("-") and not line.startswith("---")]
-            summary = change.get("summary") or change.get("description")
-            if not summary:
-                # Describe observable edits, without guessing the model's intent or making another call.
-                names = list(dict.fromkeys(re.findall(
-                    r"^\s*(?:(?:async\s+)?def|class|function)\s+([\w$]+)",
-                    "\n".join(added + removed), re.MULTILINE)))[:3]
-                if not names:
-                    names = list(dict.fromkeys(re.findall(
-                        r"^\s*(?:export\s+)?(?:const|let|var)\s+([\w$]+)\s*=",
-                        "\n".join(added + removed), re.MULTILINE)))[:3]
-                if not names and Path(change["path"]).suffix.lower() in {".html", ".htm", ".vue", ".jsx", ".tsx"}:
-                    names = list(dict.fromkeys(re.findall(
-                        r"<([A-Za-z][\w-]*)\b", "\n".join(added + removed))))[:3]
-                action = "Removed" if change.get("delete") else "Added" if change["before"] is None else "Updated"
-                summary = (f"{action} {', '.join(names)}" if names else
-                           f"{action} file content: {len(added)} lines added, {len(removed)} removed")
-            files.append({"path": change["path"],
-                          "summary": " ".join(str(summary).split())[:160],
-                          "kind": ("D" if change.get("delete")
-                                   else "A" if change["before"] is None else "M"),
-                          "add": sum(1 for line in lines if line.startswith("+") and not line.startswith("+++")),
-                          "del": sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))})
+        files = uistate.review_files(changes)
         chosen = changes[min(self.review_file, len(changes) - 1)] if changes else None
         return {
             "id": str(session.get("id", "")) + ":" + str(session.get("proposal_hash", "")),
@@ -4072,32 +3817,8 @@ class AgentController:
             "reopenLabel": say(self.arabic, en="Reopen for review", ar="إعادة الفتح للمراجعة"),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
-            "view": {
-                # A delete has no `after` at all, and the viewer shows the removal as the whole
-                # file going out with minus signs -- which is only readable if the empty side is
-                # built here rather than assumed by the caller.
-                "diff": _diff(chosen["before"] or "", chosen["after"] or "", chosen["path"]) if chosen else [],
-                "before": (chosen["before"] or "").splitlines() if chosen else [],
-                "after": (chosen["after"] or "").splitlines() if chosen else [],
-                "checks": self._checks_text(session),
-            } if chosen else {"diff": [], "before": [], "after": [], "checks": self._checks_text(session)},
+            "view": {**uistate.file_view(chosen), "checks": runresults.checks_lines(session)},
         }
-
-    def _checks_text(self, session: dict) -> list[str]:
-        out = ["Proposed checks (not execution results):"] + ["• " + check for check in session.get("checks", [])]
-        result = session.get("verification")
-        if result:
-            out.append("Latest check: " + result.get("status", "unknown"))
-            out += [item["path"] + ": " + item["status"] for item in result.get("static", [])]
-            if result.get("reason"):
-                out.append(result["reason"])
-        runs = session.get("runs") or []
-        if runs:
-            last = runs[-1]
-            out.append(f"Command runs ({len(runs)}): last was {last.get('command', '')}")
-            out.append(f"→ {last.get('status')} · exit {last.get('exit_code')} · {last.get('seconds')}s")
-            out += ["  " + str(row)[:200] for row in (last.get("failures") or [])[:8]]
-        return out
 
     # ------------------------------ persistence ------------------------------
     def _sync_project(self) -> None:
@@ -4161,44 +3882,3 @@ class AgentController:
         with self._state:
             self.key = ""
 
-
-def _hidden(path: Path) -> bool:
-    """The picker's own rule, older than the shared one: a dot folder is not where the project is.
-
-    `ignore.picker_dir` decides the rest beside it. This stays separate because it is a *navigation*
-    choice — the file-system gate that protects `.git` and the credentials lives in `ignore`, and a
-    folder being tedious to browse is not the same reason to refuse it.
-    """
-    return path.name.startswith(".")
-
-
-def drive_roots() -> list[str]:
-    """Every mounted root, so the folder picker can leave the drive it started on."""
-    if os.name != "nt":
-        return ["/"]
-    try:
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
-    except (OSError, AttributeError):
-        mask = 1
-    return [letter for letter in
-            (chr(ord("A") + index) + ":\\" for index in range(26) if mask & (1 << index))
-            if Path(letter).is_dir()]
-
-
-def initials_for(name: str) -> str:
-    """A two-letter mark that survives near-identical folder names.
-
-    ``demo2`` and ``demo_repo`` both start with "de", which made the sidebar avatars
-    indistinguishable; segment boundaries and a trailing digit separate them.
-    """
-    parts = [part for part in re.split(r"[\s._\-]+", name) if part]
-    if len(parts) >= 2:
-        return (parts[0][0] + parts[1][0]).casefold()
-    word = parts[0] if parts else "?"
-    digit = next((char for char in word[1:] if char.isdigit()), "")
-    return (word[0] + (digit or (word[1] if len(word) > 1 else ""))).casefold()
-
-
-def _diff(before: str, after: str, name: str) -> list[str]:
-    return list(difflib.unified_diff(before.splitlines(), after.splitlines(),
-                                     fromfile="a/" + name, tofile="b/" + name, lineterm=""))

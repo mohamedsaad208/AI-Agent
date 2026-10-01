@@ -14,9 +14,10 @@ from ai_code_engineer import engine, repair
 from ai_code_engineer.cli import demo
 from ai_code_engineer.config import MIN_CONTEXT_CHARS, Settings, load_settings
 from ai_code_engineer.engine import (apply_proposal, atomic_json, chat_sessions, DEFAULT_CHECKS, diff_size,
-                                     MAX_TASK_CHARS, NO_SUMMARY, SYSTEM, load_session,
+                                     MAX_TASK_CHARS, NO_SUMMARY, load_session,
                                      parse_action, plan, prepare_changes, project_key,
                                      propose_block, proposal_hash, review, rollback, shrink_warning)
+from ai_code_engineer.prompts import SYSTEM
 from ai_code_engineer.errors import AgentError, PolicyError, ProviderError
 from ai_code_engineer.redaction import redact
 from ai_code_engineer.providers import OllamaProvider, OpenAICompatibleProvider, make_provider
@@ -1585,9 +1586,13 @@ class TheSymbolVerbs(unittest.TestCase):
         """The drift this guards is the expensive kind: a verb in the system prompt that the handler
         chain does not know costs a turn per attempt, and one the chain knows but the prompt never
         mentions is code no model will ever ask for."""
-        text = (Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer"
-                / "engine.py").read_text(encoding="utf-8")
-        offered = set(re.findall(r'\n- action="(\w+)":', text))
+        root = Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer"
+        # The menu and the chain live in different files now: `prompts.py` carries the prompt the
+        # engine sends, `engine.py` carries the loop that answers it. Reading one of the two for
+        # both sides is a guard that goes blind the day the prompt moves.
+        offered = set(re.findall(r'\n- action="(\w+)":',
+                                 (root / "prompts.py").read_text(encoding="utf-8")))
+        text = (root / "engine.py").read_text(encoding="utf-8")
         # Only the handler chain's own comparisons: `name == "..."` also appears as `os.name == "nt"`,
         # which is a platform check and not an action the model can ask for.
         handled = set(re.findall(r'(?:elif|if) name == "(\w+)" and', text))

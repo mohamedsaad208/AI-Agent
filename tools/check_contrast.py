@@ -67,7 +67,7 @@ PAIRS = [
 ]
 
 # Not audited here: the per-project chip in the sidebar is coloured from the folder name by
-# avatar() in app.js, not by a token. Its lightness is pinned to an end of the scale so that the
+# avatar() in ui-projects.js, not by a token. Its lightness is pinned to an end of the scale so that the
 # ink returned with it clears AA for all 360 hues -- at the mid lightness it used to sit at, a
 # name hashing to yellow reached 2.5:1 under white and no ink passed.
 

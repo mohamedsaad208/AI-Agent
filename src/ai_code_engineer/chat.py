@@ -16,7 +16,7 @@ import uuid
 
 from .config import Settings
 from .engine import atomic_json, now
-from .errors import AgentError
+from .errors import AgentError, Cancelled
 
 # One directive, shared by both prompts: the user's own language is the language of the answer,
 # while everything that has to stay machine-readable — code, paths, identifiers, JSON — does not
@@ -148,7 +148,7 @@ def context_use(chat: dict | None, settings: Settings, context: str = "") -> dic
 
 
 def respond(chat: dict, provider, user_text: str, settings: Settings, store: Path,
-            context: str = "", on_token=None) -> str:
+            context: str = "", on_token=None, cancelled=None) -> str:
     """Answer one question. `on_token`, when given, hears the answer as it arrives.
 
     The callback is a display consumer: what is stored and returned is the assembled reply the
@@ -159,14 +159,22 @@ def respond(chat: dict, provider, user_text: str, settings: Settings, store: Pat
         raise AgentError("Type a question first.")
     if len(text) > MAX_INPUT:
         raise AgentError("Your message is too long; split it into smaller questions.")
+    if cancelled is not None and cancelled():
+        raise Cancelled("Question cancelled.")
     chat["turns"].append({"role": "user", "content": text})
     try:
-        # Asked, not assumed: a provider that does not advertise `supports_stream` may be a scripted
-        # double whose `generate` has never taken a third argument, and the answer is the same either
-        # way — a stream is something the reader sees, not something the reply depends on.
-        listening = {"on_token": on_token} if (on_token is not None and
-                                               getattr(provider, "supports_stream", False)) else {}
-        reply = provider.generate(_messages(chat, settings, context), json_mode=False, **listening)
+        if cancelled is not None and cancelled():
+            raise Cancelled("Question cancelled.")
+        listening = {}
+        if on_token is not None and getattr(provider, "supports_stream", False):
+            listening["on_token"] = on_token
+        try:
+            reply = provider.generate(_messages(chat, settings, context), json_mode=False,
+                                      cancelled=cancelled, **listening)
+        except TypeError:
+            reply = provider.generate(_messages(chat, settings, context), json_mode=False, **listening)
+        if cancelled is not None and cancelled():
+            raise Cancelled("Question cancelled.")
     except Exception:
         chat["turns"].pop()  # Do not persist a question the model never answered.
         raise

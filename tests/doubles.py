@@ -6,10 +6,13 @@ already got bitten by — `patched_catalog()` existed twice and differed the mom
 shape, and a test double that disagrees between two files is how a Web test passes over a Tk test
 that should have failed.
 
-Stubs whose *behaviour is the point of one test* deliberately stay in their own file:
-`SteppingModel`, `DualModel`, `GatingModel`, `ScriptedModel` and the two `ScriptedProvider` classes
-(the one in `test_repair.py` records the prompts it was given, the one in `test_agent.py` does not).
-Merging those would be a rewrite with the safety net removed.
+Stubs whose *behaviour is the point of one test* deliberately stay with the suite that asserts on it:
+`SteppingModel`, `DualModel` and `GatingModel` live in `controller_case.py` beside the controller
+suites, and the two `ScriptedProvider` classes (the one in `test_repair.py` records the prompts it was
+given, the one in `test_agent.py` does not) stay in their own files. Merging those would be a rewrite
+with the safety net removed. The plan documents named `PLAN` are a separate case: four files hold one,
+and they are four *different* documents, so the shared `PLAN` here is only ever the one
+`test_controller.py` feeds its model.
 
 Imported as a top-level module, so each file adds its own directory to `sys.path` first — that is
 what makes `python -m unittest discover -s tests` and `python -m unittest tests.test_gui` agree.

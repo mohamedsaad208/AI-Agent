@@ -22,8 +22,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ai_code_engineer import intent
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp import server as server_module
-from ai_code_engineer.webapp.controller import AgentController, initials_for
+from ai_code_engineer.webapp.controller import AgentController
+from ai_code_engineer.webapp.projects import initials_for
 from ai_code_engineer.webapp.fake import PROJECT_INFO, FakeController
+
+# The client, in the order the page loads it.
+UI_SCRIPTS = ("ui-core.js", "ui-projects.js", "ui-chat.js", "ui-composer.js",
+              "ui-run.js", "ui-dialogs.js", "ui-wiring.js")
+
+
+def ui_script():
+    """The whole front end as one string, concatenated in load order.
+
+    The window used to be one file, and a dozen guards here are regexes over its source. Reading one
+    of the seven would stop covering whatever moved on the day a function changed file -- which is
+    exactly the blind spot a refactor creates -- so every source-level guard asks for all of them.
+    """
+    folder = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+    return "\n".join((folder / name).read_text(encoding="utf-8") for name in UI_SCRIPTS)
 
 
 class Stub:
@@ -361,8 +377,7 @@ class HttpBoundaryTests(unittest.TestCase):
         """The number input in the settings drawer is static markup; the clamp is not."""
         import re
         from ai_code_engineer import config
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        widget = static.read_text(encoding="utf-8")
+        widget = ui_script()
         self.assertIn(f'min="{config.REQUEST_TIMEOUT_LOW}" max="{config.REQUEST_TIMEOUT_HIGH}"', widget)
         self.assertEqual(config.clamp_request_timeout("5"), config.REQUEST_TIMEOUT_LOW)
         self.assertEqual(config.clamp_request_timeout(100000), config.REQUEST_TIMEOUT_HIGH)
@@ -384,8 +399,7 @@ class HttpBoundaryTests(unittest.TestCase):
         project behind the click, so that project could never be collapsed.
         """
         import re
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        tree = re.sub(r"\s+", " ", static.read_text(encoding="utf-8"))
+        tree = re.sub(r"\s+", " ", ui_script())
         self.assertIn("expanded: {}", tree)                                     # nothing remembered at boot
         self.assertIn("const open = chosen === undefined ? matched : chosen;", tree)
         self.assertIn("state.expanded[group.key] = !open", tree)                # and the click undoes itself
@@ -498,8 +512,7 @@ class ControllerSurfaceTests(unittest.TestCase):
     def client_actions(self):
         """Every action name the page can post, read out of the client source."""
         import re
-        source = (Path(__file__).resolve().parents[1] /
-                  "src/ai_code_engineer/webapp/static/app.js").read_text(encoding="utf-8")
+        source = ui_script()
         sent = set(re.findall(r"send(?:Quiet)?\(\s*'([a-z_]+)'", source))
         # A sheet that needs the reply's payload posts through `api()` directly, because `send()` drops
         # `result` on the floor. Both forms are the client posting an action, so both are collected --
@@ -585,8 +598,7 @@ class ControllerSurfaceTests(unittest.TestCase):
         """`--fake` is the window the design is reviewed in. A field only the real controller
         sends is a control that renders as nothing there, and nobody notices for a week."""
         import re
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        source = static.read_text(encoding="utf-8")
+        source = ui_script()
         reads = set(re.findall(r"DATA\.(\w+)", source))
         snapshot = FakeController().snapshot()
         self.assertEqual(sorted(reads - set(snapshot)), [],
@@ -710,7 +722,7 @@ class TheWriteCardAndTheChips(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.html = (static / "index.html").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
 
@@ -783,7 +795,7 @@ class TheCountsOnTheChangeCard(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
 
@@ -825,7 +837,7 @@ class TheRefusalOnBothSurfaces(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
 
     def test_the_refusal_is_offered_in_the_same_window_as_the_offer(self):
         block = self.js.split("function changeActions")[1].split("\n}\n")[0]
@@ -879,7 +891,7 @@ class TheCompactThread(unittest.TestCase):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.tokens = (static / "tokens.css").read_text(encoding="utf-8")
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
 
     def test_there_is_a_spacing_scale_and_the_chat_uses_it(self):
         import re
@@ -921,7 +933,7 @@ class TheQuietActivityList(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.html = (static / "index.html").read_text(encoding="utf-8")
 
@@ -965,7 +977,7 @@ class TheChangesPaneIsGone(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.html = (static / "index.html").read_text(encoding="utf-8")
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
@@ -1069,7 +1081,7 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.flat = " ".join(cls.js.split())
         package = Path(__file__).resolve().parents[1] / "src/ai_code_engineer"
         cls.servers = "".join((package / name).read_text(encoding="utf-8") for name in
@@ -1170,7 +1182,7 @@ class TheStepRowsInTheThread(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
         cls.row = cls.js.split("function stepRow(")[1].split("\n}\n")[0]
@@ -1245,7 +1257,7 @@ class AskAgainStaysInTheBox(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.flat = " ".join(cls.js.split())
 
     def test_exactly_one_place_in_the_client_starts_a_task(self):
@@ -1287,7 +1299,7 @@ class TheQueueStrip(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
 
     def test_send_becomes_queue_only_while_a_task_runs(self):
@@ -1321,7 +1333,7 @@ class TheBranchChip(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.body = cls.js.split("function gitChip()")[1].split("\n}\n")[0]
 
@@ -1375,7 +1387,7 @@ class TheRowCopyButton(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.flat = " ".join(cls.js.split())
 
     def test_it_is_offered_on_every_row_that_has_words_in_it(self):
@@ -1456,7 +1468,7 @@ class TheReferenceBanner(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.html = (static / "index.html").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
@@ -1501,7 +1513,7 @@ class TheModelSheetFilter(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.flat = " ".join(cls.js.split())
 
     def test_the_picker_itself_has_the_search_box(self):
@@ -1525,8 +1537,7 @@ class TheModelSheetFilter(unittest.TestCase):
 
 class ShortcutsYieldToTyping(unittest.TestCase):
     def test_the_guards_come_before_any_binding(self):
-        flat = " ".join((Path(__file__).resolve().parents[1] /
-                         "src/ai_code_engineer/webapp/static/app.js").read_text(encoding="utf-8").split())
+        flat = " ".join(ui_script().split())
         self.assertIn("if (e.altKey || e.repeat || handsBusy()) return;", flat,
                       "AltGr on an Arabic layout is Ctrl+Alt, so the palette opened on the key "
                       "that types")
@@ -1536,8 +1547,7 @@ class ShortcutsYieldToTyping(unittest.TestCase):
     def test_shift_is_part_of_the_binding_not_a_free_modifier(self):
         """Without the `!e.shiftKey` guards, Ctrl+Shift+K matched the Ctrl+K branch first and
         opened the palette on the way to starting a chat."""
-        flat = " ".join((Path(__file__).resolve().parents[1] /
-                         "src/ai_code_engineer/webapp/static/app.js").read_text(encoding="utf-8").split())
+        flat = " ".join(ui_script().split())
         self.assertIn("key === 'k' && !e.shiftKey", flat)
         self.assertIn("key === 'k' && e.shiftKey", flat)
 
@@ -1559,7 +1569,7 @@ class TheActivityStrip(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
 
@@ -1682,8 +1692,7 @@ class ReconnectedStreamTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        cls.js = static.read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.connect = cls.js.split("function connectEvents()")[1].split("\n}\n")[0]
 
     def test_opening_a_stream_re_reads_the_snapshot(self):
@@ -1702,8 +1711,7 @@ class DeafStreamTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        cls.js = static.read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.connect = cls.js.split("function connectEvents()")[1].split("\n}\n")[0]
 
     def test_the_retries_are_capped_and_the_window_says_something(self):
@@ -1728,8 +1736,7 @@ class DeadWindowTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        cls.js = static.read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.api = cls.js.split("async function api(")[1].split("\n}\n")[0]
         cls.deaf = cls.js.split("function windowGoneDeaf(")[1].split("\n}\n")[0]
 
@@ -1764,8 +1771,7 @@ class ReplayedAsksAndBadgesTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        cls.js = static.read_text(encoding="utf-8")
+        cls.js = ui_script()
 
     def test_a_question_is_drawn_once_whichever_way_it_arrived(self):
         """The id is the same object on the SSE path and inside every later snapshot; drawing both
@@ -1800,8 +1806,7 @@ class ComposerButtonHandlesTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static/app.js"
-        cls.js = static.read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.bar = cls.js.split("function renderComposer()")[1].split("\n}\n")[0]
 
     def test_each_button_is_addressable_on_its_own(self):
@@ -1825,7 +1830,7 @@ class WithdrawnAskWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.flat = " ".join(cls.js.split())
 
     def test_the_event_reaches_a_handler(self):
@@ -1900,7 +1905,7 @@ class TheGraphSheet(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
-        cls.js = (static / "app.js").read_text(encoding="utf-8")
+        cls.js = ui_script()
         cls.css = (static / "app.css").read_text(encoding="utf-8")
         cls.flat = " ".join(cls.js.split())
         cls.svg = cls.js.split("function graphSvg(")[1].split("\n}\n")[0]

@@ -4,7 +4,7 @@ These live outside ``gui`` so the web controller never imports tkinter just to n
 state. The window re-exports them, so existing call sites and tests keep working.
 
 The second half of this file is the language rule. The model is already told to answer in
-the language it was asked in (``chat.py`` LANGUAGE_RULE, ``engine.py`` SYSTEM), which covers
+the language it was asked in (``chat.py`` LANGUAGE_RULE, ``prompts.py`` SYSTEM), which covers
 its own prose; the sentences *we* generate were English-only. They are chosen here so the
 rule has one home rather than a conditional at every call site.
 """

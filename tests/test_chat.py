@@ -108,7 +108,7 @@ class ChatModeTests(unittest.TestCase):
     def test_every_prompt_answers_in_the_language_it_was_asked(self):
         """One rule, three prompts: the prose follows the user, the machine-readable parts do not."""
         from ai_code_engineer.chat import BOUND_CHAT_SYSTEM, CHAT_SYSTEM
-        from ai_code_engineer.engine import SYSTEM
+        from ai_code_engineer.prompts import SYSTEM
         for prompt in (CHAT_SYSTEM, BOUND_CHAT_SYSTEM, SYSTEM):
             self.assertIn("same language", prompt)
             self.assertIn("JSON key", prompt)

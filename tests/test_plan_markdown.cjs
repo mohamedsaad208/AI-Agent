@@ -1,7 +1,6 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(require('node:path').join(__dirname, '../src/ai_code_engineer/webapp/static/app.js'), 'utf8');
+const { source } = require('./ui_source.cjs');
 const context = vm.createContext({});
 const escStart = source.indexOf('const esc =');
 vm.runInContext(source.slice(escStart, source.indexOf('\n/*', escStart)), context);

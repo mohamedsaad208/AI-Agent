@@ -69,9 +69,14 @@ class TheProviderTable(unittest.TestCase):
         self.assertIsNone(kind_for(None))
 
     def test_the_windows_and_the_table_list_the_same_rows(self):
-        # Two mode tables was how the web window and Tk disagreed about a provider's name.
+        # Two mode tables was how the web window and Tk disagreed about a provider's name. The web
+        # window used to rebuild the tuple from `config.KINDS` itself, byte-for-byte the same on the
+        # day it was copied and free to drift the day one row changed — so the guard is now that the
+        # second table cannot exist at all, rather than that two tables still agree.
         from ai_code_engineer.webapp import controller
-        self.assertEqual(controller.MODES, config.MODES)
+        for name in ("MODES", "MODE_KIND", "MODE_ROWS", "_mode_rows"):
+            self.assertFalse(hasattr(controller, name),
+                             f"the web window grew its own provider table again: {name}")
         self.assertEqual(len(config.MODES), len(KINDS) + 1, "OpenRouter is the one row that splits")
 
     def test_openrouter_is_the_only_row_split_by_price(self):

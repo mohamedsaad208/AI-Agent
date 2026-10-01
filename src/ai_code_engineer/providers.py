@@ -11,7 +11,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from .config import (Kind, OLLAMA, OPENROUTER, Settings, check_endpoint, kind_for, needs_consent,
                      validate)
-from .errors import PolicyError, ProviderError, ProviderUnavailable
+from .errors import Cancelled, PolicyError, ProviderError, ProviderUnavailable
 from .redaction import redact
 
 
@@ -154,7 +154,8 @@ def openai_chunk(line: bytes) -> dict | None:
 
 
 def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int = 120,
-                on_token=None, chunk=ollama_chunk, max_bytes: int = MAX_STREAM_BYTES) -> dict:
+                on_token=None, chunk=ollama_chunk, max_bytes: int = MAX_STREAM_BYTES,
+                cancelled=None) -> dict:
     """Read a streamed reply in pieces, saying each one as it lands, and return the whole of it.
 
     The text is assembled here rather than trusted from the client's copy: the caller has to parse an
@@ -170,6 +171,8 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
     try:
         with _opener().open(request, timeout=timeout) as response:
             for line in response:
+                if cancelled is not None and cancelled():
+                    raise Cancelled("Streaming cancelled.")
                 size += len(line)
                 if size > max_bytes:
                     raise ProviderError("Provider response exceeds size limit.")
@@ -267,7 +270,7 @@ class ModelProvider(Protocol):
     supports_stream: bool
 
     def generate(self, messages: list[dict], json_mode: bool = True,
-                 on_token=None) -> str: ...
+                 on_token=None, cancelled=None) -> str: ...
 
 
 # A reasoning model answers twice: once in a field nobody asked for and once in `content`. The names
@@ -317,7 +320,10 @@ class OllamaProvider:
             raise PolicyError("Cannot establish that this is an installed local model.")
         self.supports_thinking = "thinking" in (info.get("capabilities") or [])
 
-    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None) -> str:
+    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None,
+                 cancelled=None) -> str:
+        if cancelled is not None and cancelled():
+            raise Cancelled("Operation cancelled.")
         self.reasoning = ""
         self.metrics = {}
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages or [])
@@ -352,7 +358,7 @@ class OllamaProvider:
         else:
             streamed = read_stream(self.endpoint + "/api/chat", payload,
                                    timeout=self.settings.timeout_seconds, on_token=on_token,
-                                   chunk=ollama_chunk)
+                                   chunk=ollama_chunk, cancelled=cancelled)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             truncated = streamed["finish"] == "length"
             self.metrics = counts(streamed)
@@ -393,7 +399,10 @@ class OpenAICompatibleProvider:
         if self.kind.needs_key and not self.key:
             raise ProviderError(f"Set {env_name or 'an API key'} in your environment (never in a file).")
 
-    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None) -> str:
+    def generate(self, messages: list[dict], json_mode: bool = True, on_token=None,
+                 cancelled=None) -> str:
+        if cancelled is not None and cancelled():
+            raise Cancelled("Operation cancelled.")
         self.reasoning = ""
         body = {
             "model": self.settings.model, "messages": messages, "stream": on_token is not None,
@@ -408,7 +417,7 @@ class OpenAICompatibleProvider:
         if on_token is None:
             try:
                 result = request_json(self.endpoint + "/chat/completions", body,
-                                      key=self.key or None, timeout=self.settings.timeout_seconds)
+                                       key=self.key or None, timeout=self.settings.timeout_seconds)
                 choice = result["choices"][0]
                 message = choice["message"] if isinstance(choice.get("message"), dict) else {}
                 value, thought = message.get("content"), message
@@ -420,7 +429,7 @@ class OpenAICompatibleProvider:
         else:
             streamed = read_stream(self.endpoint + "/chat/completions", body, key=self.key or None,
                                    timeout=self.settings.timeout_seconds, on_token=on_token,
-                                   chunk=openai_chunk)
+                                   chunk=openai_chunk, cancelled=cancelled)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             finish, echoed = streamed["finish"], streamed["model"]
             self.metrics = counts(streamed)

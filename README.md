@@ -332,10 +332,11 @@ Project files, conversation history, and verification are separate records. Neit
 
 | path | what it is |
 | :--- | :--- |
-| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `redaction.py` keeps credentials out of what gets stored. |
-| `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP), `controller.py` (the state the UI reads), `static/`. |
-| `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. |
-| `tests/` | Python `unittest` coverage plus standalone Node.js rendering checks. `doubles.py` and `helpers.py` provide shared fixtures; a live model is not required. |
+| `src/ai_code_engineer/` | **the product.** `engine.py` runs the loop, `config.py` is the provider table, `providers.py` and `catalog.py` speak to a model, `runner.py` runs *your* project's command — here, or inside the one container shape the tool knows how to seal — `labels.py` holds every sentence in both languages, `intent.py` holds the three write positions and every refusal they speak, `modes.py` keeps a folder's position where the other window and the terminal both read it, `host.py` is the seam the two windows share, `session_flow.py` states what a stored record means so both windows read it the same way, `prompts.py` is the prompt the model is handed and the budget it is handed within, `refusals.py` turns an engine refusal into advice a person can act on, `redaction.py` keeps credentials out of what gets stored. |
+| `src/ai_code_engineer/webapp/` | the local web window: `server.py` (loopback-only, per-launch token, Host/Origin/CSP) and `controller.py` — the state the UI reads, and still the only entry point. Five modules take one decision each out of it: `runresults.py` (a run's result rows and the Run gates), `requestqueue.py` (a queued request's shape: split, dedupe, edit, reorder), `connection.py` (what the provider list says), `uistate.py` (the diff and the review view), `projects.py` (folder listings, initials, context use). Each is explicit inputs to a value out, imports nothing from the controller, and leaves every write where it belongs. |
+| `src/ai_code_engineer/webapp/static/` | the client: seven plain scripts in load order — `ui-core`, `ui-projects`, `ui-chat`, `ui-composer`, `ui-run`, `ui-dialogs`, `ui-wiring` (last; the only block that runs at load). Classic scripts share the global scope, so no bundler and no framework was needed to split them. `app.css` stays one file: its cascade order is load-bearing and no test can see a specificity change. |
+| `src/ai_code_engineer/gui.py` | the Tk window. Same engine, same sentences, different screen. What it and the web window agree on about a record on disk is in `session_flow.py`, not in either of them. |
+| `tests/` | Python `unittest` coverage plus standalone Node.js rendering checks. `doubles.py` holds the doubles more than one window's tests read, `helpers.py` the folder fixture, `controller_case.py` the web window's own. The controller suite is split by behaviour: `test_controller.py` for the ask-review-apply-run lifecycle, then `test_controller_queue`, `_chat`, `_activity`, `_git`, `_modes`, `_project`. A live model is not required. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | entry points: CLI, the desktop window, the interactive menu. |
 | `profiles/` | TOML model presets. They name the *variable* holding a key and never a key. |
 | `docs/` | plans, implementation status, code reviews — **local working notes, gitignored.** They quote this machine's paths, ports and counts, so they are kept on the device that measured them instead of shipped as product files. The rules they describe live in the modules' own docstrings, and the test suite is the gate: nothing in `src/`, `tests/` or CI reads a `docs/` file. |
@@ -344,6 +345,24 @@ Project files, conversation history, and verification are separate records. Neit
 | `examples/` | folders the agent is pointed at to try it out. |
 | `archive/` | see `archive/README.md` — including why two experiment folders were **not** moved into it. |
 | `.agent-chats/`, `.agent-runs/`, `.agent-plans/`, `.agent-projects.json` | Local conversations, run records, plan progress, and the granted-folder registry. Ignored by git; publishing the source does not upload these records. |
+
+## Where a new decision goes
+
+Two kinds of judgement are deliberately left as one function each, because that is where the next
+version of them belongs:
+
+- **What a message is asking for** (chat, a change, a command) is the verb table in
+  `src/ai_code_engineer/webapp/controller.py` — `CHANGE_VERBS`, `ARABIC_CHANGE_VERBS`,
+  `asks_for_a_change()`. It is a heuristic on purpose: the position a folder is in is decided by
+  `intent.py` *before* the message is read, so a classifier can only ever promote a folder the person
+  already granted, never speak for one they set to read-only.
+- **What a failed command means** is `repair.classify()` in `src/ai_code_engineer/repair.py`. It
+  already returns the category the timeline rows, the stall check and the fix offer all read, so
+  triage grows by answering that question better, not by adding a second reading of the run record.
+
+Neither one moves toward the browser. The client sends action names and draws what it is told; every
+gate — permissions, cancellation, the Run buttons' pressability, redaction — is decided server-side,
+and `tests/test_webapp.py` and `tests/test_host.py` hold that line.
 
 ---
 

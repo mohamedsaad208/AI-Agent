@@ -1,12 +1,7 @@
 // Phase 3 UI tests: Resizable rail, Tasks tab with [نفذ دي], and unread activity dots.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const vm = require('node:vm');
-const path = require('node:path');
-
-const source = fs.readFileSync(path.join(__dirname, '../src/ai_code_engineer/webapp/static/app.js'), 'utf8');
-const css = fs.readFileSync(path.join(__dirname, '../src/ai_code_engineer/webapp/static/app.css'), 'utf8');
-const html = fs.readFileSync(path.join(__dirname, '../src/ai_code_engineer/webapp/static/index.html'), 'utf8');
+const { source, css, html } = require('./ui_source.cjs');
 
 // 1. Contract tests on index.html and app.css
 assert.ok(html.includes('id="rail-resizer"'), 'index.html has rail-resizer');

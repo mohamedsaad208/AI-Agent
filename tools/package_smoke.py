@@ -42,12 +42,16 @@ def main() -> int:
         checks = [
             ("the page itself", base, b"AI Code Engineer"),
             ("the stylesheet", base + "app.css", b"--accent"),
-            ("the UI script", base + "app.js", b"function"),
             ("the boot script", base + "boot.js", b"dataset.style"),
         ]
+        # Every script the installed package carries, asked of the running server rather than named
+        # here. The front end is split across several files, and a check that names one file proves
+        # that file exists -- not that the wheel the window is loading from has the other six.
+        for script in sorted(server.STATIC.glob("ui-*.js")):
+            checks.append(("the " + script.name, base + script.name, None))
         for label, target, marker in checks:
             status, body = fetch(target)
-            if status != 200 or marker not in body:
+            if status != 200 or not body or (marker and marker not in body):
                 print("%s came back %s with %d bytes" % (label, status, len(body)))
                 return 1
         status, body = fetch(base + "api/bootstrap?" + url.split("?", 1)[1])
