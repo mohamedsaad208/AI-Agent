@@ -805,6 +805,14 @@ function renderHeader() {
   const btnPlan = $('mode-btn-plan');
   const btnChange = $('mode-btn-change');
   const btnRead = $('mode-btn-read');
+  const declared = DATA.declared || {};
+  if (btnRead) {
+    btnRead.classList.toggle('sealed', !!declared.sealed);
+    btnRead.innerHTML = (declared.sealed ? ICON.lock + ' ' : '') + 'Read-only';
+    btnRead.title = declared.sealed
+      ? (declared.note || (declared.by ? 'Read-only set by ' + declared.by : 'This folder is locked to read-only'))
+      : 'Read-only Mode: read and explain code, write nothing';
+  }
   if (btnPlan && btnChange && btnRead) {
     const isChange = DATA.composer === 'change';
     const isRead = DATA.composer === 'read' || !!(DATA.declared && DATA.declared.sealed);
@@ -979,11 +987,17 @@ function renderThread() {
         const head = el('div', 'step-prompt-head');
         head.innerHTML = `<span>📋 ${esc(firstLine)}</span>`;
         if (rest) {
-          const toggle = el('button', 'step-prompt-toggle', 'Show details ▾');
+          const toggle = el('button', 'step-prompt-toggle', ICON.chev);
+          toggle.title = 'Show details';
+          toggle.setAttribute('aria-label', 'Show details');
+          toggle.setAttribute('aria-expanded', 'false');
           const bodyDetails = el('div', 'step-prompt-body hidden', esc(rest));
           toggle.onclick = () => {
             const isHidden = bodyDetails.classList.toggle('hidden');
-            toggle.textContent = isHidden ? 'Show details ▾' : 'Hide details ▴';
+            toggle.title = isHidden ? 'Show details' : 'Hide details';
+            toggle.setAttribute('aria-label', toggle.title);
+            toggle.setAttribute('aria-expanded', String(!isHidden));
+            toggle.style.transform = isHidden ? '' : 'rotate(180deg)';
           };
           head.appendChild(toggle);
           card.append(head, bodyDetails);
@@ -1324,7 +1338,7 @@ function askAgain() {
 function renderComposer() {
   const bar = $('cbar'); bar.innerHTML = '';
   const add = (node) => bar.appendChild(node);
-  add(modeBadge());
+  updatePromptPlaceholder();
   if (DATA.project) {
     const bound = !!(DATA.branch || {}).bound;
     /* Which folder this branch is on, always visible where the message is typed: the sidebar can
@@ -1367,7 +1381,7 @@ function renderComposer() {
   /* Typable during a run, because typing is how the next message gets written; Send is the button
      that changes meaning, not the box. */
   ta.disabled = false;
-  // modeBadge() has already chosen the normal placeholder for this mode; a run overrides it.
+  // The selected mode supplies the placeholder; an active run overrides it.
   if (DATA.busy) ta.placeholder = 'Ask the next thing — it queues until this task ends.';
   $('composer').classList.toggle('busy', !!DATA.busy);
 }
@@ -1459,39 +1473,13 @@ function modeMenu() {
   const close = modal(s);
 }
 
-function modeBadge() {
+function updatePromptPlaceholder() {
   const branch = DATA.branch || {};
   const change = DATA.composer === 'change', reading = DATA.composer === 'read';
-  const name = branch.projectName ? ' · ' + esc(branch.projectName) : '';
-  const b = el('button', 'pill mode ' + (reading ? 'read' : change ? 'change' : 'chat'));
-  b.innerHTML = modeRow(DATA.composer)[1] + name + ICON.chev;
   if (branch.bound) {
-    // A bound chat is not a mode choice: the folder's remembered mode and switch stay with the
-    // project branch, and asking for Change here is refused. So no chevron and no click.
-    b.innerHTML = modeRow(DATA.composer)[1] + name;
-    b.title = 'A chat moved into ' + (branch.projectName || 'a project') + ' answers in prose and reads '
-      + 'that folder as context. A message that asks for files is still planned as a proposal you '
-      + 'approve, but the mode and Auto-Apply belong to the project — open it in the sidebar to change them.';
-    b.onclick = () => toast('That belongs to the project. Open ' + (branch.projectName || 'it') + ' in the sidebar.');
-    const ta0 = $('prompt');
-    if (ta0) ta0.placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
-    return b;
+    $('prompt').placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
+    return;
   }
-  b.title = modeRow(DATA.composer)[2] + ' Click to choose what the next Send will do.';
-  const declared = DATA.declared || {};
-  if (declared.sealed) {
-    // A folder can carry a position written by another surface — the other window, or a terminal that
-    // never opened one. Without the lock here that seal looks like a button that forgot to work, so
-    // the badge says who set it and when before it says why the click did nothing.
-    b.classList.add('sealed');
-    b.insertAdjacentHTML('afterbegin', ICON.lock + ' ');
-    if (declared.note) b.title = declared.note;
-    else if (declared.by) b.title = modeRow(DATA.composer)[2] + ' Set by ' + declared.by + '.';
-  }
-  b.onclick = () => {
-    if (!DATA.project) { toast('Choose a project first — then Chat, Read-only and Change each mean something'); return; }
-    modeMenu();
-  };
   const ta = $('prompt');
   /* The one field where the user decides what Send will do, so it has to describe the folder's
      actual behaviour: with the switch on, "review before applying" is a promise this window will
@@ -1505,7 +1493,6 @@ function modeBadge() {
       ? 'Ask what is wrong here, where it is, and what a fix would touch. Nothing is written.'
       : branch.key ? 'Ask about ' + branch.projectName + ' — it answers in prose and writes nothing.'
         : 'Ask anything. Choose a project to work on its files.';
-  return b;
 }
 
 function submit() {
@@ -1776,7 +1763,9 @@ function renderRail() {
       const seqDiv = el('div', 'plan-seq-controls');
       if (!state.sequential) {
         const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
-        startBtn.title = 'Run plan steps sequentially';
+        const complete = steps.length > 0 && steps.every(s => s.status === 'verified');
+        startBtn.disabled = complete || steps.length === 0;
+        startBtn.title = complete ? 'Plan complete — all steps are verified' : 'Run plan steps sequentially';
         startBtn.onclick = () => startSequential();
         seqDiv.appendChild(startBtn);
       } else {

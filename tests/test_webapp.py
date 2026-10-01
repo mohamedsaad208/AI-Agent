@@ -995,15 +995,14 @@ class TheChangesPaneIsGone(unittest.TestCase):
         self.assertIn("undo.disabled = !r.canRollback;", self.js,
                       "an interrupted apply is exactly when the escape has to be on screen")
 
-    def test_a_sealed_folder_is_drawn_locked_on_the_badge(self):
+    def test_a_sealed_folder_is_drawn_locked_in_the_header(self):
         """The lock is the only thing that separates "I chose Read-only" from "this folder was chosen
         for", and a field the front end never reads would leave the two looking identical."""
         self.assertIn("const declared = DATA.declared || {};", self.js)
-        self.assertIn("if (declared.sealed) {", self.js)
-        self.assertIn("b.classList.add('sealed');", self.js)
-        self.assertIn("b.insertAdjacentHTML('afterbegin', ICON.lock + ' ');", self.js)
-        self.assertIn("if (declared.note) b.title = declared.note;", self.js)
-        self.assertIn(".pill.mode.sealed {", self.css)
+        self.assertIn("btnRead.classList.toggle('sealed', !!declared.sealed);", self.js)
+        self.assertIn("btnRead.innerHTML = (declared.sealed ? ICON.lock + ' ' : '') + 'Read-only';", self.js)
+        self.assertIn("declared.note || (declared.by", self.js)
+        self.assertNotIn("add(modeBadge());", self.js)
         self.assertIn("lock: '<svg", self.js, "the glyph has to exist in the table the badge reads")
         self.assertEqual(self.js.count("const ICON = {"), 1)
 

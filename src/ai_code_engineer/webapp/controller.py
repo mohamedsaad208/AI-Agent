@@ -3196,8 +3196,8 @@ class AgentController:
         svc = service_runner.GLOBAL_SERVICES.start_service(
             svc_id, name, command, cwd, port=port, on_output=on_line
         )
-        self.status = f"Service '{name}' started."
-        self._add("tool", "App", f"🚀 Started service '{name}' ({command}) in {cwd.name}")
+        self.say(f"Service '{name}' started.")
+        self.line("tool", "App", f"🚀 Started service '{name}' ({command}) in {cwd.name}")
         return svc.snapshot()
 
     def stop_app_service(self, payload: dict | None = None) -> dict:
@@ -3206,8 +3206,8 @@ class AgentController:
         name = str(payload.get("name") or "app")
         svc_id = payload.get("id") or f"{repo_name}:{name}"
         service_runner.GLOBAL_SERVICES.stop_service(svc_id)
-        self.status = f"Service '{name}' stopped."
-        self._add("tool", "App", f"⏹ Stopped service '{name}'")
+        self.say(f"Service '{name}' stopped.")
+        self.line("tool", "App", f"⏹ Stopped service '{name}'")
         return {"stopped": True, "id": svc_id}
 
     def restart_app_service(self, payload: dict | None = None) -> dict:
@@ -3216,13 +3216,13 @@ class AgentController:
         name = str(payload.get("name") or "app")
         svc_id = payload.get("id") or f"{repo_name}:{name}"
         service_runner.GLOBAL_SERVICES.restart_service(svc_id)
-        self.status = f"Service '{name}' restarted."
+        self.say(f"Service '{name}' restarted.")
         return {"restarted": True, "id": svc_id}
 
     def stop_all_app_services(self) -> dict:
         service_runner.GLOBAL_SERVICES.stop_all()
-        self.status = "All services stopped."
-        self._add("tool", "App", "⏹ Stopped all services.")
+        self.say("All services stopped.")
+        self.line("tool", "App", "⏹ Stopped all services.")
         return {"stopped_all": True}
 
     def run_build_action(self) -> dict:
@@ -3245,12 +3245,12 @@ class AgentController:
                 command = "python -m py_compile"
 
         cwd = (repo / cfg.get("build", {}).get("cwd", ".")).resolve()
-        self.status = f"Building: {command}…"
+        self.say(f"Building: {command}…")
         res = service_runner.execute_bounded_job(command, cwd, timeout=600, on_output=self._build_line)
         self._last_job = {"type": "build", **res}
         outcome = "succeeded" if res["success"] else "FAILED"
-        self.status = f"Build {outcome} (exit {res['exit_code']}, {res['duration']}s)"
-        self._add("tool", "Build", f"🔨 Build {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
+        self.say(f"Build {outcome} (exit {res['exit_code']}, {res['duration']}s)")
+        self.line("tool", "Build", f"🔨 Build {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
         return res
 
     def get_service_lines(self, payload: dict | None = None) -> dict:
@@ -3279,7 +3279,7 @@ class AgentController:
             raise PolicyError("No project folder selected.")
         config_data = payload.get("config") or {}
         service_runner.save_project_config(Path(self.repo), config_data)
-        self.status = "Project run configuration saved."
+        self.say("Project run configuration saved.")
         return {"saved": True}
 
     def run_api_test(self, payload: dict) -> dict:
@@ -3340,15 +3340,15 @@ class AgentController:
         round_num = getattr(self, "_fix_round", 0) + 1
         self._fix_round = round_num
         if round_num > 3:
-            self._add("tool", "Fix", "🛑 Maximum auto-fix attempts reached (3). Manual review required.")
-            self.status = "Auto-fix limit reached."
+            self.line("tool", "Fix", "🛑 Maximum auto-fix attempts reached (3). Manual review required.")
+            self.say("Auto-fix limit reached.")
             return
 
         summary = diagnosis.get("summary", "execution failure")
         prev = getattr(self, "_last_fix_summary", "")
         if prev and prev == summary and round_num > 1:
-            self._add("tool", "Fix", f"⚠️ The exact same failure repeated ('{summary}'). Stopping fix loop to prevent runaway cycles.")
-            self.status = "Identical failure repeated; manual intervention needed."
+            self.line("tool", "Fix", f"⚠️ The exact same failure repeated ('{summary}'). Stopping fix loop to prevent runaway cycles.")
+            self.say("Identical failure repeated; manual intervention needed.")
             return
         self._last_fix_summary = summary
 
@@ -3384,7 +3384,7 @@ class AgentController:
         # Record command in history/favorites (redacting secrets)
         service_runner.record_custom_command(Path(self.repo), command, subdir, fav_name)
         
-        self.status = f"Running: {command}…"
+        self.say(f"Running: {command}…")
         try:
             res = service_runner.run_custom_command(Path(self.repo), command, subdir, timeout=300, on_output=self._build_line)
         except PolicyError as err:
@@ -3399,8 +3399,8 @@ class AgentController:
             }
         self._last_job = {"type": "custom", "subdir": subdir, **res}
         outcome = "succeeded" if res["success"] else "FAILED"
-        self.status = f"Command {outcome} (exit {res['exit_code']}, {res['duration']}s)"
-        self._add("tool", "Terminal", f"⚡ Custom run {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
+        self.say(f"Command {outcome} (exit {res['exit_code']}, {res['duration']}s)")
+        self.line("tool", "Terminal", f"⚡ Custom run {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
         return res
 
     def get_custom_cmd_history(self) -> dict:
@@ -3438,7 +3438,7 @@ class AgentController:
         enabled = bool(payload.get("enabled", not notes.get("enabled", True)))
         notes["enabled"] = enabled
         memory_store.write_auto_notes(self.memory_dir, self.repo, notes)
-        self.status = f"Automatic project notes {'enabled' if enabled else 'disabled'}."
+        self.say(f"Automatic project notes {'enabled' if enabled else 'disabled'}.")
         return notes
 
     def save_auto_notes(self, payload: dict | None = None) -> dict:
@@ -3447,7 +3447,7 @@ class AgentController:
         payload = payload or {}
         notes = payload.get("notes") or {}
         memory_store.write_auto_notes(self.memory_dir, self.repo, notes)
-        self.status = "Automatic project notes updated."
+        self.say("Automatic project notes updated.")
         return notes
 
     def get_auto_notes(self) -> dict:
@@ -3627,21 +3627,21 @@ class AgentController:
             return
         self.refresh_plan_status()
         nxt = planbook.current(book)
-        self._add("tool", "Tool", f"Plan step {step_id}/{len(book['steps'])} verified. " + runner.summarize(result))
+        self.line("tool", "Tool", f"Plan step {step_id}/{len(book['steps'])} verified. " + runner.summarize(result))
         if nxt is None:
-            self.status = f"Plan complete — {len(book['steps'])} steps verified."
+            self.say(f"Plan complete — {len(book['steps'])} steps verified.")
             return
         if self.chained and self.composer == CHANGE_COMPOSER:
             self.start_plan("")
         elif self.chained:
             self._draft = planbook.task_for(book, nxt)
-            self.status = (f"Step {step_id} verified. Switch the badge to Change mode to let the "
-                           "next step propose its work.")
+            self.say(f"Step {step_id} verified. Switch the badge to Change mode to let the "
+                     "next step propose its work.")
         elif self._offer_next_step(book, nxt, step_id):
             return
         else:
             self._draft = planbook.task_for(book, nxt)
-            self.status = (f"Step {step_id} verified. The next step is ready in the message box — press Send.")
+            self.say(f"Step {step_id} verified. The next step is ready in the message box — press Send.")
 
     def _offer_next_step(self, book: dict, nxt: dict, done_id: int) -> bool:
         """Chained mode is off, so the next step starts on an answer rather than on a guess."""

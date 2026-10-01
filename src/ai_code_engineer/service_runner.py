@@ -408,7 +408,8 @@ class ServiceProcess:
     def snapshot(self) -> dict:
         with self._lock:
             port = self.detected_port or self.configured_port
-            url = f"http://localhost:{port}" if port and self.ready else ""
+            host = "localhost"
+            url = f"http://{host}:{port}" if port and self.ready else ""
             return {
                 "id": self.id,
                 "name": self.name,

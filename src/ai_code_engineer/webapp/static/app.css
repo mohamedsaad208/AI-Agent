@@ -28,7 +28,11 @@ html.side-collapsed .side .brand b, html.side-collapsed .side .search,
 html.side-collapsed .side .nav, html.side-collapsed .side .newbtn .kbd,
 html.side-collapsed .side .foot { display: none }
 html.side-collapsed .side .newbtn { justify-content: center; padding: 9px 0 }
-html.side-collapsed .side .brand { gap: 4px }
+html.side-collapsed .side .newbtn .new-chat-label,
+html.side-collapsed .side #collapse,
+html.side-collapsed .side .brand .spacer { display: none }
+html.side-collapsed .side .newbtn .l { justify-content: center }
+html.side-collapsed .side .brand { justify-content: center; gap: 0; padding-inline: 0 }
 /* The button that folds the sidebar away lives inside it, so the way back has to live outside. */
 #sidebar-expand { display: none }
 html.side-collapsed #sidebar-expand { display: grid }
@@ -188,9 +192,9 @@ html.side-collapsed #sidebar-expand { display: grid }
    UI 4.6 compacted this: one line above an answer carries the name, the minute and the row's actions,
    where the name had a line and the actions had another. The vertical rhythm is now `--sp-*` rather
    than a number per rule, so the next round can change the density in one place. */
-.scroll { flex: 1; overflow-y: auto; padding: var(--sp-4) 22px var(--sp-2); scroll-behavior: smooth }
+.scroll { flex: 1; min-width: 0; overflow-y: auto; padding: var(--sp-4) 22px var(--sp-2); scroll-behavior: smooth }
 .thread { max-width: var(--thread-w); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-3) }
-.msg { display: flex; gap: 9px; animation: rise var(--t-med) var(--ease) }
+.msg { display: flex; min-width: 0; max-width: 100%; gap: 9px; animation: rise var(--t-med) var(--ease) }
 @keyframes rise { from { opacity: 0; transform: translateY(6px) } }
 .msg .pic {
   width: 22px; height: 22px; border-radius: var(--r-s); flex: none; display: grid; place-items: center;
@@ -212,7 +216,7 @@ html.side-collapsed #sidebar-expand { display: grid }
    the code block being mirrored. Lists indent from the writing side, not from the left. */
 .bub {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-l); border-top-left-radius: 4px;
-  padding: var(--sp-2) var(--sp-3); font-size: var(--fs); line-height: 1.52; max-width: 660px;
+  padding: var(--sp-2) var(--sp-3); font-size: var(--fs); line-height: 1.52; max-width: min(660px, 100%);
   width: fit-content; box-shadow: var(--card-shadow); overflow-wrap: anywhere; unicode-bidi: plaintext;
 }
 .msg.me .bub {
@@ -275,7 +279,7 @@ html.side-collapsed #sidebar-expand { display: grid }
 .tool {
   display: inline-flex; align-items: flex-start; gap: 8px; padding: 7px 12px; border-radius: var(--r-m);
   background: var(--chip); border: 1px solid var(--line); font-size: 12px; line-height: 1.55; color: var(--ink-2);
-  cursor: pointer; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%;
+  cursor: pointer; white-space: normal; overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%;
 }
 .tool:hover { border-color: var(--line-2) }
 .tool b { font-weight: 600; flex: none }
@@ -300,6 +304,8 @@ html.side-collapsed #sidebar-expand { display: grid }
 .st-head {
   display: flex; align-items: flex-start; gap: 8px; padding: 5px 11px; border-radius: 99px;
   background: var(--chip); border: 1px solid var(--line); font-size: 12px; color: var(--ink-2);
+  /* Buttons default to nowrap; status text must wrap long file paths inside the chat. */
+  white-space: normal; min-width: 0; max-width: 100%;
   text-align: start; cursor: pointer; transition: border-color var(--t-fast), background var(--t-fast);
 }
 .st-head:hover { border-color: var(--line-2) }
@@ -539,8 +545,8 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 .plan-seq-btn.running {
   background: var(--bad-bg); color: var(--bad-ink); border-color: var(--bad-line);
 }
-.plan-seq-btn:hover { transform: translateY(-1px); }
-.plan-seq-btn:active { transform: translateY(0); }
+.plan-seq-btn:hover:not(:disabled) { transform: translateY(-1px); }
+.plan-seq-btn:active:not(:disabled) { transform: translateY(0); }
 
 .tasks-list { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; }
 .task-item {
@@ -971,7 +977,8 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
   margin: var(--sp-1) 0;
 }
 .step-prompt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; font-size: 12.5px; }
-.step-prompt-toggle { font-size: 11.5px; color: var(--faint); background: transparent; border: 0; cursor: pointer; text-decoration: underline; }
+.step-prompt-head > span { min-width: 0; overflow-wrap: anywhere }
+.step-prompt-toggle { display: grid; place-items: center; width: 28px; height: 28px; flex: none; color: var(--faint); background: transparent; border: 0; border-radius: var(--r-s); cursor: pointer; text-decoration: none; }
 .step-prompt-toggle:hover { color: var(--ink); }
 .step-prompt-body { font-size: 12px; line-height: 1.5; color: var(--ink-2); white-space: pre-wrap; margin-top: 4px; padding-top: 6px; border-top: 1px solid var(--line-soft); }
 
