@@ -2425,14 +2425,15 @@ class AgentWindow:
         sandbox = self.sandbox_image.get().strip() if self.sandbox_on.get() else ""
 
         def work():
+            sink = lambda line: self.events.put(("progress", line))
             try:
                 result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                    progress=lambda line: self.events.put(("progress", line)),
+                                    progress=sink,
                                     target=target, sandbox=sandbox,
                                     cancelled=self.cancel_event.is_set)
             except TypeError:
                 result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                    progress=lambda line: self.events.put(("progress", line)),
+                                    progress=sink,
                                     target=target, sandbox=sandbox)
             return repair.record_run(path, result), result
 
