@@ -2923,9 +2923,13 @@ class AgentController:
                                     action="executing", fields={"command": command})
 
         def work():
-            result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=self._build_line, target=target, sandbox=sandbox,
-                                cancelled=self.cancel_event.is_set)
+            try:
+                result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
+                                    progress=self._build_line, target=target, sandbox=sandbox,
+                                    cancelled=self.cancel_event.is_set)
+            except TypeError:
+                result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
+                                    progress=self._build_line, target=target, sandbox=sandbox)
             return (repair.record_run(path, result) if recordable else None), result
 
         def done(pair):

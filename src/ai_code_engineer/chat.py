@@ -168,14 +168,11 @@ def respond(chat: dict, provider, user_text: str, settings: Settings, store: Pat
         listening = {}
         if on_token is not None and getattr(provider, "supports_stream", False):
             listening["on_token"] = on_token
-        if cancelled is not None:
-            import inspect
-            try:
-                if "cancelled" in inspect.signature(provider.generate).parameters:
-                    listening["cancelled"] = cancelled
-            except (ValueError, TypeError):
-                pass
-        reply = provider.generate(_messages(chat, settings, context), json_mode=False, **listening)
+        try:
+            reply = provider.generate(_messages(chat, settings, context), json_mode=False,
+                                      cancelled=cancelled, **listening)
+        except TypeError:
+            reply = provider.generate(_messages(chat, settings, context), json_mode=False, **listening)
         if cancelled is not None and cancelled():
             raise Cancelled("Question cancelled.")
     except Exception:

@@ -754,14 +754,10 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             gen_kwargs = {}
             if on_token is not None and getattr(provider, "supports_stream", False):
                 gen_kwargs["on_token"] = on_token
-            if cancelled is not None:
-                import inspect
-                try:
-                    if "cancelled" in inspect.signature(provider.generate).parameters:
-                        gen_kwargs["cancelled"] = cancelled
-                except (ValueError, TypeError):
-                    pass
-            raw = provider.generate(base + history, **gen_kwargs)
+            try:
+                raw = provider.generate(base + history, cancelled=cancelled, **gen_kwargs)
+            except TypeError:
+                raw = provider.generate(base + history, **gen_kwargs)
             # A reasoning model answered twice and only one of the two is the action. The thought is
             # shown, capped and redacted, as its own collapsible row — never folded into the envelope and
             # never sent back as history, because the next turn does not need to re-read the deliberation.
