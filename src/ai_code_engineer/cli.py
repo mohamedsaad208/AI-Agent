@@ -11,7 +11,7 @@ import sys
 from .config import load_settings, validate
 from .engine import apply_proposal, load_session, plan, reopen_proposal, review, rollback
 from .errors import AgentError
-from .labels import asked_of, is_arabic, policy_line
+from .labels import asked_of, is_arabic, policy_line, policy_verdicts
 from .labels import note as shared_note
 from .providers import make_provider
 from .report import export_file, find_session
@@ -65,6 +65,17 @@ def parser() -> argparse.ArgumentParser:
     seal.add_argument("--repo", type=Path, help="The folder to declare or lift; with no folder, list")
     seal.add_argument("--off", action="store_true", help="Lift the declaration instead of making it")
     seal.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
+    rule = sub.add_parser("policy",
+                          help="Read or set what one folder answers without asking, for every surface")
+    rule.add_argument("--repo", type=Path,
+                      help="The folder whose rows are read or written; with no folder, list every declared row")
+    rule.add_argument("--action", choices=sorted(policy.TABLE), metavar="CLASS",
+                      help="One of: " + ", ".join(sorted(policy.TABLE)))
+    rule.add_argument("--verdict", choices=sorted(policy.VERDICTS),
+                      help="allow, ask or deny — an override loosens a question, never opens a refusal")
+    rule.add_argument("--off", action="store_true",
+                      help="Remove one class's row, or the folder's whole set when no class is named")
+    rule.add_argument("--arabic", action="store_true", help="Write the rows in Arabic")
     over = sub.add_parser("overrides",
                           help="Read, set or remove the configuration rows the program signs")
     over.add_argument("--list", action="store_true", help="Every row and every refusal, newest first")
@@ -159,7 +170,8 @@ def refuses_policy(folder, session, interactive: bool = True) -> None:
         return
     arabic = is_arabic(asked_of(str((session or {}).get("task", ""))))
     raise AgentError(policy_line(arabic, policy.WRITE_THAT_RUNS, verdict, names=", ".join(runs[:3]))
-                     + "  " + shared_note("policy_lift", arabic=arabic))
+                     + "  " + shared_note("policy_how", arabic=arabic, folder=str(folder),
+                                          action=policy.WRITE_THAT_RUNS))
 
 
 def speak_arabic() -> None:
@@ -199,6 +211,74 @@ def run_read_only(args) -> int:
     safe_print(intent.declared(by=row["by"], at=row["at"], arabic=args.arabic,
                                project=Path(folder).name))
     safe_print(intent.lift(folder, arabic=args.arabic))
+    return 0
+
+
+def _policy_table(where, folder: str, arabic: bool) -> None:
+    """Print the eight classes as this folder will be treated, and who said so.
+
+    A row the folder set itself carries its surface and its minute: a verdict nobody can trace reads like
+    a bug, and the operator's next move is to find whoever set it. A row nobody set is said plainly.
+    """
+    words = policy_verdicts(arabic)
+    key = permissions.folder_key(folder)
+    own = {row["action"]: row for row in permissions.listed(where) if row["folder"] == key}
+    safe_print(shared_note("policy_heading", arabic=arabic))
+    for name in sorted(policy.TABLE):
+        tail = ""
+        if name in own:
+            bits = [part for part in (intent.source(own[name].get("by", ""), arabic=arabic),
+                                      own[name].get("at", "")) if part]
+            tail = "  (" + " · ".join(bits) + ")"
+        safe_print(f"  {name} = {words[permissions.verdict(where, folder, name)]}" + tail)
+    safe_print(shared_note("policy_allow_note", arabic=arabic, count=len(own), total=len(policy.TABLE)))
+
+
+def run_policy(args) -> int:
+    """Read or set the rows one folder answers for itself.
+
+    The web window draws this same table and writes to this same file; this command is the half a person
+    reaches from a terminal, which is where a refusal has to name a remedy that surface can actually give.
+    Nothing caches a verdict in a window, so a row set here is obeyed by both windows the next time they
+    look.
+    """
+    where = app_dir()
+    if args.arabic:
+        speak_arabic()
+    arabic = bool(args.arabic)
+    words = policy_verdicts(arabic)
+    folder = str(args.repo) if args.repo else ""
+
+    if not folder:
+        rows = permissions.listed(where)
+        if not rows:
+            safe_print("No folder has answered any class for itself, so every action answers the table.")
+            return 0
+        for row in rows:
+            safe_print(f"{row['path'] or row['folder']}  {row['action']} = "
+                       f"{words.get(row['verdict'], row['verdict'])}  "
+                       f"{intent.source(row.get('by', ''), arabic=arabic)}  {row.get('at', '')}")
+        return 0
+
+    if not Path(folder).is_dir():
+        raise AgentError("No such folder to set a rule for: " + folder)
+
+    if args.off:
+        permissions.forget(where, folder, args.action or "")
+        _policy_table(where, folder, arabic)
+        return 0
+
+    if not args.action and not args.verdict:
+        _policy_table(where, folder, arabic)
+        return 0
+
+    if not args.action or not args.verdict:
+        raise AgentError("A policy row names both a class and a verdict: --action and --verdict. "
+                         "`agent policy --repo PATH` alone prints the eight classes as they answer now.")
+
+    if not permissions.declare(where, folder, args.action, args.verdict, by=permissions.TERMINAL):
+        raise AgentError("Nothing was written: this folder has no record key of its own.")
+    _policy_table(where, folder, arabic)
     return 0
 
 
@@ -357,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
             safe_print(Workspace(args.repo).repo_map())
         elif args.command == "read-only":
             return run_read_only(args)
+        elif args.command == "policy":
+            return run_policy(args)
         elif args.command == "overrides":
             return run_overrides(args)
         elif args.command == "plan":

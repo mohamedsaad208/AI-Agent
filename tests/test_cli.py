@@ -616,7 +616,8 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
     The class the policy table asks about is the write that changes what runs *later*, and the terminal
     is where it matters most: a person approving a hash there has seen a diff, not the build file's new
     meaning. These go through `main([...])` because the thing under test is a command typed at a
-    keyboard, in a folder whose rule was set in a window the operator is not looking at.
+    keyboard, in a folder whose rule was set in a window the operator is not looking at — and the other
+    half of that sentence is `agent policy`, the same table read and written from the same keyboard.
     """
 
     RUNS = "test:\n\tpython -m pytest -q\n"
@@ -637,6 +638,12 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = main(argv)
         return code, out.getvalue()
+
+    def usage_error(self, argv):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            main(argv)
+        return caught.exception.code, err.getvalue()
 
     def planned_run_file(self):
         """A waiting proposal whose only change is to `Makefile`, as the session file on disk."""
@@ -704,6 +711,85 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
         code, text = self.run_command(["rollback", str(session), "--approve", approved])
         self.assertEqual(code, 1, text)
         self.assertNotIn("Makefile", text)
+
+    # ------------------------------- the command that answers back -------------------------------
+    def test_the_terminal_prints_the_eight_answers_and_says_who_set_none_of_them(self):
+        code, text = self.run_command(["policy", "--repo", str(self.root)])
+        self.assertEqual(code, 0, text)
+        for name in sorted(policy.TABLE):
+            self.assertIn(name + " = ", text)
+        self.assertIn("0 of 8", text, "a listing that cannot say how much it overrode is a table with no shape")
+
+    def test_a_row_set_here_is_the_row_the_same_terminal_obeys(self):
+        """One store, two entry points: the row this command writes is the row `apply` reads back, with no
+        window open anywhere."""
+        session, approved = self.planned_run_file()
+        code, text = self.run_command(["policy", "--repo", str(self.root),
+                                       "--action", policy.WRITE_THAT_RUNS, "--verdict", policy.ALLOW])
+        self.assertEqual(code, 0, text)
+        self.assertIn(policy.WRITE_THAT_RUNS + " = allow", text)
+        code, text = self.run_command(["apply", str(session), "--approve", approved])
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.root / "Makefile").read_text(encoding="utf-8"), self.SILENT)
+
+    def test_a_row_set_in_a_window_is_named_as_a_windows(self):
+        permissions.declare(self.app, self.root, policy.NETWORK, policy.DENY, by=permissions.WEB)
+        _code, text = self.run_command(["policy", "--repo", str(self.root)])
+        self.assertIn("the web window", text)
+        self.assertIn("network = deny", text)
+
+    def test_lifting_a_row_gives_the_answer_back_to_the_table(self):
+        self.run_command(["policy", "--repo", str(self.root),
+                          "--action", policy.WRITE_THAT_RUNS, "--verdict", policy.DENY])
+        code, text = self.run_command(["policy", "--repo", str(self.root), "--off"])
+        self.assertEqual(code, 0, text)
+        self.assertIn(policy.WRITE_THAT_RUNS + " = ask", text)
+        self.assertIn("0 of 8", text)
+
+    def test_lifting_one_class_leaves_the_others_declared(self):
+        self.run_command(["policy", "--repo", str(self.root), "--action", policy.NETWORK, "--verdict", "deny"])
+        self.run_command(["policy", "--repo", str(self.root),
+                          "--action", policy.WRITE_THAT_RUNS, "--verdict", "deny"])
+        code, text = self.run_command(["policy", "--repo", str(self.root), "--off",
+                                       "--action", policy.WRITE_THAT_RUNS])
+        self.assertEqual(code, 0, text)
+        self.assertIn("network = deny", text)
+        self.assertIn("1 of 8", text)
+
+    def test_a_class_that_does_not_exist_is_a_usage_error_not_a_default(self):
+        code, _text = self.usage_error(["policy", "--repo", str(self.root),
+                                        "--action", "teleport", "--verdict", "allow"])
+        self.assertEqual(code, 2)
+
+    def test_a_verdict_without_a_class_names_the_flag_it_wants(self):
+        code, text = self.run_command(["policy", "--repo", str(self.root), "--verdict", "allow"])
+        self.assertEqual(code, 1, text)
+        self.assertIn("both a class and a verdict", text)
+
+    def test_the_refusal_line_names_the_command_that_changes_it(self):
+        """A refusal that sends a person to a window they are not sitting in is a dead end, so the terminal
+        owes the exact line that works from where they stand."""
+        session, approved = self.planned_run_file()
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.DENY)
+        _code, text = self.run_command(["apply", str(session), "--approve", approved])
+        self.assertIn("agent policy --repo", text)
+        self.assertIn(policy.WRITE_THAT_RUNS, text)
+
+    def test_the_listing_of_every_folder_names_who_said_so(self):
+        self.run_command(["policy", "--repo", str(self.root), "--action", policy.NETWORK, "--verdict", "deny"])
+        code, text = self.run_command(["policy"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("the command line", text)
+        self.assertIn("network = deny", text)
+
+    def test_an_arabic_answer_keeps_the_class_names_in_latin(self):
+        """Verified by code point: a mangled literal looks like Arabic, and the class names are what a
+        person copies back into `--action`."""
+        code, text = self.run_command(["policy", "--repo", str(self.root), "--arabic"])
+        self.assertEqual(code, 0, text)
+        self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in text), text)
+        for name in sorted(policy.TABLE):
+            self.assertIn(name + " = ", text)
 
 
 if __name__ == "__main__":

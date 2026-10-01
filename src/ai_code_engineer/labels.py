@@ -608,6 +608,10 @@ NOTE_TEMPLATES = {
                             "يرسله، لا أكثر."),
     "policy_lift": ("To answer differently for this folder, set its policy row.",
                     "لتغيير الإجابة لهذا المجلد، اضبط سطر سياسته."),
+    "policy_how": ("To answer it differently from here, run:  agent policy --repo \"{folder}\" "
+                   "--action {action} --verdict allow|ask|deny",
+                   "للإجابة بشكل مختلف من هنا، شغّل:  agent policy --repo \"{folder}\" "
+                   "--action {action} --verdict allow|ask|deny"),
     "policy_heading": ("What this folder answers without asking:",
                        "ما يجيبه هذا المجلد من غير سؤال:"),
     "policy_allow_note": ("{count} of {total} action classes are answered by this folder's own rule",
