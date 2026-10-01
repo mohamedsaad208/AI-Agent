@@ -22,6 +22,7 @@ from ai_code_engineer.config import Settings
 from ai_code_engineer.engine import atomic_json, load_session, project_key
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES, AgentController, LineFeed
+from ai_code_engineer.webapp import runresults
 from doubles import (CALCULATOR_BAD, CALCULATOR_GOOD, ChatModel, FREE_ENTRY, OLLAMA_ENTRY,
                      PROOF, ProposalModel, run_result)
 
@@ -3079,6 +3080,25 @@ class TheActivityFeed(unittest.TestCase):
         self.assertIn("[redacted]", checks)
         self.assertIn("The full output is in Activity", checks)
         self.assertNotIn("**", checks, "a tool row is escaped, never rendered")
+
+    def test_the_checks_card_keeps_a_proposal_from_reading_as_a_result(self):
+        """The one line between "the model said it would check" and "a command answered".
+
+        Nothing asserted this text before it moved into `runresults`, and it is the promise the
+        README makes about the repository map: a proposed check is not proof of anything.
+        """
+        lines = runresults.checks_lines({"checks": ["run pytest"]})
+        self.assertEqual(lines[0], "Proposed checks (not execution results):")
+        self.assertIn("• run pytest", lines)
+        self.assertEqual([row for row in lines if "Latest check" in row], [])
+        self.assertEqual([row for row in lines if "Command runs" in row], [])
+        checked = runresults.checks_lines({"checks": [], "runs": [{"command": "pytest", "status":
+                                                                   "failed", "exit_code": 1,
+                                                                   "seconds": 3.2,
+                                                                   "failures": ["boom"]}]})
+        self.assertTrue(any("last was pytest" in row for row in checked), checked)
+        self.assertTrue(any("exit 1" in row for row in checked), checked)
+        self.assertTrue(any(row.strip() == "boom" for row in checked), checked)
 
     def test_a_running_line_does_not_outlive_the_job(self):
         """Two sentences belong on the strip after a job: an outcome, and nothing else."""

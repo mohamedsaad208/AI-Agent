@@ -58,6 +58,7 @@ from .. import (git_integration, host, ignore, intent, modes, overrides, planboo
                 runner, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
+from . import runresults
 
 DEFAULT_MODEL = "qwen2.5-coder:1.5b"
 RECOMMENDED = {
@@ -2993,51 +2994,23 @@ class AgentController:
     RUN_LOCKED_STATES = {"DISCOVERING", "WAITING_APPROVAL"}
 
     def run_status_info(self) -> dict:
+        """Whether each Run control is pressable — the answer `runresults.gate` builds from what
+        this window holds, because the gate is presentation and the state underneath it is ours."""
         state = self.session.get("state") if self.session else ""
-        reasons = []
-        has_project = bool(self.repo and Path(self.repo).is_dir())
-        if not has_project:
-            reasons.append({
-                "code": "no_project",
-                "title": "No project selected",
-                "action": "Select or open a project folder in the sidebar."
-            })
-        if self.busy:
-            reasons.append({
-                "code": "agent_busy",
-                "title": "Agent is busy",
-                "action": "Wait for the current operation to complete or press Stop."
-            })
-        if state in self.RUN_LOCKED_STATES:
-            reasons.append({
-                "code": "waiting_approval",
-                "title": "Changes waiting for approval",
-                "action": "Review the pending changes and click Apply or Rollback before running."
-            })
-
-        can_run_general = has_project and not self.busy and state not in self.RUN_LOCKED_STATES
-        can_run_app = can_run_general
-        can_run_tests = can_run_general and bool(self.recipes)
-        can_build = can_run_general
-        disabled_msg = (reasons[0]["title"] + ": " + reasons[0]["action"]) if reasons else ""
-
-        docker_avail = runner.sandbox_available()
-        return {
-            "canRun": can_run_general,
-            "canRunApp": can_run_app,
-            "canRunTests": can_run_tests,
-            "canBuild": can_build,
-            "reasons": reasons,
-            "disabledMessage": disabled_msg,
-            "dockerAvailable": docker_avail,
-            "dockerOn": bool(self.sandbox_on and docker_avail),
-            "dockerNote": "Docker is optional. Local execution runs directly using your system tools.",
-        }
+        return runresults.gate(
+            has_project=bool(self.repo and Path(self.repo).is_dir()),
+            busy=self.busy,
+            waiting_approval=state in self.RUN_LOCKED_STATES,
+            has_recipes=bool(self.recipes),
+            sandbox_requested=self.sandbox_on,
+            docker_available=runner.sandbox_available())
 
     def _can_run(self) -> bool:
         state = self.session.get("state") if self.session else ""
-        return (not self.busy and bool(self.recipes) and bool(self.repo)
-                and Path(self.repo).is_dir() and state not in self.RUN_LOCKED_STATES)
+        return runresults.can_run(has_project=bool(self.repo and Path(self.repo).is_dir()),
+                                  busy=self.busy,
+                                  waiting_approval=state in self.RUN_LOCKED_STATES,
+                                  has_recipes=bool(self.recipes))
 
     def sandbox_info(self) -> dict:
         """The container choice as the card draws it: the two values, whether this machine can honour
@@ -3129,33 +3102,12 @@ class AgentController:
         summary = runner.summarize(result)
         self.run_info = summary
         self._settle_run_step(result)
+        # One row either way: the sentence is `runresults`' business, the state under it is ours.
+        self._add("tool", "Checks", runresults.result_row(result, summary))
         if result["status"] == "passed":
-            self._add("tool", "Checks", "✅ " + summary)
             self._auto_fix = False
             self.status = status_text("command_passed", arabic=self.arabic) + summary
         else:
-            # A tool row is plain text — the thread escapes it and never runs markdown — and the
-            # pill collapses newlines, so this line has to read as one sentence with no markup.
-            # And this row is built from the raw runner result rather than the slimmed record the
-            # session stores, and `runner` does not scrub: the two other paths that show command
-            # output redact it (`repair.record_run` for storage and the model, `_build_line` for the
-            # stream). A test that prints its own connection string must not find the chat to do it
-            # in — every row here can be copied out with one click.
-            msg = "❌ " + summary + " — command: " + redact(str(result.get("command", "")))
-            failures = result.get("failures") or []
-            if failures:
-                msg += (" · Errors: " + " | ".join(redact(str(f).strip())
-                                                   for f in failures[:repair.FAILURES_KEPT]))
-            elif result.get("reason"):
-                msg += " · Reason: " + redact(str(result["reason"]))
-            elif result.get("tail"):
-                err_lines = [l.strip() for l in result["tail"].strip().splitlines()
-                             if "[ERROR]" in l or "Error" in l or "Exception" in l]
-                sample = err_lines[-6:] or [l.strip() for l in result["tail"].strip().splitlines()][-6:]
-                if sample:
-                    msg += " · Output: " + " | ".join(redact(line) for line in sample)
-            msg += " · The full output is in Activity."
-            self._add("tool", "Checks", msg)
             if self._auto_fix and result["status"] in {"failed", "timeout"}:
                 self.ask_for_fix(result)
                 return
@@ -4079,25 +4031,10 @@ class AgentController:
                 "diff": _diff(chosen["before"] or "", chosen["after"] or "", chosen["path"]) if chosen else [],
                 "before": (chosen["before"] or "").splitlines() if chosen else [],
                 "after": (chosen["after"] or "").splitlines() if chosen else [],
-                "checks": self._checks_text(session),
-            } if chosen else {"diff": [], "before": [], "after": [], "checks": self._checks_text(session)},
+                "checks": runresults.checks_lines(session),
+            } if chosen else {"diff": [], "before": [], "after": [],
+                              "checks": runresults.checks_lines(session)},
         }
-
-    def _checks_text(self, session: dict) -> list[str]:
-        out = ["Proposed checks (not execution results):"] + ["• " + check for check in session.get("checks", [])]
-        result = session.get("verification")
-        if result:
-            out.append("Latest check: " + result.get("status", "unknown"))
-            out += [item["path"] + ": " + item["status"] for item in result.get("static", [])]
-            if result.get("reason"):
-                out.append(result["reason"])
-        runs = session.get("runs") or []
-        if runs:
-            last = runs[-1]
-            out.append(f"Command runs ({len(runs)}): last was {last.get('command', '')}")
-            out.append(f"→ {last.get('status')} · exit {last.get('exit_code')} · {last.get('seconds')}s")
-            out += ["  " + str(row)[:200] for row in (last.get("failures") or [])[:8]]
-        return out
 
     # ------------------------------ persistence ------------------------------
     def _sync_project(self) -> None:
