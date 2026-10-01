@@ -12,6 +12,11 @@ from .core import (
     Tool,
     VerificationResult,
 )
+from .repair import (
+    execute_verification,
+    handle_fix_evaluation,
+    verification_from_run,
+)
 from .repo_scanner import (
     ProjectIndex,
     RepoScanner,
@@ -32,7 +37,10 @@ __all__ = [
     "Task",
     "Tool",
     "VerificationResult",
+    "execute_verification",
     "get_or_create_index",
+    "handle_fix_evaluation",
     "index_boost",
     "load_index",
+    "verification_from_run",
 ]
