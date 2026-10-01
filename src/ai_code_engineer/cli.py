@@ -11,9 +11,11 @@ import sys
 from .config import load_settings, validate
 from .engine import apply_proposal, load_session, plan, reopen_proposal, review, rollback
 from .errors import AgentError
+from .labels import asked_of, is_arabic, policy_line
+from .labels import note as shared_note
 from .providers import make_provider
 from .report import export_file, find_session
-from . import config, intent, modes, overrides, setup
+from . import config, intent, modes, overrides, permissions, policy, setup
 from .verification import RECIPES, verify
 from .workspace import Workspace
 
@@ -139,6 +141,25 @@ def refuses_sealed(folder, what: str) -> None:
     """
     if modes.sealed(app_dir(), folder):
         raise AgentError(modes.refusal(app_dir(), folder, what) + "  " + intent.lift(str(folder)))
+
+
+def refuses_policy(folder, session, interactive: bool = True) -> None:
+    """Stop a terminal write that edits the file this tool takes its commands out of.
+
+    DENY is the folder's own rule and is refused outright. ASK is refused when nobody is typing: the
+    proposal hash an operator types for `apply` *is* the confirmation this class asks for, and
+    `--approve` from a script carries no such keystroke — so an automation that wants it says so once,
+    in the folder's policy, instead of getting it silently on every run.
+    """
+    runs = policy.runs_later_paths((session or {}).get("changes"))
+    if not runs:
+        return
+    verdict = permissions.verdict(app_dir(), folder, policy.WRITE_THAT_RUNS)
+    if verdict not in (policy.DENY, policy.ASK) or (verdict == policy.ASK and interactive):
+        return
+    arabic = is_arabic(asked_of(str((session or {}).get("task", ""))))
+    raise AgentError(policy_line(arabic, policy.WRITE_THAT_RUNS, verdict, names=", ".join(runs[:3]))
+                     + "  " + shared_note("policy_lift", arabic=arabic))
 
 
 def speak_arabic() -> None:
@@ -373,6 +394,10 @@ def main(argv: list[str] | None = None) -> int:
                 # Checked before anything is asked, because a hash typed for a write that was never
                 # going to happen teaches the operator that the prompts do not mean anything.
                 refuses_sealed(session.get("root", ""), args.command)
+                if args.command == "apply":
+                    # Only the forward write is asked about. A roll back returns a file to the state the
+                    # operator already reviewed, and refusing it would use a guard to block the way out.
+                    refuses_policy(session.get("root", ""), session, interactive=sys.stdin.isatty())
                 approved = args.approve
                 if not approved:
                     safe_print(review(session))

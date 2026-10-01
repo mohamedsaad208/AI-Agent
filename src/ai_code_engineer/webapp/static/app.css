@@ -1100,6 +1100,19 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
   overflow-y: auto; white-space: pre-wrap; word-break: break-all;
 }
 
+/* The policy rows: one action class per line, the answer it currently gets, and the buttons that
+   change it. Collapsed by default because eight rows on the run card would push the run itself off
+   the screen, and the card is read for the run. */
+.policy-card { margin-top: 10px; font-size: 11.5px; }
+.policy-card > summary { cursor: pointer; font-weight: 600; opacity: 0.92; }
+.policy-row {
+  display: flex; align-items: center; gap: 6px; margin-top: 5px; flex-wrap: wrap;
+}
+.policy-row .p-act { font-family: var(--mono); flex: 1; min-width: 110px; overflow-wrap: anywhere; }
+.policy-row .p-ver { padding: 1px 6px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); }
+.policy-row .p-ver.set { border-color: var(--accent); }
+.policy-row .p-btns { display: flex; gap: 4px; }
+
 .fix-card {
   background: var(--bad-bg); color: var(--bad-ink); border: 1px solid var(--bad-line);
   border-radius: var(--r-m); padding: 10px 12px; display: flex; flex-direction: column; gap: 7px;

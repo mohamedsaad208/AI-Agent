@@ -157,6 +157,7 @@ function renderRail() {
     const cfg = DATA.runConfig || {};
     const many = (DATA.targets || []).length > 1;
     const sb = DATA.sandbox || {};
+    const pl = DATA.policy || {};
     const folderName = (DATA.project && DATA.project.name) || 'Project';
 
     const c = el('div', 'card');
@@ -191,6 +192,15 @@ function renderRail() {
         ${sb.on && sb.available ? '' : 'disabled'} style="width:100%;font-family:Consolas,monospace;margin-top:5px">
       <div class="meta" dir="auto">${esc(sb.note || rs.dockerNote || '')}</div>
       ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
+      ${(pl.rows || []).length ? `<details class="policy-card"><summary dir="auto">${esc(pl.heading || '')}</summary>
+        ${pl.rows.map(r => `<div class="policy-row" dir="auto"><span class="p-act">${esc(r.action)}</span>
+          <span class="p-ver${r.declared ? ' set' : ''}">${esc((pl.words || {})[r.verdict] || r.verdict)}</span>
+          <span class="p-btns">${['allow', 'ask', 'deny'].map(v =>
+            `<button class="line-btn p-set" data-a="${esc(r.action)}" data-v="${v}" ${r.verdict === v ? 'disabled' : ''}>${esc((pl.words || {})[v] || v)}</button>`).join('')}
+            ${r.declared ? `<button class="line-btn p-clear" data-a="${esc(r.action)}" title="reset">↺</button>` : ''}</span>
+        </div>`).join('')}
+        <div class="meta" dir="auto">${esc(pl.note || '')}</div>
+        <div class="meta" dir="auto">${esc(pl.lift || '')}</div></details>` : ''}
       ${DATA.runInfo ? `<div class="d" style="margin-top:9px">${esc(DATA.runInfo)}</div>` : ''}`;
 
     c.querySelector('#run-app').onclick = () => {
@@ -219,6 +229,14 @@ function renderRail() {
     }
     c.querySelector('#sandboxOn').onchange = (e) => send('sandbox', { on: e.target.checked });
     c.querySelector('#sandboxImage').onchange = (e) => send('sandbox', { image: e.target.value });
+    // The action and the verdict travel as data attributes, never as text read back off the row: a
+    // label is a sentence and a sentence changes with the language, while this has to name a class.
+    c.querySelectorAll('.p-set').forEach(b => {
+      b.onclick = () => send('set_policy', { action: b.dataset.a, verdict: b.dataset.v });
+    });
+    c.querySelectorAll('.p-clear').forEach(b => {
+      b.onclick = () => send('set_policy', { action: b.dataset.a });
+    });
     rail.appendChild(c);
 
     // Active Service or Last Job Failure Card

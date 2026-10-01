@@ -581,6 +581,37 @@ NOTE_TEMPLATES = {
                              "أحد الملفات فقد تعريفات أكثر مما هو مُدرج هنا ({max} لكل نوع)"),
     "impact_unknown_failed": ("the impact check could not run, so nothing was verified about other files",
                               "لم يستطيع فحص الأثر أن يعمل، لذا لم يُتحقق أي شيء بخصوص الملفات الأخرى"),
+    # ---- the policy table (#4). `policy.py` answers with a class and a verdict, `permissions.py`
+    # remembers the folder's own word; these are the sentences an operator reads when one of them
+    # stands between a click and a command.
+    "policy_ask_write_that_runs": ("This change edits {names}, a file this tool reads back as the command "
+                                   "to run. Confirm to write it.",
+                                   "هذا التعديل يغيّر {names}، وهو ملف تقرأ هذه الأداة منه الأمر الذي "
+                                   "تنفّذه. أكّد للكتابة."),
+    "policy_deny_write_that_runs": ("This folder was told never to let a change edit the file its commands "
+                                    "come from ({names}).",
+                                    "هذا المجلد أُمر ألا يعدّل أبدًا الملف الذي تُؤخذ منه أوامره ({names})."),
+    "policy_ask_execute_custom": ("This command is not one of the project's own recipes, so it runs on your "
+                                  "word alone. Confirm to run it once.",
+                                  "هذا الأمر ليس من وصفات المشروع الجاهزة، لذا سينفّذ بناء على كلمتك وحدها. "
+                                  "أكّد لتنفيذه مرة واحدة."),
+    "policy_deny_execute_custom": ("A model asked for a shell command. Commands here come from you, not from "
+                                   "the agent.",
+                                   "أحد النماذج طلب أمر نظام. الأوامر هنا صادرة منك، لا من الوكيل."),
+    "policy_ask_network": ("This address is outside the local ranges the provider rules already accept. "
+                            "Confirm to send the request once.",
+                            "هذا العنوان خارج النطاقات المحلية التي تقبلها قواعد المزوّد. أكّد لإرسال الطلب "
+                            "مرة واحدة."),
+    "policy_deny_network": ("A model asked to reach an address. This tool sends a network request when you "
+                            "press the button that makes one, and not otherwise.",
+                            "أحد النماذج طلب الوصول إلى عنوان. هذه الأداة ترسل طلب شبكة عندما تضغط الزر الذي "
+                            "يرسله، لا أكثر."),
+    "policy_lift": ("To answer differently for this folder, set its policy row.",
+                    "لتغيير الإجابة لهذا المجلد، اضبط سطر سياسته."),
+    "policy_heading": ("What this folder answers without asking:",
+                       "ما يجيبه هذا المجلد من غير سؤال:"),
+    "policy_allow_note": ("{count} of {total} action classes are answered by this folder's own rule",
+                          "{count} من {total} من أنواع الأفعال تُجيبها قاعدة هذا المجلد نفسها"),
 }
 
 # `apply_rerun_warning` is the only one with no second-language twin in the other window: Tk has no
@@ -598,6 +629,39 @@ def note(key: str, *, arabic: bool = False, **fields) -> str:
         raise KeyError("no shared sentence named " + str(key))
     english, arabic_text = NOTE_TEMPLATES[key]
     return say(arabic, en=english, ar=arabic_text).format(**fields)
+
+
+# The classes that have a sentence. An ALLOW is silence — the operator is not told about a thing the
+# tool went ahead with, which is what an approval flow already looks like from the inside.
+POLICY_SENTENCES = {
+    "write_that_runs": ("policy_ask_write_that_runs", "policy_deny_write_that_runs"),
+    "execute_custom": ("policy_ask_execute_custom", "policy_deny_execute_custom"),
+    "network": ("policy_ask_network", "policy_deny_network"),
+}
+
+# The three answers as words on a button. Action classes stay as codes: they are names of things in the
+# table, the way a recipe id is, and translating a name would break the row that says which one it was.
+POLICY_VERDICT_AR = {"allow": "سماح", "ask": "اسأل", "deny": "رفض"}
+
+
+def policy_verdicts(arabic: bool) -> dict:
+    """The verdict words, so a control can be labelled in the language the task was asked in."""
+    return {code: (POLICY_VERDICT_AR[code] if arabic else code) for code in POLICY_VERDICT_AR}
+
+
+def policy_line(arabic: bool, action: str, verdict: str, **fields) -> str:
+    """What one action class answers, said in the language the task was asked in.
+
+    The engine and the windows both need this sentence, and neither may write it: a refusal whose words
+    live at the call site is a refusal one window can rephrase into something the operator approves. An
+    unknown class or an ALLOW answers with the empty string, because the caller's own text is then the
+    only thing on screen.
+    """
+    pair = POLICY_SENTENCES.get(str(action or ""))
+    if not pair:
+        return ""
+    key = pair[0] if str(verdict or "") == "ask" else pair[1] if str(verdict or "") == "deny" else ""
+    return note(key, arabic=arabic, **fields) if key else ""
 
 
 def impact_lines(report: dict, *, arabic: bool = False) -> list[str]:

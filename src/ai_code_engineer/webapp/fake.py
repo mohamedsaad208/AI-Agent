@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, modes, overrides, repair, runner, setup
+from .. import config, git_integration, intent, labels, modes, overrides, permissions, policy, repair, runner, setup
 from ..errors import PolicyError
 from .controller import PROJECT_ICONS as ICONS
 from . import uistate
@@ -173,6 +173,10 @@ class FakeController:
         # The real window's `available` comes from `runner.sandbox_available()`.
         self.sandbox_on = False
         self.sandbox_image = ""
+        # The policy rows, scripted the same way the sandbox switch is: the *answers* are what is being
+        # reviewed, so a click has to move one. Overrides only, because the defaults come from the real
+        # table rather than from anything written here.
+        self.policy_over: dict = {}
         self.composer = "chat"
         # The scripted twin of the controller's `declared` block: the folder's own position, kept by
         # whichever surface wrote it. The preview needs the field or the lock on the badge cannot be
@@ -398,6 +402,15 @@ class FakeController:
             "sandbox": {"on": bool(self.sandbox_on), "image": self.sandbox_image, "available": True,
                         "note": labels.note(runner.sandbox_state(self.sandbox_on,
                                                                  self.sandbox_image, True))},
+            "policy": {"heading": labels.note("policy_heading"),
+                       "lift": labels.note("policy_lift"),
+                       "words": labels.policy_verdicts(False),
+                       "rows": [{"action": name, "declared": name in self.policy_over,
+                                 "verdict": self.policy_over.get(
+                                     name, policy.TABLE[name][policy.OPERATOR])}
+                                for name in policy.ACTIONS],
+                       "note": labels.note("policy_allow_note",
+                                           count=len(self.policy_over), total=len(policy.ACTIONS))},
             # The loop's budget, from the same constant the real controller reads it from: a field the
             # preview never sends is a field the window is never drawn with.
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
@@ -761,6 +774,16 @@ class FakeController:
                 self.sandbox_on = bool(payload.get("on"))
             if "image" in payload:
                 self.sandbox_image = str(payload.get("image") or "")
+        elif type == "set_policy":
+            # One row, one answer. A click that moved nothing would make the preview useless for
+            # reviewing the thing it exists to show.
+            name = str(payload.get("action") or "")
+            verdict = str(payload.get("verdict") or "")
+            if name in policy.ACTIONS:
+                if verdict in policy.VERDICTS:
+                    self.policy_over[name] = verdict
+                else:
+                    self.policy_over.pop(name, None)
         elif type == "set_auto_apply":
             # The pill next to Send and the composer placeholder both key off this, so a preview
             # that ignored the click could not be used to review either of them.

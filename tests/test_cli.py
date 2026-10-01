@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
-from ai_code_engineer import catalog, modes, setup
+from ai_code_engineer import catalog, modes, permissions, policy, setup
 from ai_code_engineer.cli import doctor, main, parser, run_setup
 from ai_code_engineer.errors import AgentError
 from doubles import CALCULATOR_BAD, CALCULATOR_GOOD
@@ -608,6 +608,102 @@ class TheFolderSOwnPosition(unittest.TestCase):
         code, text = self.run_command(["review", str(session)])
         self.assertEqual(code, 0, text)
         self.assertIn("calculator.py", text)
+
+
+class TheRunFileAtTheTerminal(unittest.TestCase):
+    """`agent apply` on a change to the file this tool takes its own commands out of.
+
+    The class the policy table asks about is the write that changes what runs *later*, and the terminal
+    is where it matters most: a person approving a hash there has seen a diff, not the build file's new
+    meaning. These go through `main([...])` because the thing under test is a command typed at a
+    keyboard, in a folder whose rule was set in a window the operator is not looking at.
+    """
+
+    RUNS = "test:\n\tpython -m pytest -q\n"
+    SILENT = "test:\n\t@echo nothing runs\n"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app = Path(self.temp.name)
+        self.root = sandbox_repo(self.temp.name)
+        self.runs = self.app / "runs"
+        where = patch("ai_code_engineer.cli.app_dir", return_value=self.app)
+        where.start()
+        self.addCleanup(where.stop)
+
+    def run_command(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue()
+
+    def planned_run_file(self):
+        """A waiting proposal whose only change is to `Makefile`, as the session file on disk."""
+        (self.root / "Makefile").write_text(self.RUNS, encoding="utf-8", newline="\n")
+        started = patch("ai_code_engineer.cli.make_provider",
+                        return_value=ScriptedProvider([
+                            {"action": "read_file", "path": "Makefile"},
+                            {"action": "propose", "summary": "Make the test target quiet",
+                             "checks": ["Run the tests"],
+                             "changes": [{"path": "Makefile", "content": self.SILENT}]}]))
+        started.start()
+        self.addCleanup(started.stop)
+        code, text = self.run_command(["plan", "Silence the test target", "--repo", str(self.root),
+                                       "--runs", str(self.runs)])
+        self.assertEqual(code, 0, text)
+        session = Path([row for row in text.splitlines()
+                        if row.startswith("Session: ")][0].split("Session: ", 1)[1].strip())
+        return session, json.loads(session.read_text(encoding="utf-8"))["proposal_hash"]
+
+    # ------------------------------- the two verdicts -------------------------------
+    def test_a_folder_that_refuses_the_run_file_refuses_the_terminal_write(self):
+        session, approved = self.planned_run_file()
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.DENY)
+        code, text = self.run_command(["apply", str(session), "--approve", approved])
+        self.assertEqual(code, 1, text)
+        self.assertIn("Error:", text)
+        self.assertIn("Makefile", text, "a refusal that does not name the file sends a person to guess")
+        self.assertEqual((self.root / "Makefile").read_text(encoding="utf-8"), self.RUNS)
+
+    def test_a_rule_that_asks_is_refused_when_nobody_is_typing_at_it(self):
+        """`--approve` carries a hash, not a keystroke, so the class that asks cannot be satisfied by a
+        script. The folder that wants it unattended says so once in its policy."""
+        session, _ = self.planned_run_file()
+        with patch("sys.stdin", io.StringIO()):
+            code, text = self.run_command(["apply", str(session)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("Error:", text)
+        self.assertNotIn("Type the full proposal", text,
+                         "asking for a hash is promising the write follows it")
+        self.assertEqual((self.root / "Makefile").read_text(encoding="utf-8"), self.RUNS)
+
+    def test_a_folder_that_answered_allow_writes_it(self):
+        session, approved = self.planned_run_file()
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.ALLOW)
+        code, text = self.run_command(["apply", str(session), "--approve", approved])
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.root / "Makefile").read_text(encoding="utf-8"), self.SILENT)
+
+    def test_the_rule_that_stopped_the_write_never_blocks_the_way_back(self):
+        """A roll back returns a file to the state this folder already approved, so answering it from the
+        same table would use a guard to lock the operator inside the change they are leaving."""
+        session, approved = self.planned_run_file()
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.ALLOW)
+        self.run_command(["apply", str(session), "--approve", approved])
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.DENY)
+        code, text = self.run_command(["rollback", str(session), "--approve", approved])
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.root / "Makefile").read_text(encoding="utf-8"), self.RUNS)
+
+    def test_a_denied_run_file_is_not_the_reason_an_unapplied_rollback_fails(self):
+        """Nothing was written, so nothing is being returned: the answer must be about the session, not
+        about a rule the command never consulted."""
+        session, approved = self.planned_run_file()
+        permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.DENY)
+        code, text = self.run_command(["rollback", str(session), "--approve", approved])
+        self.assertEqual(code, 1, text)
+        self.assertNotIn("Makefile", text)
 
 
 if __name__ == "__main__":

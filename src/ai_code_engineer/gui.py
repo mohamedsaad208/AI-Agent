@@ -23,13 +23,13 @@ from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
-                     catalog_status_line, friendly_error, impact_lines, is_arabic, run_warning,
-                     state_label, status_text)
+                     catalog_status_line, friendly_error, impact_lines, is_arabic, policy_line,
+                     run_warning, state_label, status_text)
 from .labels import note as shared_note      # `note` is a local variable in two methods here
 from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
-from . import planbook, repair, runner, session_flow
+from . import permissions, planbook, policy, repair, runner, session_flow
 from . import host, intent, modes, setup
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
@@ -2355,8 +2355,23 @@ class AgentWindow:
         # dropped the `warning` the builder returned, so a proposal that emptied or deleted a file
         # warned about it in the web window only. Both halves are the verb's job now.
         prior = self.unverified_prior_task(self.chat_id, self.repo.get().strip())
+        # The same two verdicts the web window applies to this class of write, read from the same file:
+        # a proposal that edits the file the tool takes its commands from is not only about that file,
+        # and a rule one window set is a rule the other obeys.
+        runs = policy.runs_later_paths((self.session or {}).get("changes"))
+        runs_verdict, runs_line = (permissions.verdict(self.app_dir, self.repo.get().strip(),
+                                                       policy.WRITE_THAT_RUNS), "") if runs else ("", "")
+        if runs:
+            runs_line = policy_line(self.arabic, policy.WRITE_THAT_RUNS, runs_verdict,
+                                    names=", ".join(runs[:3]))
+            if runs_verdict == policy.DENY:
+                self.say(runs_line)
+                return
+        reason = repair.must_ask(self.session, prior)
+        if runs_line and runs_verdict == policy.ASK:
+            reason = (reason + " " + runs_line).strip() if reason else runs_line
         prompt = host.apply_prompt(self.session, notice=self.approval_notice(),
-                                   reason=repair.must_ask(self.session, prior), again=again)
+                                   reason=reason, again=again)
         if not self.ask(prompt["title"], prompt["message"], prompt["warning"], prompt["ok_label"]):
             return
         path, approved = self.session_path, self.session["proposal_hash"]

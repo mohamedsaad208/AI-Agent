@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -26,6 +28,8 @@ from ..catalog import LIVE, models_for
 from ..chat import (context_block, create_chat, load_chat, project_of, respond,
                     title_for)
 from .. import config
+from .. import permissions
+from .. import policy
 from .. import service_runner
 from ..config import Settings
 from ..engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, diff_size,
@@ -41,6 +45,7 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIEL
                       executing_line, friendly_error, fix_offers_off_line, impact_lines, is_arabic,
                       log_dropped_line, log_line,
                       no_branch_note, no_checkpoint_note,
+                      policy_line, policy_verdicts,
                       quote_reference, rejected_note,
                       restore_done, restore_offer, run_unrecorded_line, run_verdict, run_warning,
                       say, state_label,
@@ -970,6 +975,8 @@ class AgentController:
             "runWarning": run_warning(arabic=self.arabic),
             # And said where the command it warns about will actually run.
             "sandbox": self.sandbox_info(),
+            # Which action classes this folder answers for, so the ask on screen has a row behind it.
+            "policy": self.policy_block(),
             "memory": {"info": self._memory_info()},
             "settings": {"project": self.repo, "plan": self.plan_file, "chained": self.chained,
                          "auto_apply": self.auto_apply, "bound": bool(self.branch.get("bound")),
@@ -1020,6 +1027,9 @@ class AgentController:
             # The container switch and its image field: one action, because a tick without the digest
             # it belongs to is half an answer.
             "sandbox": lambda: self.set_sandbox(payload),
+            # One row per action class: the answer the folder gives from now on, or the answer taken
+            # back so the table speaks again.
+            "set_policy": lambda: self.set_policy(payload),
             # Opening a step row: the id is the handle on the records this session already keeps, and
             # an empty one closes the row. Nothing here reads or writes the project.
             "step_detail": lambda: self.open_step(str(payload.get("id", ""))),
@@ -1190,6 +1200,82 @@ class AgentController:
         """
         return modes.refusal(self.app_dir, self.repo, what, arabic=self.arabic,
                              badge=self.composer)
+
+    def policy_check(self, action: str, origin: str = "", **fields) -> tuple[str, str]:
+        """What this folder answers for one action class, and the sentence that says so.
+
+        Read from the file rather than from anything this window remembers, for the reason `modes.py`
+        records: a rule the other window wrote a minute ago is a rule this one obeys. `origin` names
+        who is asking — a person at a button, or a model mid-task — and the answer differs for exactly
+        the two classes that can reach a shell or a socket.
+        """
+        verdict = permissions.verdict(self.app_dir, self.repo or "", action,
+                                      origin or policy.OPERATOR)
+        return verdict, policy_line(self.arabic, action, verdict, **fields)
+
+    def policy_confirm(self, action: str, origin: str = "", **fields) -> str:
+        """The sentence that stopped this action, or "" when it may go ahead.
+
+        ALLOW answers "" without a dialog — a tool that interrupts for what it permits has trained the
+        operator to press through it, which is the habit every real guard here exists to avoid. DENY
+        says the sentence and stops. ASK puts the sentence in front of the button, with the lift note
+        under it, because an ask that cannot be ended is a refusal that arrives twice a day. Returning
+        the words rather than a flag is what lets a command handler answer with the reason it did not
+        run, in the same field its own failure uses.
+        """
+        verdict, line = self.policy_check(action, origin, **fields)
+        if verdict == policy.ALLOW:
+            return ""
+        if verdict == policy.DENY or not line:
+            self.say(line or "Refused: " + str(action))
+            return line or "Refused: " + str(action)
+        if self.confirm("Confirm", line, shared_note("policy_lift", arabic=self.arabic)):
+            return ""
+        self.say(line)
+        return line
+
+    def policy_block(self) -> dict:
+        """This folder's answers, as data with the sentences already chosen.
+
+        Every class is listed whether the folder spoke about it or not, because the useful question is
+        "what will this tool do without asking me", and answering it from the overrides alone would show
+        an empty card for exactly the folder that is running on the table's defaults.
+        """
+        if not self.repo or not Path(self.repo).is_dir():
+            return {}
+        declared = permissions.overrides(self.app_dir, self.repo)
+        rows = [{"action": name,
+                 "verdict": permissions.verdict(self.app_dir, self.repo, name),
+                 "declared": name in declared} for name in policy.ACTIONS]
+        return {"heading": shared_note("policy_heading", arabic=self.arabic),
+                "lift": shared_note("policy_lift", arabic=self.arabic),
+                "words": policy_verdicts(self.arabic),
+                "rows": rows,
+                "note": shared_note("policy_allow_note", arabic=self.arabic,
+                                    count=sum(1 for row in rows if row["declared"]),
+                                    total=len(rows))}
+
+    def set_policy(self, payload: dict) -> dict:
+        """Answer one action class for this folder, or take the answer back.
+
+        The row exists because an ask that cannot be ended is a refusal that arrives twice a day, and
+        the alternative — approving whatever appears until the dialog stops meaning anything — is the
+        failure this table was written to prevent. This is the one place a verdict changes, and it is a
+        deliberate click rather than a consequence of a run.
+        """
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        action = str(payload.get("action") or "")
+        if action not in policy.ACTIONS:
+            raise PolicyError("Unknown action class: " + action[:40])
+        verdict = str(payload.get("verdict") or "")
+        if verdict in policy.VERDICTS:
+            permissions.declare(self.app_dir, self.repo, action, verdict, by=permissions.WEB)
+        else:
+            permissions.forget(self.app_dir, self.repo, action)
+        self.say(self.policy_check(action)[1] or
+                 f"{action} is back on the table's own answer for this folder.")
+        return self.policy_block()
 
     def _branch_mode(self, key: str) -> str:
         """A chat with no folder can only answer in prose; a project keeps the position it was told to
@@ -2491,6 +2577,16 @@ class AgentController:
                          ar="رُفض هذا المقترح. أعد فتحه للمراجعة قبل تطبيقه."))
             return
         changes = self.session.get("changes", [])
+        # A change to the file this tool reads its commands out of is the one write that is not only
+        # about that file: it decides what the *next* click runs. So it gets its own verdict, and an ASK
+        # borrows the same lever Auto-Apply pulls on — a reason sitting in `must_ask`'s seat is exactly
+        # what takes a write off the silent path.
+        runs = policy.runs_later_paths(changes)
+        runs_verdict, runs_line = (self.policy_check(policy.WRITE_THAT_RUNS,
+                                                     names=", ".join(runs[:3])) if runs else ("", ""))
+        if runs_verdict == policy.DENY:
+            self.say(runs_line)
+            return
         again = ""
         if self._auto_fix and self.selected_recipe():
             again = shared_note("apply_rerun_warning", arabic=self.arabic,
@@ -2500,6 +2596,8 @@ class AgentController:
         # `must_ask` is the whole refusal rule, and it is the same one the switch's own tooltip
         # describes: an emptying proposal, or a folder a previous task left half-written.
         reason = repair.must_ask(self.session, prior)
+        if runs_line:
+            reason = (reason + " " + runs_line).strip() if reason else runs_line
         self.wrote_without_asking = bool(self.auto_apply and not reason)
         self.auto_banner = len(changes) if self.wrote_without_asking else 0
         if not self.wrote_without_asking:
@@ -3039,7 +3137,13 @@ class AgentController:
         
         def on_line(line):
             self._build_line(f"[{name}] {line}")
-            
+
+        # The command here comes from the project's own file, which is the definition of a thing this
+        # tool did not choose: it starts a process that outlives the click, so it is asked about on the
+        # same terms as a typed command rather than run because a config file said so.
+        stopped = self.policy_confirm(policy.EXECUTE_CUSTOM)
+        if stopped:
+            raise PolicyError(stopped)
         svc = service_runner.GLOBAL_SERVICES.start_service(
             svc_id, name, command, cwd, port=port, on_output=on_line
         )
@@ -3134,6 +3238,12 @@ class AgentController:
         method = str(payload.get("method") or "GET").upper()
         if not url.startswith(("http://", "https://")):
             raise PolicyError("API test requires a valid http:// or https:// URL.")
+        # A scheme check says what the string looks like, not where the packet goes. The provider path
+        # already refuses to leave the loopback range without consent; this one sends whatever the page
+        # was handed, to anywhere, with whatever headers — so it asks the same table first.
+        stopped = self.policy_confirm(policy.NETWORK)
+        if stopped:
+            raise PolicyError(stopped)
         headers = dict(payload.get("headers") or {})
         body_text = payload.get("body")
         data = body_text.encode("utf-8") if body_text else None
@@ -3227,6 +3337,12 @@ class AgentController:
             raise PolicyError("Command cannot be empty.")
         subdir = str(payload.get("subdir") or "").strip()
         fav_name = str(payload.get("favorite_name") or "").strip()
+        # The recipe list is a whitelist with its own refusal; this is the path that has no list at
+        # all, so the table answers before anything is run and before anything is recorded.
+        stopped = self.policy_confirm(policy.EXECUTE_CUSTOM)
+        if stopped:
+            return {"command": command, "cwd": str(self.repo), "exit_code": 1,
+                    "output": stopped, "duration": 0.0, "success": False}
         
         # Record command in history/favorites (redacting secrets)
         service_runner.record_custom_command(Path(self.repo), command, subdir, fav_name)
