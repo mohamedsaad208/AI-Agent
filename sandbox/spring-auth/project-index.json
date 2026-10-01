@@ -1,0 +1,293 @@
+{
+  "root": "D:\\AI\\AI-Agent\\sandbox\\spring-auth",
+  "generated_at": "2026-10-01T13:15:28.389653+00:00",
+  "modules": [
+    "."
+  ],
+  "controllers": [
+    {
+      "path": "src/main/java/com/example/auth/web/AuthController.java",
+      "layer": "controller",
+      "package": "com.example.auth.web",
+      "module": "src",
+      "types": [
+        {
+          "name": "AuthController",
+          "kind": "class",
+          "package": "com.example.auth.web",
+          "file": "src/main/java/com/example/auth/web/AuthController.java",
+          "members": [
+            "AuthController(UserStore users, JwtTokenProvider tokens)",
+            "login(@RequestBody LoginRequest request)"
+          ],
+          "extends": [],
+          "line": 15
+        }
+      ],
+      "depends_on": [
+        "src/main/java/com/example/auth/dto/LoginRequest.java",
+        "src/main/java/com/example/auth/dto/LoginResponse.java",
+        "src/main/java/com/example/auth/service/JwtTokenProvider.java",
+        "src/main/java/com/example/auth/service/UserStore.java"
+      ]
+    }
+  ],
+  "services": [
+    {
+      "path": "src/main/java/com/example/auth/service/JwtTokenProvider.java",
+      "layer": "service",
+      "package": "com.example.auth.service",
+      "module": "src",
+      "types": [
+        {
+          "name": "JwtTokenProvider",
+          "kind": "class",
+          "package": "com.example.auth.service",
+          "file": "src/main/java/com/example/auth/service/JwtTokenProvider.java",
+          "members": [
+            "issue(String subject)",
+            "lifetimeSeconds()",
+            "subjectOf(String token)"
+          ],
+          "extends": [],
+          "line": 14
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "path": "src/main/java/com/example/auth/service/UserStore.java",
+      "layer": "service",
+      "package": "com.example.auth.service",
+      "module": "src",
+      "types": [
+        {
+          "name": "UserStore",
+          "kind": "class",
+          "package": "com.example.auth.service",
+          "file": "src/main/java/com/example/auth/service/UserStore.java",
+          "members": [
+            "matches(String username, String password)",
+            "digestOf(String value)"
+          ],
+          "extends": [],
+          "line": 10
+        }
+      ],
+      "depends_on": []
+    }
+  ],
+  "repositories": [],
+  "entities": [],
+  "dtos": [
+    {
+      "path": "src/main/java/com/example/auth/dto/LoginRequest.java",
+      "layer": "dto",
+      "package": "com.example.auth.dto",
+      "module": "src",
+      "types": [
+        {
+          "name": "LoginRequest",
+          "kind": "record",
+          "package": "com.example.auth.dto",
+          "file": "src/main/java/com/example/auth/dto/LoginRequest.java",
+          "members": [],
+          "extends": [],
+          "line": 3
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "path": "src/main/java/com/example/auth/dto/LoginResponse.java",
+      "layer": "dto",
+      "package": "com.example.auth.dto",
+      "module": "src",
+      "types": [
+        {
+          "name": "LoginResponse",
+          "kind": "record",
+          "package": "com.example.auth.dto",
+          "file": "src/main/java/com/example/auth/dto/LoginResponse.java",
+          "members": [],
+          "extends": [],
+          "line": 3
+        }
+      ],
+      "depends_on": []
+    }
+  ],
+  "security": [
+    {
+      "path": "src/main/java/com/example/auth/config/SecurityConfig.java",
+      "layer": "security",
+      "package": "com.example.auth.config",
+      "module": "src",
+      "types": [
+        {
+          "name": "SecurityConfig",
+          "kind": "class",
+          "package": "com.example.auth.config",
+          "file": "src/main/java/com/example/auth/config/SecurityConfig.java",
+          "members": [
+            "filterChain(HttpSecurity http)"
+          ],
+          "extends": [],
+          "line": 12
+        }
+      ],
+      "depends_on": []
+    }
+  ],
+  "configs": [
+    {
+      "path": "src/main/java/com/example/auth/AuthApplication.java",
+      "layer": "config",
+      "package": "com.example.auth",
+      "module": "src",
+      "types": [
+        {
+          "name": "AuthApplication",
+          "kind": "class",
+          "package": "com.example.auth",
+          "file": "src/main/java/com/example/auth/AuthApplication.java",
+          "members": [
+            "main(String[] args)"
+          ],
+          "extends": [],
+          "line": 7
+        }
+      ],
+      "depends_on": []
+    }
+  ],
+  "messaging": [],
+  "aspects": [],
+  "tests": [
+    {
+      "path": "src/test/java/com/example/auth/AuthApplicationTests.java",
+      "layer": "test",
+      "package": "com.example.auth",
+      "module": "src",
+      "types": [
+        {
+          "name": "AuthApplicationTests",
+          "kind": "class",
+          "package": "com.example.auth",
+          "file": "src/test/java/com/example/auth/AuthApplicationTests.java",
+          "members": [
+            "contextLoads()"
+          ],
+          "extends": [],
+          "line": 7
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "path": "src/test/java/com/example/auth/service/JwtTokenProviderTests.java",
+      "layer": "test",
+      "package": "com.example.auth.service",
+      "module": "src",
+      "types": [
+        {
+          "name": "JwtTokenProviderTests",
+          "kind": "class",
+          "package": "com.example.auth.service",
+          "file": "src/test/java/com/example/auth/service/JwtTokenProviderTests.java",
+          "members": [
+            "tokenRoundTripsToItsSubject()",
+            "rejectsATamperedSignature()",
+            "reportsTheConfiguredLifetime()"
+          ],
+          "extends": [],
+          "line": 9
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "path": "src/test/java/com/example/auth/service/UserStoreTests.java",
+      "layer": "test",
+      "package": "com.example.auth.service",
+      "module": "src",
+      "types": [
+        {
+          "name": "UserStoreTests",
+          "kind": "class",
+          "package": "com.example.auth.service",
+          "file": "src/test/java/com/example/auth/service/UserStoreTests.java",
+          "members": [
+            "acceptsTheConfiguredCredentials()",
+            "rejectsAWrongPassword()",
+            "rejectsAnUnknownUser()",
+            "rejectsNullInputs()"
+          ],
+          "extends": [],
+          "line": 8
+        }
+      ],
+      "depends_on": []
+    }
+  ],
+  "utils": [],
+  "components": [],
+  "build_files": [
+    {
+      "path": "pom.xml",
+      "facts": [
+        [
+          "parent",
+          "spring-boot-starter-parent"
+        ],
+        [
+          "artifact",
+          "auth"
+        ],
+        [
+          "needs",
+          "jjwt-api, jjwt-impl, jjwt-jackson, spring-boot-starter-security, spring-boot-starter-test, spring-boot-starter-web"
+        ]
+      ]
+    },
+    {
+      "path": "src/main/resources/application.yml",
+      "facts": [
+        [
+          "port",
+          "8080"
+        ],
+        [
+          "name",
+          "auth"
+        ]
+      ]
+    }
+  ],
+  "dependency_graph": {
+    "AuthController": [
+      "LoginRequest",
+      "LoginResponse",
+      "JwtTokenProvider",
+      "UserStore"
+    ]
+  },
+  "stats": {
+    "total_files": 14,
+    "indexed_files": 10,
+    "modules": 1,
+    "build_files": 2,
+    "controllers": 1,
+    "services": 2,
+    "repositories": 0,
+    "entities": 0,
+    "dtos": 2,
+    "security": 1,
+    "configs": 1,
+    "messaging": 0,
+    "aspects": 0,
+    "tests": 3,
+    "utils": 0,
+    "components": 0
+  }
+}

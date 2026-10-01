@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 
 from . import ignore
-from .errors import PolicyError
+from .errors import Cancelled, PolicyError
 
 MAX_OUTPUT_CHARS = 200_000
 MODEL_OUTPUT_CHARS = 12_000
@@ -594,7 +594,7 @@ def _visible(chunk: str) -> str:
     return text.rsplit("\r", 1)[-1].rstrip()
 
 
-def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
+def _collect(process, progress, deadline: float, cancelled=None) -> tuple[str, bool, int]:
     """Read the child until it closes its output, streaming each line as it lands.
 
     Returns the kept text, whether the run was killed for taking too long, and how many
@@ -640,6 +640,9 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
         stored = dropped = streamed = hidden = 0
         timed_out = False
         while True:
+            if cancelled is not None and cancelled():
+                kill_tree(process)
+                raise Cancelled("Build command cancelled.")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if timed_out:
@@ -696,7 +699,8 @@ def _collect(process, progress, deadline: float) -> tuple[str, bool, int]:
 
 
 def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
-        progress=lambda _text: None, target: str = "", sandbox: str = "") -> dict:
+        progress=lambda _text: None, target: str = "", sandbox: str = "",
+        cancelled=None) -> dict:
     """Execute a fixed recipe in the project folder — or in one module of it, when a target is named.
 
     `target` is a relative folder of `repo`, never a path the caller invented: `project_folder`
@@ -780,7 +784,11 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         else:
             options["start_new_session"] = True
         process = subprocess.Popen(argv, **options)
-        output, timed_out, dropped = _collect(process, progress, started + timeout)
+        try:
+            output, timed_out, dropped = _collect(process, progress, started + timeout,
+                                                  cancelled=cancelled)
+        except TypeError:
+            output, timed_out, dropped = _collect(process, progress, started + timeout)
         seconds = round(time.monotonic() - started, 1)
         truncated = dropped > 0
         exit_code = process.returncode

@@ -1925,7 +1925,8 @@ class AgentWindow:
             provider = make_provider(settings, allow_cloud=cloud, data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
             return respond(chat, provider, task, settings, self.chats,
-                           context=self._chat_context(repo))
+                           context=self._chat_context(repo),
+                           cancelled=self.cancel_event.is_set)
 
         def done(reply):
             self.chat_message("AI Code Engineer", reply)
@@ -1933,7 +1934,7 @@ class AgentWindow:
             self.say(intent.answered(arabic=self.arabic) if reading else
                      "Answered. Choose a project when you want reviewed changes to real files.")
             self.refresh_recent()
-        self.run_job(work, done, "Thinking…")
+        self.run_job(work, done, "Thinking…", cancellable=True)
 
     def _chat_context(self, repo: str) -> str:
         """The repository map and the standing notes, or nothing at all if the folder cannot be read.
@@ -2426,13 +2427,14 @@ class AgentWindow:
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
                                 progress=lambda line: self.events.put(("progress", line)),
-                                target=target, sandbox=sandbox)
+                                target=target, sandbox=sandbox,
+                                cancelled=self.cancel_event.is_set)
             return repair.record_run(path, result), result
 
         def done(pair):
             self.display_session(path)
             self.report_run(pair[1])
-        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
+        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""), cancellable=True)
 
     def report_run(self, result):
         # `summarize()` interpolates the recipe's own `reason` when the tool is missing, and a

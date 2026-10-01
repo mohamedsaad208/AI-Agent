@@ -692,7 +692,19 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     remaining = prompts.retrieval_budget(settings, used)
     _visible, rows = ws.index()
     named = []
-    for entry in symbols.rank(rows, task, limit=MAX_CONTEXT_FILES):
+    # Architecture-aware file selection: if the project has been scanned and
+    # project-index.json is present, index_boost re-ranks the symbol rows so
+    # that files whose architectural layer matches the task intent surface first.
+    # If the index is absent (scanner not run yet) we fall back silently to the
+    # baseline symbols.rank — the planning loop is never worse than before.
+    from .repo_scanner import get_or_create_index, index_boost
+    _proj_index = get_or_create_index(ws.root)
+    _rank_entries = (
+        index_boost(rows, task, _proj_index, limit=MAX_CONTEXT_FILES)
+        if _proj_index is not None
+        else symbols.rank(rows, task, limit=MAX_CONTEXT_FILES)
+    )
+    for entry in _rank_entries:
         name = entry["path"]
         if reference and name == reference["path"]:
             continue
@@ -708,9 +720,14 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         remaining -= len(encoded)
         observed[name] = item["sha256"]
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
-        event(session, "context_file", path=name, sha256=item["sha256"], why=entry["why"],
+        # Log the layer hint when available so the conversation shows why each
+        # file was selected (e.g. "layer: service" instead of just "declares")
+        why = entry.get("why", "")
+        layer_hint = entry.get("layer", "")
+        why_full = f"{why} [{layer_hint}]" if layer_hint else why
+        event(session, "context_file", path=name, sha256=item["sha256"], why=why_full,
               symbol=entry["symbol"])
-        named.append({"path": name, "why": entry["why"], "symbol": entry["symbol"]})
+        named.append({"path": name, "why": why_full, "symbol": entry["symbol"]})
     if named:
         announce("context_files", count=len(named), names=named)
     failures = 0
@@ -734,12 +751,17 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 raise AgentError("Initial context exceeds the " + str(settings.context_chars)
                                  + "-character budget; narrow the task or raise `context_chars`.")
             progress(f"Turn {turn + 1}/{settings.max_turns}: asking {provider.model}...")
-            raw = provider.generate(
-                base + history,
-                # Asked for only when the provider says it can hold a stream, which is also what keeps
-                # a scripted model's two-argument `generate` valid.
-                **({"on_token": on_token} if on_token is not None and
-                   getattr(provider, "supports_stream", False) else {}))
+            gen_kwargs = {}
+            if on_token is not None and getattr(provider, "supports_stream", False):
+                gen_kwargs["on_token"] = on_token
+            if cancelled is not None:
+                import inspect
+                try:
+                    if "cancelled" in inspect.signature(provider.generate).parameters:
+                        gen_kwargs["cancelled"] = cancelled
+                except (ValueError, TypeError):
+                    pass
+            raw = provider.generate(base + history, **gen_kwargs)
             # A reasoning model answered twice and only one of the two is the action. The thought is
             # shown, capped and redacted, as its own collapsible row — never folded into the envelope and
             # never sent back as history, because the next turn does not need to re-read the deliberation.

@@ -2330,7 +2330,8 @@ class AgentController:
             try:
                 return respond(chat, provider, task, settings, self.chats,
                                context=self._chat_context(repo),
-                               on_token=(feed.feed if feed else None))
+                               on_token=(feed.feed if feed else None),
+                               cancelled=self.cancel_event.is_set)
             finally:
                 if feed:
                     feed.close()
@@ -2345,7 +2346,7 @@ class AgentController:
 
         typed = asked or asked_of(task)
         reference = task[:-len(typed)] if typed else ""
-        self.run_job(work, done, "Thinking…",
+        self.run_job(work, done, "Thinking…", cancellable=True,
                      on_busy=lambda: self.queue_add(typed, reference=reference))
 
     def _chat_project(self) -> dict | None:
@@ -2923,7 +2924,8 @@ class AgentController:
 
         def work():
             result = runner.run(Path(repo), recipe, timeout=runner.timeout_for(recipe),
-                                progress=self._build_line, target=target, sandbox=sandbox)
+                                progress=self._build_line, target=target, sandbox=sandbox,
+                                cancelled=self.cancel_event.is_set)
             return (repair.record_run(path, result) if recordable else None), result
 
         def done(pair):
@@ -2936,7 +2938,8 @@ class AgentController:
                 self._add("tool", "Checks",
                           run_unrecorded_line(arabic=self.arabic, project=Path(repo).name))
 
-        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""))
+        self.run_job(work, done, "Running %s in %s%s…" % (label, where, " Docker" if sandbox else ""),
+                     cancellable=True)
 
     def report_run(self, result) -> None:
         self._last_job = {"type": "tests", **result}

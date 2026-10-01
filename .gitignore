@@ -59,3 +59,8 @@ docs/
 target/
 .design-preview$1.png
 
+# Test suite and execution logs
+*.log
+logs/
+.logs/
+
