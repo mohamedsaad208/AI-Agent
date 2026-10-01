@@ -49,23 +49,30 @@ def top_level_names(module: Path) -> set:
 
 
 class OneCopyEach(unittest.TestCase):
-    def test_doubles_py_is_the_only_definition_of_the_shared_names(self):
+    def test_no_module_declares_a_shared_double_again(self):
         """No test module may declare one of these again. `patched_catalog` is deliberately not in
-        the list: both windows keep a one-line wrapper for it, and the next test holds those to
-        delegating rather than reimplementing."""
-        for module in sorted(TESTS.glob("test_*.py")):
+        the list: each window keeps a one-line wrapper for it, and the next test holds those to
+        delegating rather than reimplementing.
+
+        The walk covers every module in `tests/`, not only the `test_*` ones, because a shared name
+        can be re-declared in a helper file just as quietly -- and a helper is the one place a second
+        copy would be believed.
+        """
+        for module in sorted(TESTS.glob("*.py")):
+            if module.name == "doubles.py":
+                continue
             with self.subTest(module=module.name):
                 self.assertEqual(top_level_names(module), set(),
                                  "%s re-declares a shared double" % module.name)
 
     def test_the_wrappers_point_at_the_window_they_belong_to(self):
         bodies = {}
-        for name in ("test_gui.py", "test_controller.py"):
+        for name in ("test_gui.py", "controller_case.py"):
             tree = ast.parse((TESTS / name).read_text(encoding="utf-8"))
             for node in tree.body:
                 if isinstance(node, ast.FunctionDef) and node.name == "patched_catalog":
                     bodies[name] = ast.dump(node)
-        self.assertEqual(sorted(bodies), ["test_controller.py", "test_gui.py"])
+        self.assertEqual(sorted(bodies), ["controller_case.py", "test_gui.py"])
         for name, dump in bodies.items():
             self.assertIn("shared_patched_catalog", dump, name)
             self.assertNotIn("models_for", dump, "%s builds its own discovery stub again" % name)
