@@ -1,6 +1,6 @@
 # AI Developer Agent — Architecture and Implementation Plan
 
-**Target Audience:** Java/Spring engineering teams operating within banking/enterprise environments.  
+**Target Audience:** Java/Spring engineering teams operating within high-security enterprise environments.  
 **Last Updated:** September 23, 2026 — UI 2.1 interface and verified implementation status.  
 **Adopted Architectural Decision:** Python for the Agent Runtime to accelerate Version 1 delivery, utilizing local Ollama + OpenRouter. Target repositories remain Java/Spring Boot.  
 **Core Objective:** Build a developer-centric coding agent capable of repository understanding, structured planning, bounded code modification, and automated verification, maintaining consistent orchestration logic whether backed by a local model or cloud providers.
@@ -92,7 +92,7 @@ The interface features a modern dark/light layout tailored for developer workflo
 3. Validate Docker container isolation on a configured host and add machine-readable test reports; finalize Gradle test inspection.
 4. Implement bounded repair cycles, alternative proposal approvals, and context tool enhancements.
 5. Introduce workspace locks/worktrees, robust session recovery, Skills, MCP, and IDE integration.
-6. Fulfill enterprise banking prerequisites: SSO, session encryption/auditing, centralized data egress enforcement, model benchmarking, and security isolation. The current release represents an MVP workbench.
+6. Fulfill enterprise production prerequisites: SSO, session encryption/auditing, centralized data egress enforcement, model benchmarking, and security isolation. The current release represents an MVP workbench.
 
 ---
 
@@ -147,7 +147,7 @@ All execution paths—including MCP adapters, hooks, and local scripts—must pa
 | **Prototyping & AI Ecosystem** | Highly suitable; compact experimentation loops | Mature; requires additional scaffolding | Concise syntax with JVM ecosystem access |
 | **Team Alignment (Java/Spring)** | Requires additional tooling and runtime management | Directly aligns with team skills and CI/CD pipelines | Excellent if already adopted within the organization |
 | **Type Contracts & Refactoring** | Requires external type checking (mypy) and disciplined testing | Robust static typing and compile-time contract enforcement | Strong static typing with language-level null safety |
-| **Enterprise Integration** | Viable, but requires integration with banking platforms | Native fit for existing Spring enterprise stacks | Seamless JVM/Spring interop with Kotlin runtime |
+| **Enterprise Integration** | Viable, but requires integration with enterprise platforms | Native fit for existing Spring enterprise stacks | Seamless JVM/Spring interop with Kotlin runtime |
 | **Operations & Maintenance** | Requires Python virtual environments and package curation | Leverages existing JVM monitoring, profiling, and deployment tools | Standard JVM operations with library compatibility checks |
 | **Model Fine-Tuning & Specialized Research** | Predominant industry choice | Typically consumes inference endpoints | Consumes inference endpoints via JVM clients |
 
@@ -448,7 +448,7 @@ Offline deployments encompass package registries, tokenizers, model weights, lic
 
 Proposed Configuration Schema:
 ```yaml
-profile: bank-onprem
+profile: enterprise-onprem
 model:
   provider: ollama
   modelRef: approved-coding-model
@@ -469,7 +469,7 @@ telemetry:
   destination: internal
   rawPrompts: false
 policy:
-  bundleRef: approved-bank-policy
+  bundleRef: approved-enterprise-policy
   planApproval: required
 ```
 
@@ -520,11 +520,11 @@ API Endpoints: Task creation, status/event streaming, plan/diff inspection, scop
 
 ---
 
-## 15. Practical Workflow: Bank Transfer Validation
+## 15. Practical Workflow: Account Transaction Validation
 
-**Task Prompt:** *"Reject zero and negative transfer amounts in Transfer API while preserving existing error contract."*
+**Task Prompt:** *"Reject zero and negative amounts in Transaction API while preserving existing error contract."*
 
-1. **Intake & Discovery:** The agent inspects the workspace and active changes, analyzing `TransferController`, `TransferRequest`, services, and existing tests.
+1. **Intake & Discovery:** The agent inspects the workspace and active changes, analyzing `TransactionController`, `TransactionRequest`, services, and existing tests.
 2. **Skill Ingestion:** Ingests Java, Spring, Testing, and API Compatibility skills.
 3. **Pattern Recognition:** Identifies existing Bean Validation annotations and global `@ControllerAdvice` exception handlers, avoiding custom ad-hoc error structures.
 4. **Planning:** Emits a plan: add validation constraints to DTO, add unit/integration tests covering zero, negative, valid, and null amounts, and verify that services are not invoked on invalid requests.
@@ -718,6 +718,6 @@ Benchmark results are recorded with measurement timestamp, model ID, and active 
 
 Cloud free tiers are restricted to experimental repositories and public or synthetic datasets. Data processing terms vary across providers, and OpenRouter privacy configurations must be evaluated alongside inference provider terms.
 
-Labeling an endpoint as free or altering logging levels does not authorize transmitting proprietary banking source code. Enterprise code remains restricted to local or on-premises infrastructure unless explicit institutional authorization is granted. If provider routing cannot be restricted to compliant endpoints, `cloud-auto` is disabled for that data classification.
+Labeling an endpoint as free or altering logging levels does not authorize transmitting proprietary enterprise source code. Enterprise code remains restricted to local or on-premises infrastructure unless explicit institutional authorization is granted. If provider routing cannot be restricted to compliant endpoints, `cloud-auto` is disabled for that data classification.
 
 **Approved Baseline:** Python Agent Runtime + Local Ollama + OpenRouter + Focused Tooling + Day-One Sandboxing and Policy Engine + Automated Verification Loop. Cloud models are integrated following empirical evaluation; direct proprietary provider SDKs and autonomous subagent swarms remain future phases.
