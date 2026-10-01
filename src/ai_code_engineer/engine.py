@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 
 from .config import Settings
 from .errors import AgentError, Cancelled, MissingFileError, PolicyError
+from . import impact
 from . import labels
 from . import memory as memory_module
 from . import prompts
@@ -63,6 +64,86 @@ def atomic_json(path: Path, value: dict) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+# A run's continuation lives beside its session, not inside it: `session.json` is the record a person
+# reads (events, proposal, verdict), and a resumed loop needs the conversation it was in the middle of.
+TURNS_NAME = "turns.json"
+TURN_CHARS = 4000
+TURNS_TOTAL_CHARS = 60000
+
+
+def turns_file(path: Path) -> Path:
+    return path.parent / TURNS_NAME
+
+
+def save_turns(path: Path, *, run_id: str, turn: int, history: list, observed: dict,
+               counters: dict, elapsed: float) -> None:
+    """Write what the loop needs to continue where it stopped, and nothing it does not.
+
+    Turns are dropped from the front two at a time once the file grows past the cap, which is the same
+    trim the live loop applies to `history` when the window fills (engine: `while history and ...`).
+    Every string passes `redact()` before it is stored: a turn carries file contents and model output,
+    and this file outlives the run that made it.
+    """
+    turns = [{"role": str(item.get("role", "")),
+              "content": redact(str(item.get("content", ""))[:TURN_CHARS])}
+             for item in history[-200:] if isinstance(item, dict)]
+    while len(turns) > 2 and sum(len(item["content"]) for item in turns) > TURNS_TOTAL_CHARS:
+        turns = turns[2:]
+    atomic_json(path, {"schema": 1, "run_id": run_id, "turn": turn, "turns": turns,
+                       "observed": dict(observed), "counters": dict(counters),
+                       "elapsed": round(elapsed, 1), "written": now()})
+    # Writing the continuation is also the heartbeat: a run that is still turning the page holds its
+    # lock, and a run whose process died stops refreshing it, so the stale rule can be minutes.
+    touch_run_lock(path.parent)
+
+
+def load_turns(path: Path) -> dict | None:
+    """The stored continuation, or None when there is nothing trustworthy to continue from."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(data, dict) or data.get("schema") != 1
+            or not isinstance(data.get("turns"), list) or not isinstance(data.get("observed"), dict)):
+        return None
+    return data
+
+
+LOCK_NAME = "run.lock"
+# Long enough that a reboot cannot leave a resumable run locked, short enough that a process which died
+# mid-turn stops being the reason nothing can continue. The lock is touched once per turn, so a slow
+# local model does not age its own run out.
+LOCK_STALE_SECONDS = 900
+
+
+def acquire_run_lock(run_dir: Path) -> None:
+    """One writer per run folder, or a refusal that says so instead of a torn file."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock = run_dir / LOCK_NAME
+    if lock.exists():
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            age = LOCK_STALE_SECONDS + 1
+        if age < LOCK_STALE_SECONDS:
+            raise PolicyError("Another window is working on this task right now.")
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def touch_run_lock(run_dir: Path) -> None:
+    try:
+        (run_dir / LOCK_NAME).touch()
+    except OSError:
+        pass
+
+
+def release_run_lock(run_dir: Path) -> None:
+    try:
+        (run_dir / LOCK_NAME).unlink()
+    except OSError:
+        pass
 
 
 def parse_action(raw: str) -> dict:
@@ -165,6 +246,19 @@ MAX_TASK_CHARS = 4000
 # budget, not this number.
 MAX_CONTEXT_FILES = 5
 
+# How many of those five slots a *partial* file may take. A budget too small for a whole file used to
+# mean the model never saw that file at all; an excerpt gives it the declarations around the symbol the
+# task named instead. Three is the ceiling because an excerpt is a hint, not a read — it cannot carry a
+# proposal on its own (`prepare_changes` still refuses a file that was never read whole), and a prompt
+# made of four half-files reads like a repository nobody finished showing.
+MAX_EXCERPTS = 3
+
+# How much of the plan a step's retrieval is allowed to read as a bag of names. The task is capped at
+# MAX_TASK_CHARS because it is a document the model has to answer; the seed is only scored for the
+# words it contains, and a goal tree of that length would name every file in the repository at the
+# weakest score and crowd out the one the step is about.
+SEED_CHARS = 1200
+
 # The route that works at any file size, added to every "your content is broken" refusal. Without it
 # the only advice a large file gets is "send the whole file", which is the thing that just failed.
 ANCHORED_ROUTE = (", or send one anchored edit: search for a line unique to this file and replace it "
@@ -185,6 +279,19 @@ def proposal_hash(session: dict) -> str:
     if "chat_id" in session:
         payload["chat_id"] = session["chat_id"]
     return digest(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode())
+
+
+def chosen_reason(entry: dict) -> str:
+    """Why retrieval picked this file, as the code `labels` turns into a sentence.
+
+    Both paths — the whole file that fitted and the block that did not — must write this the same way,
+    or the same file is explained one way in one project and another way in a bigger one. The layer the
+    project index supplied qualifies the code in brackets; nothing else may be appended there, because
+    `labels` looks the code up as a key and an unrecognised key speaks no reason at all.
+    """
+    why = str(entry.get("why", ""))
+    layer = str(entry.get("layer", ""))
+    return f"{why} [{layer}]" if layer else why
 
 
 def read_plan_reference(ws: Workspace, plan_file: str, settings: Settings) -> dict:
@@ -591,7 +698,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
          chat_id: str | None = None, extra_context: str | None = None,
          plan_step: int | None = None, memory: str | None = None, step=None,
          on_token=None, goal: str = "", criteria: list[str] | None = None,
-         accepts: list[int] | None = None) -> Path:
+         accepts: list[int] | None = None, resume_run: str | None = None) -> Path:
     """Run the tool loop until the model proposes a change.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
@@ -607,6 +714,9 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     proposal_hash on purpose, since the number proves sequencing rather than content.
     memory is the user's own standing note for this project, kept on the session for
     audit but outside the hash, which covers what the proposal changes.
+    resume_run picks up a run that stopped before it reached a result: the stored turns come back, a
+    file whose content moved since is dropped from the read set instead of trusted, and the failure
+    counters carry over so a resumed run does not quietly get a second full budget for one mistake.
     """
     if not task.strip() or len(task) > MAX_TASK_CHARS:
         raise AgentError(f"Task must contain 1-{MAX_TASK_CHARS} characters.")
@@ -632,10 +742,26 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     # Evidence is captured from a command the project itself defines; whatever it
     # printed is stored on the session and re-sent to the provider on the next turn.
     extra_context = redact(extra_context) if extra_context else extra_context
-    run_id = uuid.uuid4().hex
-    path = runs.resolve() / run_id / "session.json"
-    session = {"schema": 1, "id": run_id, "root": str(ws.root), "task": task,
-               "state": "DISCOVERING", "created": now(), "events": [], "model": provider.model}
+    resumed: dict = {}
+    if resume_run is not None:
+        if not re.fullmatch(r"[a-f0-9]{32}", str(resume_run)):
+            raise PolicyError("Invalid run identity.")
+        path = runs.resolve() / str(resume_run) / "session.json"
+        session = load_session(path)
+        if session.get("state") != "DISCOVERING":
+            raise PolicyError("That task already reached a result; there is nothing to continue.")
+        stored_root = str(session.get("root") or "")
+        if not stored_root or (Path(stored_root).resolve() != ws.root.resolve()):
+            raise PolicyError("That task belongs to a different project folder.")
+        run_id = str(session.get("id") or resume_run)
+        resumed = load_turns(turns_file(path)) or {}
+    else:
+        run_id = uuid.uuid4().hex
+        path = runs.resolve() / run_id / "session.json"
+        session = {"schema": 1, "id": run_id, "root": str(ws.root), "task": task,
+                   "state": "DISCOVERING", "created": now(), "events": [], "model": provider.model}
+    run_dir = path.parent
+    acquire_run_lock(run_dir)
     prior_context = ""
     if chat_id is not None:
         if not re.fullmatch(r"[a-f0-9]{32}", chat_id):
@@ -680,15 +806,44 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         event(session, "memory_attached", characters=len(session["memory"]))
     atomic_json(path, session)
     repo_map = ws.repo_map()
+    # What this project's earlier tasks left behind is read once per turn from the store outside the
+    # folder, so a small model is not asked to re-derive a Java version or a naming rule from a file it
+    # is no longer shown. Empty on a first task, and that is the correct answer to send.
+    auto_notes = memory_module.auto_block(memory_module.auto_notes_context(
+        memory_module.memory_dir_for(runs), str(ws.root)))
     base = prompts.base_messages(
         task=task, repo_map=repo_map, settings=settings,
         memory_block=memory_module.block(session["memory"]) if session.get("memory") else "",
         reference=reference, open_errors=open_errors, prior_context=prior_context,
-        evidence=extra_context or "")
+        evidence=extra_context or "", auto_notes=auto_notes)
+    if auto_notes:
+        event(session, "auto_notes_attached", characters=len(auto_notes))
     if extra_context:
         session["evidence"] = extra_context[:4000]
         event(session, "evidence_attached", characters=len(extra_context))
     history, observed = [], {}
+    if resumed:
+        # The conversation the run was in, not a summary of it: a resumed loop that forgot what it had
+        # already read proposes the same file twice and burns its budget re-learning the task.
+        history = [{"role": item["role"], "content": str(item.get("content", ""))}
+                   for item in resumed.get("turns", [])
+                   if isinstance(item, dict) and item.get("role") in ("assistant", "user")]
+        stale = []
+        for name, digest_of in sorted((resumed.get("observed") or {}).items()):
+            try:
+                current = ws.read(name)["sha256"]
+            except (AgentError, OSError):
+                current = None
+            if current != digest_of:
+                stale.append(name)
+            else:
+                observed[name] = digest_of
+        if stale:
+            progress("Files changed or gone since the run stopped: "
+                     + ", ".join(stale[:6]) + ("…" if len(stale) > 6 else "")
+                     + ". The loop will read them again before proposing them.")
+        if len(history) != len(resumed.get("turns", [])):
+            progress("Some of the stored turns were unreadable and were dropped.")
     # Deterministic retrieval, so a small local model is not left guessing filenames out of a truncated
     # map: the index is scored against the sentence the operator typed, the top few files ride along as
     # already-read snapshots, and the reason each was chosen is said in the thread. The old rule was
@@ -699,17 +854,35 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     remaining = prompts.retrieval_budget(settings, used)
     _visible, rows = ws.index()
     named = []
+    excerpts = 0
     # Architecture-aware file selection: if the project has been scanned and
     # project-index.json is present, index_boost re-ranks the symbol rows so
     # that files whose architectural layer matches the task intent surface first.
     # If the index is absent (scanner not run yet) we fall back silently to the
     # baseline symbols.rank — the planning loop is never worse than before.
-    from .repo_scanner import get_or_create_index, index_boost
+    from .repo_scanner import get_or_create_index, index_boost, project_facts
     _proj_index = get_or_create_index(ws.root)
+    # Measured now, read from the next turn on: the build files the scan opened hold the versions a
+    # later proposal has to respect, and they are kept outside the folder so no proposal can edit the
+    # facts it is being checked against.
+    if _proj_index is not None:
+        memory_module.record_facts(memory_module.memory_dir_for(runs), str(ws.root),
+                                   project_facts(_proj_index))
+    # Step-aware seeds. A run that implements step four of a plan is not the same question as the plan,
+    # and the sentence the operator typed is often only "step 4" — the names the files live in are in
+    # the goal and in the criteria that step accepts. Same rule as the ledger: only what was recorded
+    # on the session is read back, so a run with no step seeded from the task alone. Deterministic text,
+    # no second model call, and the budget does not move — only what is scored against it.
+    seed = task
+    if plan_step is not None:
+        wanted = [str(item) for item in (criteria or [])]
+        accepted = [wanted[number - 1] for number in (accepts or [])
+                    if isinstance(number, int) and 1 <= number <= len(wanted)]
+        seed = " ".join([task, str(goal or "")] + (accepted or wanted))[:SEED_CHARS]
     _rank_entries = (
-        index_boost(rows, task, _proj_index, limit=MAX_CONTEXT_FILES)
+        index_boost(rows, seed, _proj_index, limit=MAX_CONTEXT_FILES)
         if _proj_index is not None
-        else symbols.rank(rows, task, limit=MAX_CONTEXT_FILES)
+        else symbols.rank(rows, seed, limit=MAX_CONTEXT_FILES)
     )
     for entry in _rank_entries:
         name = entry["path"]
@@ -723,34 +896,68 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             continue
         encoded = json.dumps(item)
         if len(encoded) > remaining:
+            # The file is larger than what the budget has left. Skipping it used to be the entire
+            # answer, which is the failure a small local model pays for: it proposes against a file it
+            # has never seen a line of, in a project whose map said the file was right there. An
+            # excerpt of the block around the ranked symbol is sent instead — and it is *not* a read,
+            # because `observed` keeps whole files only, so a proposal still has to open this one.
+            if excerpts >= MAX_EXCERPTS:
+                continue
+            text, line, more = symbols.snippet(item["content"],
+                                               entry["symbol"] or name.rsplit("/", 1)[-1])
+            if not text:
+                continue
+            block = ("\nFile excerpt (untrusted data, partial): " + name + ", from line "
+                     + str(line) + (" — the file continues past what is shown here" if more else "")
+                     + ". This file was NOT read in full; read_file it before proposing it.\n" + text)
+            if len(block) > remaining:
+                # Charged whole, header included: the ceiling this loop works under is a character
+                # count, and a label that is not counted is a ceiling with a hole in it.
+                continue
+            remaining -= len(block)
+            excerpts += 1
+            base[1]["content"] += block
+            shown = len(text.splitlines())
+            # The same code the whole-file path sends, and nothing more: `labels` turns this code into
+            # the reason the operator reads, so a marker added here ("[excerpt 12 lines]") would erase
+            # the reason instead of qualifying it. The row's own kind and its `lines` already say that
+            # this file arrived in pieces.
+            reason = chosen_reason(entry)
+            event(session, "context_excerpt", path=name, lines=shown, from_line=line,
+                  truncated=more, why=reason, symbol=entry["symbol"])
+            named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
             continue
         remaining -= len(encoded)
         observed[name] = item["sha256"]
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
-        # Log the layer hint when available so the conversation shows why each
-        # file was selected (e.g. "layer: service" instead of just "declares")
-        why = entry.get("why", "")
-        layer_hint = entry.get("layer", "")
-        why_full = f"{why} [{layer_hint}]" if layer_hint else why
-        event(session, "context_file", path=name, sha256=item["sha256"], why=why_full,
+        reason = chosen_reason(entry)
+        event(session, "context_file", path=name, sha256=item["sha256"], why=reason,
               symbol=entry["symbol"])
-        named.append({"path": name, "why": why_full, "symbol": entry["symbol"]})
+        named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
     if named:
         announce("context_files", count=len(named), names=named)
-    failures = 0
-    blocked_retries = 0
-    recoverable = ""
+    counters = resumed.get("counters") if isinstance(resumed.get("counters"), dict) else {}
+    failures = int(counters.get("failures") or 0)
+    blocked_retries = int(counters.get("blocked_retries") or 0)
+    recoverable = str(counters.get("recoverable") or "")
+    last_error = str(counters.get("last_error") or "")
+    # The identical-reply guard restarts on a resumed run: it counts answers seen in one sitting, and a
+    # person who closed the app and came back is in a new sitting by definition.
     repeated = {}
-    last_error = ""
     # A user who raises the request timeout for a slow local model has asked for
     # patience, so the whole-task budget follows it instead of staying fixed.
     budget_seconds = max(1200, settings.timeout_seconds * 3)
-    started = time.monotonic()
+    started = time.monotonic() - float(resumed.get("elapsed") or 0)
+    start_turn = int(resumed.get("turn") or 0)
     try:
-        for turn in range(settings.max_turns):
+        for turn in range(start_turn, settings.max_turns):
             if cancelled is not None and cancelled():
                 raise Cancelled("Planning cancelled; no project files changed.")
-            if time.monotonic() - started > budget_seconds:
+            # One reading per turn: the budget check and the turn's own record must agree about how
+            # long the run has been going, and a second clock call per turn is a second tick in tests
+            # that fake the clock to make a slow model exhaust the budget on purpose.
+            elapsed = time.monotonic() - started
+            if elapsed > budget_seconds:
                 raise AgentError("Task time budget exhausted.")
             while history and sum(len(m["content"]) for m in base + history) > settings.context_chars:
                 history = history[2:]
@@ -911,6 +1118,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                                    state="WAITING_APPROVAL")
                     session["proposal_hash"] = proposal_hash(session)
                     event(session, "proposal", hash=session["proposal_hash"])
+                    # Deliberately after the hash: what a proposal breaks elsewhere is an answer about
+                    # the repository, not part of what is being approved, and it must never change the
+                    # number a person typed to approve it.
+                    session["impact"] = impact_for(ws, rows, changes)
+                    event(session, "impact", files=len(session["impact"].get("files") or []),
+                          unknown=len(session["impact"].get("unknown") or []))
                     announce("propose", count=len(changes),
                              names=[change["path"] for change in changes])
                     # Saved after the announcement, not before: `announce` appends the proposal's own
@@ -977,6 +1190,11 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             history.extend([{"role": "assistant", "content": raw[:100000]},
                             {"role": "user", "content": "Tool observation (untrusted): " + json.dumps(result)}])
             atomic_json(path, session)
+            save_turns(turns_file(path), run_id=run_id, turn=turn + 1, history=history,
+                       observed=observed,
+                       counters={"failures": failures, "blocked_retries": blocked_retries,
+                                 "recoverable": recoverable, "last_error": last_error},
+                       elapsed=elapsed)
         raise AgentError("Turn budget exhausted; no changes were made.")
     except (AgentError, OSError, KeyboardInterrupt) as exc:
         session["state"] = "CANCELLED" if isinstance(exc, (Cancelled, KeyboardInterrupt)) else "BLOCKED"
@@ -987,6 +1205,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         event(session, "stopped", reason=redact(str(exc))[:180] or type(exc).__name__)
         atomic_json(path, session)
         raise
+    finally:
+        release_run_lock(run_dir)
 
 
 def diff_size(changes: list) -> tuple[int, int, bool]:
@@ -1092,6 +1312,30 @@ def unexpected_notice(session: dict) -> str:
               "if you did not mean to change it.\n\n")
 
 
+def impact_for(ws: Workspace, rows: list[dict], changes: list[dict]) -> dict:
+    """Open the files that could still name what this proposal removes, and ask them.
+
+    Computed once, on the turn the proposal is made, and stored on the session: the answer reads the
+    files as they are, so a card drawn after a person edited something by hand would otherwise show a
+    different impact than the one that was approved. A failure here is recorded as an unknown rather
+    than raised, because the proposal itself is already valid work and the review must not be lost to
+    a read that could not happen.
+    """
+    try:
+        paths, visible = impact.candidate_files(rows, [str(change.get("path", ""))
+                                                       for change in changes])
+        sources = []
+        for name in paths:
+            try:
+                sources.append((name, ws.read(name)["content"]))
+            except (AgentError, MissingFileError, OSError):
+                continue
+        return impact.analyze(changes, rows, sources, visible=visible)
+    except (AgentError, PolicyError, OSError, ValueError, TypeError, KeyError):
+        return {"files": [], "unknown": [{"key": "impact_unknown_failed"}],
+                "searched": 0, "visible": 0}
+
+
 def review(session: dict) -> str:
     rows = ["State: " + session["state"], "Workspace: " + session["root"],
             session.get("summary", "No proposal."), ""]
@@ -1105,6 +1349,10 @@ def review(session: dict) -> str:
     if warnings:
         rows.extend(["", "Check these removals before approving:",
                      *[line for note in warnings for line in ("  • " + note, "")]])
+    findings = labels.impact_lines(session.get("impact") or {})
+    if findings:
+        rows.extend(["", labels.note("impact_heading"),
+                     *[line for finding in findings for line in ("  • " + finding, "")]])
     stray = unrelated_files(session)
     if stray:
         rows.extend(["", "Files this task never named or read:",
@@ -1192,6 +1440,11 @@ def apply_proposal(path: Path, approved_hash: str) -> dict:
                          (" Rollback undoes the files named above." if (written or removed)
                           else "")) from None
     session["state"] = "APPLIED_UNVERIFIED"
+    # The project remembers what its own tasks changed, outside the folder the model can write to.
+    # Recorded after the writes, because a change that is only remembered and not made is worse than
+    # one that is neither: `note_task` swallows its own failures for exactly that reason.
+    memory_module.note_task(memory_module.memory_dir_for(path.parent.parent),
+                            session["root"], session)
     atomic_json(path, session)
     return session
 
@@ -1227,5 +1480,8 @@ def rollback(path: Path, approved_hash: str) -> dict:
         atomic_json(path, session)
     session["state"] = "ROLLED_BACK"
     event(session, "rolled_back")
+    # The memory of the change is corrected rather than left claiming work that is no longer on disk.
+    memory_module.note_task(memory_module.memory_dir_for(path.parent.parent),
+                            session["root"], session, status="rolled_back")
     atomic_json(path, session)
     return session

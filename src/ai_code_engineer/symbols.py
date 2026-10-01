@@ -19,6 +19,7 @@ MAX_TYPES = 40          # declared types per file
 MAX_MEMBERS = 25        # methods per type
 MAX_IMPORTS = 40        # imports per file
 MAX_SIGNATURE = 60      # characters of one signature
+MAX_ENDPOINTS = 40      # routes per file; a controller over this is a generated one
 SCRIPT_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 INDEXABLE = {".py", ".java", ".kt", ".go", ".rs"} | SCRIPT_SUFFIXES
 # Kinds whose declared types are importable by their simple name from another file.
@@ -50,6 +51,18 @@ JAVA_PLAIN_METHOD_RE = re.compile(
     r"^\s*(?:@[\w.]+\s+)*(?:final\s+|static\s+|abstract\s+|default\s+)*"
     r"([\w$][\w$<>\[\],.?\s]*?)\s+([A-Za-z_$][\w$]*)\s*\(([^()]*)\)\s*"
     r"(?:throws [\w$.,\s]+)?[{;]")
+
+# ---------------- HTTP endpoints on the JVM ----------------
+# Three dialects spell the same route. Spring fuses verb and path into one annotation name, JAX-RS
+# splits them (`@GET` above `@Path`), and only the Spring family is case-mixed, so its verbs are
+# translated here rather than upper-cased where they are read.
+MAPPING_RE = re.compile(r"@(Get|Post|Put|Delete|Patch|Request)Mapping(?![\w$])")
+JAXRS_VERB_RE = re.compile(r"@(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)(?![\w$])")
+JAXRS_PATH_RE = re.compile(r"@Path(?![\w$])")
+JVM_VERBS = {"Get": "GET", "Post": "POST", "Put": "PUT", "Delete": "DELETE", "Patch": "PATCH"}
+# A supers clause, `extends` or `implements`, up to the body. The angle brackets are emptied by
+# `_supers` before this runs, so a generic bound (`<T extends Comparable<T>>`) is never read as one.
+JVM_SUPERS_RE = re.compile(r"\b(?:extends|implements)\s+([^({;<>]+)")
 
 # ---------------- JavaScript / TypeScript / JSX ----------------
 # `export` is a modifier here, never a second declaration: the same name is recorded once.
@@ -161,6 +174,93 @@ def blank(source: str, backticks: bool = False) -> str:
     return "".join(out)
 
 
+ANNOTATION_LEAD = re.compile(r"@[A-Za-z_$][\w.$]*(?:\s*\([^()]*(?:\([^()]*\)[^()]*)*\))?\s*")
+
+
+def _after_annotations(line: str) -> str:
+    """The line with every leading annotation cut off, so the declaration under it can be matched.
+
+    One nesting level of parentheses is enough: an annotation argument list that itself calls a
+    method (`@Cacheable(key = "#id")`) still ends where the first unbalanced `)` is, and the rest of
+    the line is the declaration the caller wants.
+    """
+    text = line.lstrip()
+    while text.startswith("@"):
+        lead = ANNOTATION_LEAD.match(text)
+        if not lead or lead.end() == 0:
+            break
+        text = text[lead.end():]
+    return text
+
+
+def _jvm_annotation(head: str, raw: str, depth: int) -> tuple[str, object] | None:
+    """What a mapping line says, as ("BASE"|"PATH"|"VERB", value).
+
+    The verb is read from the blanked line and the path from the raw one: `blank()` keeps the shape of a
+    line and removes the inside of every string, so `@GetMapping("/login")` survives as
+    `@GetMapping("       ")` — enough to name the annotation, useless for the URL it maps.
+    A class-level mapping is a prefix, not an endpoint: Spring's `@RequestMapping` on the type and
+    JAX-RS's `@Path` there both join the method paths under them.
+    """
+    match = MAPPING_RE.match(head)
+    if match:
+        name = match.group(1).capitalize()
+        path = _annotation_path(raw)
+        if name == "Request":
+            if depth == 0:
+                return ("BASE", path)
+            # The old spelling puts the verb in an attribute rather than the annotation name.
+            method = re.search(r"RequestMethod\.([A-Z]+)", raw)
+            return ("VERB", (method.group(1) if method else "ANY", path))
+        return ("VERB", (JVM_VERBS.get(name, name.upper()), path))
+    if JAXRS_VERB_RE.match(head):
+        return ("VERB", (JAXRS_VERB_RE.match(head).group(1).upper(), _annotation_path(raw)))
+    if JAXRS_PATH_RE.match(head):
+        return ("PATH", _annotation_path(raw))
+    return None
+
+
+def _annotation_path(raw: str) -> str:
+    """The path an annotation carries, whether it is quoted, bare, or named `value`/`path`."""
+    quoted = re.search(r'"([^"\n]*)"', raw)
+    if quoted:
+        return quoted.group(1).strip()[:120]
+    bare = re.match(r"^\s*@\w+\s*\(\s*([\w\-/{}.]+)", raw)
+    return bare.group(1)[:120] if bare else ""
+
+
+def _join_path(base: str, path: str) -> str:
+    joined = "/".join(part for part in (base.strip("/"), path.strip("/")) if part)
+    return "/" + joined if joined else "/"
+
+
+def _supers(line: str) -> list[str]:
+    """`extends` and `implements` names on a type header, generics reduced to what they wrap.
+
+    A generic is emptied from the inside out before the clauses are read. `class A<T extends Base>
+    extends Real` has two `extends` and only the second is a supertype, and the one that survives
+    this is the one outside the brackets — `Base` there would otherwise be the answer the map gives.
+    """
+    for _ in range(4):
+        stripped = re.sub(r"<[^<>]*>", "", line)
+        if stripped == line:
+            break
+        line = stripped
+    found = []
+    for clause in JVM_SUPERS_RE.findall(line):
+        # One clause runs to the brace, so `extends A implements B, C` arrives as a single capture and
+        # the keyword inside it starts a new list of names.
+        for part in re.split(r"\b(?:extends|implements)\b", clause):
+            for piece in part.split(","):
+                name = re.match(r"[A-Za-z_$][\w$.]*", piece.strip())
+                if not name:
+                    continue
+                simple = name.group(0).rsplit(".", 1)[-1]
+                if simple.lower() not in ("class", "interface") and simple not in CONTROL:
+                    found.append(simple)
+    return found[:6]
+
+
 def _jvm(path: str, source: str) -> dict:
     """Java/Kotlin declarations, found by a brace-depth scan of blanked text.
 
@@ -168,12 +268,35 @@ def _jvm(path: str, source: str) -> dict:
     `public Token login(String p)` from `tokenService.login(password)` two lines later.
     """
     row = {"path": path, "kind": "jvm", "package": "", "imports": [], "types": [],
-           "functions": []}
+           "functions": [], "endpoints": []}
+    raw_lines = source.splitlines()
+    pending: tuple[str, str] | None = None      # a verb waiting for the method under it
+    path_wait = ""                              # a JAX-RS `@Path` above its `@GET`
+    base_path = ""
     depth = 0
     stack: list[tuple[str, int]] = []           # (type name, depth where it opened)
     for number, line in enumerate(blank(source).splitlines(), 1):
         head = line.strip()
+        raw = raw_lines[number - 1] if number - 1 < len(raw_lines) else line
         opened, closed = line.count("{"), line.count("}")
+        annotation = _jvm_annotation(head, raw, depth)
+        if annotation is not None:
+            kind, value = annotation
+            if kind == "BASE":
+                base_path = str(value) or base_path
+            elif kind == "PATH":
+                if depth == 0:
+                    base_path = str(value) or base_path
+                elif pending is not None and not pending[1]:
+                    # JAX-RS writes the verb first and the path under it, so a method-level `@Path`
+                    # belongs to the mapping that is already armed rather than to the next one.
+                    pending = (pending[0], str(value))
+                else:
+                    path_wait = str(value)
+            else:
+                verb, explicit = value  # type: ignore[misc]
+                pending = (verb, explicit or path_wait)
+                path_wait = ""
         if head.startswith("package") and not row["package"]:
             match = PACKAGE_RE.match(line)
             if match:
@@ -187,25 +310,49 @@ def _jvm(path: str, source: str) -> dict:
             for kind, simple in declared:
                 outer = next((name for name, level in reversed(stack) if level == depth), "")
                 name = outer + "." + simple if outer else simple
-                _declare_type(row, simple, kind, number, outer)
+                _declare_type(row, simple, kind, number, outer, _supers(line))
                 # The frame opens even when the cap refused the type: without it a method
                 # inside has no owner at all and lands in the file's own function list.
                 stack.append((name, depth))
-        elif any(head.startswith(word) for word in LINE_STARTS):
+            # A type header swallows whatever verb was waiting: an annotated class is not an endpoint,
+            # and leaving it armed would hand that mapping to the first method it happens to see.
+            pending = None
+        elif head.startswith("@") or any(head.startswith(word) for word in LINE_STARTS):
+            # An annotation-led head is read as a declaration too: `@GetMapping("/health")
+            # public String health() {` names the route and the method on one line, and every method
+            # pattern below is anchored at the start, so the line is shortened before it is matched.
+            body = _after_annotations(line)
             method = None
-            if re.search(r"\bfun\s", line):
-                method = KOTLIN_FUN_RE.match(line)
-            method = method or JAVA_METHOD_RE.match(line) or JAVA_PLAIN_METHOD_RE.match(line)
+            if re.search(r"\bfun\s", body):
+                method = KOTLIN_FUN_RE.match(body)
+            method = (method or JAVA_METHOD_RE.match(body)
+                      or JAVA_PLAIN_METHOD_RE.match(body))
             if method and method.group(2) not in CONTROL:
                 params = [part for part in method.group(3).split(",") if part.strip()][:6]
                 if stack:
                     owner = next((item for item in reversed(row["types"])
                                   if item["name"] == stack[-1][0]), None)
-                    if owner and depth == stack[-1][1] + 1 and len(owner["members"]) < MAX_MEMBERS:
+                    inside = bool(owner) and depth == stack[-1][1] + 1
+                    if inside and len(owner["members"]) < MAX_MEMBERS:
                         owner["members"].append(_signature(method.group(2), params))
+                    if inside and pending is not None:
+                        if len(row["endpoints"]) < MAX_ENDPOINTS:
+                            row["endpoints"].append({"verb": pending[0],
+                                                     "path": _join_path(base_path, pending[1]),
+                                                     "handler": f"{owner['name']}.{method.group(2)}",
+                                                     "line": number})
+                        else:
+                            # The refused routes are recorded as refused: a later reader that asks
+                            # "does anything answer this URL" has to be able to tell "no" from
+                            # "the list stopped at 40".
+                            row["routes_capped"] = True
+                        pending = None
                 elif len(row["functions"]) < MAX_MEMBERS:
                     # A Kotlin file-level function, which belongs to no type.
                     row["functions"].append(_signature(method.group(2), params))
+                # A path with no verb on the method under it maps nothing, and holding it over would
+                # arm the next handler in the file with this one's URL.
+                path_wait = ""
         depth += opened - closed
         while stack and depth <= stack[-1][1]:
             stack.pop()
@@ -223,7 +370,8 @@ def _add_import(row: dict, name: str) -> None:
         row["imports"].append(name)
 
 
-def _declare_type(row: dict, name: str, kind: str, line: int, outer: str = "") -> dict | None:
+def _declare_type(row: dict, name: str, kind: str, line: int, outer: str = "",
+                  supers: list[str] | None = None) -> dict | None:
     """The entry for a declared type, created once per name.
 
     `export class X` and a later `export { X }`, or a Go type with its methods spread over
@@ -232,10 +380,14 @@ def _declare_type(row: dict, name: str, kind: str, line: int, outer: str = "") -
     full = outer + "." + name if outer else name
     for item in row["types"]:
         if item["name"] == full:
+            if supers and not item.get("extends"):
+                item["extends"] = supers
             return item
     if len(row["types"]) >= MAX_TYPES:
         return None
     item = {"name": full, "kind": kind, "line": line, "members": []}
+    if supers:
+        item["extends"] = supers
     row["types"].append(item)
     return item
 
@@ -540,6 +692,25 @@ def _shorten(label: str, value: str) -> tuple[str, str] | None:
     return (label, value)
 
 
+POM_JAVA_KEYS = ("java.version", "maven.compiler.release", "maven.compiler.source",
+                 "maven.compiler.target")
+
+
+def _pom_java(root) -> str:
+    """The Java version a POM declares, whichever of its four spellings it used.
+
+    Called after the namespace pass, so the tags are plain names here. A `${…}` is a pointer to
+    another property rather than an answer, so only a literal counts.
+    """
+    holder = root.find("properties")
+    for key in POM_JAVA_KEYS:
+        node = None if holder is None else holder.find(key)
+        value = (node.text or "").strip() if node is not None else ""
+        if value and not value.startswith("${"):
+            return value[:20]
+    return ""
+
+
 def _pom(source: str) -> list[tuple[str, str]]:
     """Maven's own answers: what this module is, what it builds, and what it needs.
 
@@ -571,11 +742,20 @@ def _pom(source: str) -> list[tuple[str, str]]:
         return found.text if found is not None and found.text else ""
 
     facts = []
+    parent_artifact = parent_version = ""
     if (owner := root.find("parent")) is not None:
         if named := _shorten("parent", text("artifactId", owner)):
             facts.append(named)
+        parent_artifact, parent_version = text("artifactId", owner), text("version", owner)
     if named := _shorten("artifact", text("artifactId")):
         facts.append(named)
+    # The two versions that decide what code compiles, taken from the build file rather than inferred
+    # from the source: a 2.x project still on `javax.` imports and a 3.x one on `jakarta.` look almost
+    # alike to a model that was never told which is which.
+    if parent_artifact.startswith("spring-boot") and parent_version:
+        facts.append(("spring boot", parent_version[:20]))
+    if java := _pom_java(root):
+        facts.append(("java", java))
     modules = [str(item.text).strip() for item in root.findall("modules/module")
                if item.text and str(item.text).strip()]
     if modules:
@@ -595,12 +775,39 @@ GRADLE_INCLUDE = re.compile(r"""include\s+[\s,]*(['"]([\w.\-:]+)['"](?:\s*,\s*['
 GRADLE_PROJECT = re.compile(r"""project\s*\(\s*['"]:?([\w.\-]+)['"]""")
 PACKAGE_NAME = re.compile(r"""^\s*(?:(?:const|let|var)\s+)?rootProject\.name\s*=\s*['"]([\w.\-]+)""",
                           re.M)
+# Gradle has no one place to say which Java it builds with, so all three spellings are read: the
+# toolchain block modern projects use, the `sourceCompatibility` line older ones kept, and the
+# `JavaVersion.VERSION_1_8` enum whose underscore is a decimal point.
+GRADLE_TOOLCHAIN = re.compile(r"""JavaLanguageVersion\.of\(\s*(\d+)""")
+GRADLE_COMPAT = re.compile(r"""(?:source|target)Compatibility\s*=\s*(?:JavaVersion\.VERSION_)?
+                             ['"]?([0-9][0-9_.]*)""", re.X)
+GRADLE_BOOT = re.compile(r"""org\.springframework\.boot(?:\.gradle\.plugin)?['")\s]+version\s+
+                          ['"]([\d][\w.\-]*)""", re.X)
+GRADLE_BOOT_COORD = re.compile(r"""spring-boot-starter-parent[:@]([\d][\w.\-]*)""")
+
+
+def _gradle_java(source: str) -> str:
+    for pattern in (GRADLE_TOOLCHAIN, GRADLE_COMPAT):
+        if (match := pattern.search(source)):
+            return match.group(1).strip("_.").replace("_", ".")[:20]
+    return ""
+
+
+def _gradle_boot(source: str) -> str:
+    for pattern in (GRADLE_BOOT, GRADLE_BOOT_COORD):
+        if (match := pattern.search(source)):
+            return match.group(1)[:20]
+    return ""
 
 
 def _gradle(source: str) -> list[tuple[str, str]]:
     facts = []
     if named := PACKAGE_NAME.search(source):
         facts.append(("artifact", named.group(1)))
+    if boot := _gradle_boot(source):
+        facts.append(("spring boot", boot))
+    if java := _gradle_java(source):
+        facts.append(("java", java))
     includes = set()
     for match in GRADLE_INCLUDE.finditer(source):
         for group in match.groups():
@@ -1199,6 +1406,12 @@ def rank(rows: list[dict], task: str, limit: int = 6) -> list[dict]:
         if folder != "." and (hit := next((word for word in [folder.casefold()] + _name_parts(folder)
                                            if word in words), "")):
             offer(path, 4, "module", hit)
+        # The route the task named, now that the map knows the routes: a person who says "the login
+        # endpoint" and never types a class name still means one file, and the handler is the answer
+        # the index can give without reading it.
+        for route in row.get("endpoints") or []:
+            if score := names_route(task, words, route):
+                offer(path, score, "route", route["verb"] + " " + route["path"])
 
     for path, entry in list(scores.items()):
         if entry["score"] < 4:
@@ -1206,9 +1419,80 @@ def rank(rows: list[dict], task: str, limit: int = 6) -> list[dict]:
         for other in reverse.get(path, []):
             offer(other, min(5, entry["score"] - 2), "imports",
                   entry["symbol"] or path.rsplit("/", 1)[-1])
+        # The other half of one hop. A person who names a service means the repository it calls as
+        # often as the controller that calls it, and the single direction found only the second — the
+        # collaborator was the file the fix needed and the map had never offered. Named by the seed's
+        # file rather than its symbol, because "used by UserService.java" is the sentence that says
+        # which relationship pulled this one in.
+        for other in edges.get(path, []):
+            offer(other, min(5, entry["score"] - 2), "used_by", path.rsplit("/", 1)[-1])
 
     ordered = sorted(scores.values(), key=lambda entry: (-entry["score"], entry["path"]))
     return ordered[:limit]
+
+
+# A URL a person types is the strongest name of a file there is, and until the map carried routes the
+# ranker could not use one. These segments appear in thousands of endpoints and identify nothing, so a
+# path made only of them is matched by its literal text or not at all.
+GENERIC_ROUTE = {"api", "rest", "v1", "v2", "v3", "http", "https", "web", "internal"}
+
+
+def names_route(task: str, words: set[str], route: dict) -> int:
+    """0 when the sentence is not about this URL, 8 when it says the path, 5 when it says part of it.
+
+    The two strengths are the whole point. A person who types `/api/v1/orders/{id}/pay` has named the
+    file, and that ranks like a filename. A person who says "the pay endpoint" or "orders" means one
+    segment of a URL, and matching on one segment is a guess — so it ranks like the other guesses, at
+    the weight of an import edge or a folder name, with the URL it matched on kept in the reason so the
+    window can show *why* this file came to be in the prompt.
+    """
+    path = str(route.get("path", ""))
+    if path and path in str(task or ""):
+        return 8
+    parts = [piece for piece in path.split("/")
+             if len(piece) >= 3 and not piece.startswith("{")
+             and piece.casefold() not in GENERIC_ROUTE]
+    for piece in parts:
+        folded = piece.casefold()
+        # A URL segment is usually plural and the sentence is usually not, and neither form on its own
+        # finds the pair.
+        if any(word == folded or word.startswith(folded) or folded.startswith(word)
+               for word in words):
+            return 5
+    return 0
+
+
+SNIPPET_LINES = 40        # of a file too large for what is left of the retrieval budget
+
+
+def snippet(source: str, symbol: str, cap_lines: int = SNIPPET_LINES) -> tuple[str, int, bool]:
+    """The block around one declaration, for a file that will not fit in the budget whole.
+
+    Answers `(text, first line, more lines follow)`. The window opens at the first line that *declares*
+    the name in blanked text, so a comment or a log message naming it cannot choose what is shown. It
+    closes at the next declaration at the same indent or shallower — which is the end of a method body
+    for every method but the last one in the file — because finding where a brace closes needs the
+    parser, and this is reading a file the parser was pointed at by name, not re-parsing it.
+    """
+    needle = str(symbol or "").strip()
+    if not needle:
+        return "", 0, False
+    site = re.compile(r"(?<!\w)" + re.escape(needle.split("(", 1)[0].rsplit(".", 1)[-1]) + r"(?!\w)")
+    lines = source.splitlines()
+    blanked = blank(source).splitlines()
+    start = next((number for number, bare in enumerate(blanked, 1) if site.search(bare)), 0)
+    if not start:
+        return "", 0, False
+    first = lines[start - 1]
+    indent = len(first) - len(first.lstrip())
+    body = [first]
+    for offset in range(start, min(len(lines), start - 1 + cap_lines)):
+        bare = blanked[offset] if offset < len(blanked) else ""
+        depth = len(lines[offset]) - len(lines[offset].lstrip())
+        if depth <= indent and DECLARE_LINE.match(bare):
+            break
+        body.append(lines[offset])
+    return "\n".join(body), start, len(body) < len(lines) - (start - 1)
 
 
 def config_row(path: str, source: str) -> dict | None:
@@ -1265,6 +1549,19 @@ def render(rows: list[dict], files: list[str], limit: int = 12000, spread_files:
             if row["functions"]:
                 block.append("  functions: " + ", ".join(row["functions"][:8]) +
                              (" …" if len(row["functions"]) > 8 else ""))
+            # The routes on their own lines, above the depends-on edge: "what answers POST /login" is
+            # the question that decides whether a change is local or breaks a caller, and a map that
+            # only names the class leaves the model to open the file to find out.
+            routes = row.get("endpoints") or []
+            for route in routes[:6]:
+                block.append(("  route " + route["verb"] + " " + route["path"] + " \u2192 "
+                              + route["handler"])[:200])
+            if len(routes) > 6:
+                # The ceiling is named when it was reached, because "+34 more" out of a list that was
+                # cut at 40 is a different promise than "+34 more" out of the file's real 40.
+                block.append("  routes +" + str(len(routes) - 6) + " more"
+                             + (" (this map lists at most " + str(MAX_ENDPOINTS) + " per file)"
+                                if row.get("routes_capped") else ""))
             if edges.get(name):
                 block.append("  depends on: " + ", ".join(edges[name]))
         block.append("")

@@ -501,6 +501,24 @@ NOTE_TEMPLATES = {
     "step_unproven": ("Plan step {step} was marked verified by you, not by a command run: the ledger "
                       "records it as unproven.",
                       "الخطوة {step} عُلِّمت كمنتهية بقرارك وليس بتشغيل أمر: السجل يسجّلها بدون إثبات."),
+    # The three words the plan card needs to label the goal tree. They are sent in the snapshot rather
+    # than written in the client, because the client cannot know which language the task was asked in.
+    "plan_goal": ("Goal", "الهدف"),
+    "plan_criteria": ("Acceptance criteria", "معايير القبول"),
+    "plan_uncovered": ("no step answers this yet", "لا خطوة تجيب على هذا بعد"),
+    "plan_unproven": ("marked done without a command run", "مُعلَّم كمنتهي بدون تشغيل أمر"),
+    # A task that stopped mid-turn is a fact the operator has to decide about, so it is said and never
+    # acted on: nothing here resumes a run by itself, which is the rule the request queue already lives
+    # by (`restored: True` and a press of the play button).
+    "resume_line": ("{count} task in this folder stopped before it reached a result. "
+                    "Nothing resumed itself.",
+                    "{count} مهمة في هذا المجلد توقفت قبل أن تصل إلى نتيجة. لم تُستأنف أي مهمة تلقائيًا."),
+    "resume_gone": ("That task is no longer here — it was resumed, rolled back, or its folder moved.",
+                    "هذه المهمة لم تعد موجودة: إما استُؤنفت أو تراجِع عنها أو نُقل المجلد الخاص بها."),
+    "resume_busy": ("A task is running right now. Resume the stopped one after it finishes.",
+                    "توجد مهمة قيد التشغيل الآن. استأنف المهمة المتوقفة بعد انتهائها."),
+    "resume_started": ("Continuing the task that stopped: {task}",
+                       "استكمال المهمة التي توقفت: {task}"),
     # Leading spaces are part of the text: these three are appended to `prior_write`, which ends in a
     # full stop. Keeping the space here is what lets both windows join the same two pieces.
     "apply_rerun_warning": ("\nIt will then run {label} again in that folder, which executes the "
@@ -519,6 +537,50 @@ NOTE_TEMPLATES = {
                         " نكمل على هذه الحالة باختيارك."),
     "prior_stacked": (" Run its command (or roll it back) before stacking more changes on top of it.",
                       " شغّل أمرها أو تراجع عنها قبل تكديس تغييرات أخرى فوقها."),
+    # ---- the change-impact block (#8). `impact.py` computes the structure; these are its sentences.
+    "impact_heading": ("What this changes in the rest of the repository:",
+                       "ما يغيّره هذا في بقية المستودع:"),
+    "impact_removed": ("removes {names}", "يحذف {names}"),
+    "impact_changed": ("changes the shape of {names}", "يغيّر شكل {names}"),
+    "impact_callers": ("other files name {name} ({count}): {files}",
+                       "ملفات أخرى تذكر {name} ({count}): {files}"),
+    "impact_tests": ("test files name {name} ({count}): {files}",
+                     "ملفات اختبار تذكر {name} ({count}): {files}"),
+    "impact_route_gone": ("{route} ({handler}) would answer nothing",
+                          "لن يردّ {route} ({handler}) على شيء"),
+    "impact_route_new": ("{route} is added, handled by {handler}",
+                         "أُضيف {route} ويعالجه {handler}"),
+    "impact_modules": ("modules touched: {modules}", "الوحدات المتأثرة: {modules}"),
+    "impact_unread": ("is not a language this tool reads as code",
+                      "لغة لا تقرأها هذه الأداة ككود"),
+    "impact_query": ("query text disappears from this file",
+                     "نص استعلام يختفي من هذا الملف"),
+    "impact_text_changed": ("query or configuration text changed in a file this tool does not read",
+                            "نص استعلام أو إعداد تغيّر في ملف لا تقرأه هذه الأداة"),
+    "impact_more": ("+{count} more", "+{count} أخرى"),
+    "impact_listed_more": ("({count} more not listed)", "({count} غير مدرجة)"),
+    "impact_unknown_heading": ("Not covered: ", "غير مغطى: "),
+    "impact_unknown_no_index": ("nothing is indexed for this folder, so no caller could be checked",
+                                "لا فهرس لهذا المجلد، لذا لم يتسن فحص أي ملف يستخدمها"),
+    "impact_unknown_searched": ("callers were searched in {searched} of the {visible} other indexed files",
+                                "تم البحث في {searched} من {visible} من الملفات المفهرسة الأخرى"),
+    "impact_unknown_not_indexed": ("{path} is not in the index: its own declarations were compared, "
+                                   "nothing that uses them",
+                                   "{path} ليس في الفهرس: قورنت تعريفاته نفسها لا ما يستخدمها"),
+    "impact_unknown_routes": ("{path} answers more routes than an index lists ({max} per file), "
+                              "so a URL may be missing",
+                              "{path} يردّ على مسارات أكثر مما يسجله الفهرس ({max} لكل ملف)، "
+                              "لذا قد يكون هناك مسار ناقص"),
+    "impact_unknown_unread": ("a changed file is in a language this tool does not parse; its content "
+                              "was diffed, its users were not",
+                              "أحد الملفات المعدلة بلغة لا تحللها هذه الأداة؛ قورن محتواها لا مستخدموها"),
+    "impact_unknown_per_file": ("a name is written more than {limit} times in one file, so only its "
+                                "first sites were counted",
+                                "يُكتب اسم أكثر من {limit} مرة في ملف واحد، لذا حُسبت مواضعه الأولى فقط"),
+    "impact_unknown_names": ("a file lost more declarations than are listed here ({max} per kind)",
+                             "أحد الملفات فقد تعريفات أكثر مما هو مُدرج هنا ({max} لكل نوع)"),
+    "impact_unknown_failed": ("the impact check could not run, so nothing was verified about other files",
+                              "لم يستطيع فحص الأثر أن يعمل، لذا لم يُتحقق أي شيء بخصوص الملفات الأخرى"),
 }
 
 # `apply_rerun_warning` is the only one with no second-language twin in the other window: Tk has no
@@ -536,6 +598,61 @@ def note(key: str, *, arabic: bool = False, **fields) -> str:
         raise KeyError("no shared sentence named " + str(key))
     english, arabic_text = NOTE_TEMPLATES[key]
     return say(arabic, en=english, ar=arabic_text).format(**fields)
+
+
+def impact_lines(report: dict, *, arabic: bool = False) -> list[str]:
+    """The change-impact block as sentences: one line per proposed file, then what it cannot cover.
+
+    `impact.analyze` keeps the structure — which name went, which file still writes it — and this is
+    the only home its wording has, so the web card and the desktop window both answer in the language
+    the task was asked in. A file with nothing to say is left out rather than reported as clean: an
+    empty answer means "nothing was found", which is not the claim "nothing was looked for".
+    """
+    lines: list[str] = []
+    for entry in (report or {}).get("files") or []:
+        said: list[str] = []
+        if entry.get("removed"):
+            said.append(note("impact_removed", arabic=arabic, names=", ".join(entry["removed"]))
+                        + _more(entry, "removed_more", arabic))
+        if entry.get("changed"):
+            said.append(note("impact_changed", arabic=arabic, names=", ".join(entry["changed"]))
+                        + _more(entry, "changed_more", arabic))
+        if entry.get("unread"):
+            said.append(note("impact_unread", arabic=arabic))
+        for row in entry.get("callers") or []:
+            said.append(note("impact_callers", arabic=arabic, name=row["name"],
+                             count=row["count"], files=", ".join(row["files"]))
+                        + _unlisted(row, arabic))
+        for route in entry.get("endpoints") or []:
+            said.append(note("impact_route_gone" if route.get("gone") else "impact_route_new",
+                             arabic=arabic, route=route["route"], handler=route["handler"]))
+        for row in entry.get("tests") or []:
+            said.append(note("impact_tests", arabic=arabic, name=row["name"], count=row["count"],
+                             files=", ".join(row["files"])) + _unlisted(row, arabic))
+        for key in entry.get("flags") or []:
+            said.append(note(key, arabic=arabic))
+        if len(entry.get("modules") or []) > 1:
+            said.append(note("impact_modules", arabic=arabic, modules=", ".join(entry["modules"])))
+        if said:
+            lines.append(redact(str(entry.get("path", "")) + " — " + "; ".join(said))[:600])
+    unknown = (report or {}).get("unknown") or []
+    if unknown:
+        lines.append(redact(note("impact_unknown_heading", arabic=arabic) + "; ".join(
+            note(row["key"], arabic=arabic, **{k: v for k, v in row.items() if k != "key"})
+            for row in unknown))[:600])
+    return lines
+
+
+def _more(entry: dict, key: str, arabic: bool) -> str:
+    """` +3 more` when a list was stopped early, and nothing when it was not."""
+    left = int(entry.get(key) or 0)
+    return " " + note("impact_more", arabic=arabic, count=left) if left else ""
+
+
+def _unlisted(row: dict, arabic: bool) -> str:
+    """The count is the truth and the list is the display; say which of the two was cut."""
+    left = int(row.get("count") or 0) - len(row.get("files") or [])
+    return " " + note("impact_listed_more", arabic=arabic, count=left) if left > 0 else ""
 
 
 def status_text(key: str, *, arabic: bool = False, tail: str = "") -> str:
@@ -593,7 +710,22 @@ CONTEXT_REASON = {
     "imports": ("imports {}", "يستقدم {}"),
     "module": ("its folder is named in the task", "مجلده مذكور في المهمة"),
     "names": ("the task names this file", "المهمة تسمي هذا الملف"),
+    "route": ("serves {}", "يخدم {}"),
+    "used_by": ("used by {}", "يستخدمه {}"),
 }
+
+
+def context_reason(arabic: bool, why: str, symbol: str) -> str:
+    """The one reason a file was chosen, spoken.
+
+    The engine may qualify the code it sends with a bracketed hint — `declares [controller]` when the
+    project index supplied a layer — and that hint belongs to the stored audit, not to the sentence.
+    Looking the whole string up as a key would answer nothing, which is how a reason disappears.
+    """
+    phrase = CONTEXT_REASON.get(str(why or "").split(" [", 1)[0], "")
+    if not phrase:
+        return ""
+    return say(arabic, en=phrase[0], ar=phrase[1]).replace("{}", str(symbol or ""))
 
 
 def graph_caption(arabic: bool, *, nodes: int, edges: int, cyclic: bool = False,
@@ -653,9 +785,7 @@ def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", cou
         # is the engine's decision, and how it is said belongs here with the rest of the thread's words.
         listed = []
         for row in (names or []):
-            phrase = CONTEXT_REASON.get(str(row.get("why", "")), "")
-            why = say(arabic, en=phrase[0], ar=phrase[1]).replace("{}", str(row.get("symbol", ""))) \
-                if phrase else ""
+            why = context_reason(arabic, str(row.get("why", "")), str(row.get("symbol", "")))
             listed.append(f"{row.get('path', '')}" + (f" ({why})" if why else ""))
         body = say(arabic, en=f"\U0001f3af Chose {count} file(s) for this task",
                    ar=f"\U0001f3af اختيرت {count} ملف(ات) لهذه المهمة")
@@ -872,13 +1002,22 @@ def log_line(arabic: bool, entry: dict) -> str:
         return say(arabic, en=f"\u2699\ufe0f {name} — {entry.get('count', 0)} result(s)",
                    ar=f"\u2699\ufe0f {name} — {entry.get('count', 0)} نتيجة")
     if kind == "context_file":
-        phrase = CONTEXT_REASON.get(str(entry.get("why", "")), "")
-        why = say(arabic, en=phrase[0], ar=phrase[1]).replace("{}", str(entry.get("symbol", ""))) \
-            if phrase else ""
+        why = context_reason(arabic, str(entry.get("why", "")), str(entry.get("symbol", "")))
         return say(arabic, en=f"\U0001f3af Read {entry.get('path', '')} into the context" +
                               (f" ({why})" if why else ""),
                    ar=f"\U0001f3af قراءة {entry.get('path', '')} في السياق" +
                       (f" ({why})" if why else ""))
+    if kind == "context_excerpt":
+        # Its own row rather than a share with `context_file`: a block of forty lines that arrived
+        # because the whole file would not fit is not a read, and the strip that says it is teaches the
+        # operator to trust a context that was never there.
+        return say(arabic,
+                   en=f"\u2702\ufe0f Sent {entry.get('lines', 0)} lines of {entry.get('path', '')} "
+                      f"(partial — this file was not read in full)"
+                      + (f" ({entry.get('symbol', '')})" if entry.get("symbol") else ""),
+                   ar=f"\u2702\ufe0f أُرسلت {entry.get('lines', 0)} سطرًا من "
+                      f"{entry.get('path', '')} (جزئي — لم يُقرأ هذا الملف بالكامل)"
+                      + (f" ({entry.get('symbol', '')})" if entry.get("symbol") else ""))
     if kind == "auto_read":
         return say(arabic, en=f"\U0001f4d6 Read {entry.get('path', '')} before it was asked for",
                    ar=f"\U0001f4d6 قراءة {entry.get('path', '')} قبل طلبها")
@@ -930,6 +1069,13 @@ def log_line(arabic: bool, entry: dict) -> str:
     if kind == "evidence_attached":
         return say(arabic, en=f"\U0001f4ce Build evidence sent ({entry.get('characters', 0)} characters)",
                    ar=f"\U0001f4ce إرسال دليل البناء ({entry.get('characters', 0)} حرف)")
+    if kind == "impact":
+        return say(arabic,
+                   en=f"\U0001f50e Checked what this breaks elsewhere "
+                      f"({entry.get('files', 0)} files with findings, "
+                      f"{entry.get('unknown', 0)} not covered)",
+                   ar=f"\U0001f50e فحص ما يفسده هذا في أماكن أخرى "
+                      f"({entry.get('files', 0)} ملفات، غير مغطى: {entry.get('unknown', 0)})")
     return say(arabic, en=f"\u2699\ufe0f {kind}", ar=f"\u2699\ufe0f {kind}")
 
 

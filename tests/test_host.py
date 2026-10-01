@@ -169,12 +169,29 @@ class TheContractIsImplemented(unittest.TestCase):
         92, not 89: the override section adds three, and each one assigns the answer of a shared
         function — `overrides.written`, `.removed`, `.absent`, or `friendly_error` — never a sentence
         written here. The count moved because a new surface speaks; the wording still has one owner.
+
+        V1 #1 moved three of them, for the same reason and with the same discipline: a plan's goal tree
+        is a thing the agent did and therefore needs a row (`goal_written`, `goal_skipped`), a failing
+        command run now records itself on the ledger and says so when the write fails, and Tk hears the
+        goal outcome through the only channel a worker thread may use. 36 `_add`, 17 `chat_message`, 7
+        `events.put`. Every one of those sentences is `labels.note(...)` with its Arabic twin in the same
+        table — none of them is wording written at the call site.
+
+        V1 #2 moved five more, all of them the resume surface: a stopped task is read from disk, offered
+        in a strip, and refused in six ways (busy, gone, no folder, no model, no consent, unreadable
+        session) in each window. 66 `status.set`, 18 `chat_message` in Tk; 98 `self.status`, 37 `_add`
+        and 22 `_emit` in the web window. None of the refusals is written at the call site: they are
+        `resume_busy`/`resume_gone`/`resume_line`/`resume_started` from the notes table, and
+        `need_folder_exists`/`pick_model`/`consent_message`/`proposal_ready` from the status table, so a
+        refusal that differs between the windows is still a bug this table could not hide. The eighth
+        `events.put` in Tk is the same rule seen from the other side: a goal outcome and a resumed job
+        both speak from a worker thread, and the pump only understands `progress` and `done`.
         """
         ceilings = {
-            SRC / "gui.py": {"status.set(": 59, "self.chat_message(": 16, "messagebox.": 6,
-                             "events.put(": 6},
-            SRC / "webapp" / "controller.py": {"self.status = ": 92, "self._add(": 33,
-                                               "self._emit(": 21, "self._note(": 9},
+            SRC / "gui.py": {"status.set(": 66, "self.chat_message(": 18, "messagebox.": 6,
+                             "events.put(": 8},
+            SRC / "webapp" / "controller.py": {"self.status = ": 98, "self._add(": 37,
+                                               "self._emit(": 22, "self._note(": 9},
         }
         for path, limits in ceilings.items():
             text = path.read_text(encoding="utf-8")

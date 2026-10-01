@@ -35,6 +35,7 @@ Layered taxonomy — Spring / JVM / Jakarta EE / Quarkus / Micronaut:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -507,6 +508,11 @@ class FileEntry:
     module: str        # top-level directory (e.g. auth-service), or "."
     types: list[TypeEntry] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
+    endpoints: list[dict[str, Any]] = field(default_factory=list)
+    # True when the parser refused a route at its per-file ceiling. An impact answer built on a route
+    # list that stopped has to be able to say "I did not see every URL", so the cap travels with the
+    # data rather than being re-derived from its length.
+    routes_capped: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -516,6 +522,8 @@ class FileEntry:
             "module": self.module,
             "types": [t.to_dict() for t in self.types],
             "depends_on": self.depends_on,
+            "endpoints": self.endpoints,
+            "routes_capped": self.routes_capped,
         }
 
 
@@ -547,6 +555,10 @@ class ProjectIndex:
     build_files: list[dict[str, Any]]
     dependency_graph: dict[str, list[str]]
     stats: dict[str, int]
+    # Which tree this index describes. An index is only a picture of the files that were there when
+    # it was written, so it is stored with the stamp those files made and re-checked before it is
+    # trusted again -- see `get_or_create_index`.
+    fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -568,6 +580,7 @@ class ProjectIndex:
             "build_files": self.build_files,
             "dependency_graph": self.dependency_graph,
             "stats": self.stats,
+            "fingerprint": self.fingerprint,
         }
 
 
@@ -576,6 +589,10 @@ class ProjectIndex:
 # ---------------------------------------------------------------------------
 
 MAX_FILE_BYTES = 128 * 1024
+# The scanner's own output, written inside the folder it describes. It is never indexed, and never
+# stamped: an index that counted itself would look stale the moment it was saved and re-scan on every
+# turn, which is the one loop this file must not create.
+INDEX_NAME = "project-index.json"
 _TEXT_SUFFIXES = {
     ".py", ".java", ".kt", ".kts", ".xml", ".gradle", ".md",
     ".json", ".yaml", ".yml", ".toml", ".properties", ".sql",
@@ -617,6 +634,8 @@ def _walk_files(root: Path) -> list[str]:
 
         for name in sorted(names):
             relative = prefix + name
+            if relative == INDEX_NAME:
+                continue
             suffix = Path(name).suffix.lower()
             if suffix not in _TEXT_SUFFIXES and name.casefold() not in {
                 ".gitignore", "dockerfile", "makefile", "license", "readme"
@@ -662,6 +681,32 @@ def _read_safe(root: Path, relative: str) -> str | None:
 # ---------------------------------------------------------------------------
 # RepoScanner
 # ---------------------------------------------------------------------------
+
+def _stamp(root: Path, files: list[str]) -> str:
+    """Path, size and modification time for every file a scan would read, digested.
+
+    Nothing is opened: the check that decides whether a saved index is still true has to cost a small
+    part of the scan it protects, or the loop it belongs to would be better off ignoring it. `st_mtime_ns`
+    rather than seconds because a one-character edit that keeps the file the same length is otherwise
+    invisible inside the second it happened in, and an invisible edit is a stale map that answers with
+    confidence.
+    """
+    parts = []
+    for relative in files:
+        try:
+            info = (root / relative.replace("/", os.sep)).stat()
+        except OSError:
+            parts.append(relative + "|gone")
+            continue
+        parts.append(relative + "|" + str(info.st_size) + "|" + str(info.st_mtime_ns))
+    return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
+
+
+def fingerprint(root: str | Path) -> str:
+    """The stamp of the tree as it is right now."""
+    base = Path(root)
+    return _stamp(base, _walk_files(base))
+
 
 class RepoScanner:
     """Scan a project directory and produce a structured ProjectIndex.
@@ -743,6 +788,10 @@ class RepoScanner:
         }
         for layer, stat_key in _LAYER_STAT_KEY.items():
             stats[stat_key] = len(buckets.get(layer, []))
+        # Counted across every bucket, because the first question about a route map is whether this
+        # project answers HTTP at all.
+        stats["endpoints"] = sum(len(entry.get("endpoints") or [])
+                                 for bucket in buckets.values() for entry in bucket)
 
         return ProjectIndex(
             root=str(self.root),
@@ -763,6 +812,7 @@ class RepoScanner:
             build_files=build_files,
             dependency_graph=dep_graph,
             stats=stats,
+            fingerprint=_stamp(self.root, files),
         )
 
     def save(self, index: ProjectIndex, output_path: str | Path | None = None) -> Path:
@@ -799,6 +849,7 @@ class RepoScanner:
             ("Utils",        "utils"),
             ("Components",   "components"),
             ("Build files",  "build_files"),
+            ("Endpoints",    "endpoints"),
         ]
         for label, key in layer_labels:
             # normalise plural keys that don't follow the simple +s rule
@@ -856,6 +907,8 @@ class RepoScanner:
             module=symbols.module_of(row["path"]),
             types=types,
             depends_on=dep_map.get(row["path"], []),
+            endpoints=list(row.get("endpoints") or []),
+            routes_capped=bool(row.get("routes_capped")),
         )
 
     def _build_named_dep_graph(
@@ -1021,19 +1074,27 @@ def load_index(root: str | Path) -> ProjectIndex | None:
             build_files=data.get("build_files", []),
             dependency_graph=data.get("dependency_graph", {}),
             stats=data.get("stats", {}),
+            fingerprint=data.get("fingerprint", ""),
         )
     except Exception:   # noqa: BLE001 — never crash the planning loop
         return None
 
 
 def get_or_create_index(root: str | Path) -> ProjectIndex | None:
-    """Load existing project-index.json or automatically scan and save if absent.
+    """Load `project-index.json`, and re-scan whenever the tree no longer matches it.
 
-    Ensures the Agent always has architectural awareness even on the very
-    first task in a workspace without requiring manual pre-scanning.
+    An index written by an older version carries no stamp, so the first call after an upgrade scans
+    once and the stamp is in the file from then on. A scan that fails leaves the stale index standing
+    rather than returning nothing: an out-of-date map still beats no map, and it says when it was
+    written.
     """
     existing = load_index(root)
-    if existing is not None:
+    stamp = ""
+    try:
+        stamp = fingerprint(root)
+    except Exception:   # noqa: BLE001 — an unreadable tree cannot prove the index false
+        stamp = existing.fingerprint if existing else ""
+    if existing is not None and existing.fingerprint == stamp:
         return existing
     try:
         scanner = RepoScanner(root)
@@ -1041,7 +1102,41 @@ def get_or_create_index(root: str | Path) -> ProjectIndex | None:
         scanner.save(index)
         return index
     except Exception:   # noqa: BLE001 — safety net
-        return None
+        return existing
+
+
+# The build-file facts worth remembering between tasks: stated outright by the build, cheap to carry,
+# and each one changes what code a later proposal has to be.
+FACT_LABELS = ("java", "spring boot", "artifact", "modules", "needs")
+BUILD_TOOL = {"pom.xml": "maven", "build.gradle": "gradle", "build.gradle.kts": "gradle",
+              "settings.gradle": "gradle", "settings.gradle.kts": "gradle",
+              "package.json": "npm", "go.mod": "go modules", "cargo.toml": "cargo",
+              "pyproject.toml": "python"}
+
+
+def project_facts(index: ProjectIndex) -> dict[str, str]:
+    """What this project *is*, as its own build files state it.
+
+    Read once and stored in the project notes, so the next task is not asked to re-derive a Java
+    version from a `pom.xml` it is no longer shown. Only what a file says is kept: nothing here is
+    guessed from a filename or from the source, and a project that states no version produces an
+    empty answer, which is the honest one.
+    """
+    facts: dict[str, str] = {}
+    for entry in index.build_files:
+        name = str(entry.get("path", "")).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if name in BUILD_TOOL:
+            facts.setdefault("build", BUILD_TOOL[name])
+        for pair in entry.get("facts") or []:
+            try:
+                label, value = str(pair[0]), str(pair[1])
+            except (TypeError, IndexError, KeyError):
+                continue
+            if label in FACT_LABELS and value.strip():
+                facts.setdefault(label, value.strip()[:120])
+    if len(index.modules) > 1 and "." not in index.modules:
+        facts["modules"] = ", ".join(index.modules[:12])
+    return dict(sorted(facts.items())[:8])
 
 
 def index_boost(

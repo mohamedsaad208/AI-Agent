@@ -419,6 +419,42 @@ class TestRepoScanner(unittest.TestCase):
         idx = self.scanner.scan()
         self.assertIsInstance(idx.dependency_graph, dict)
 
+    def test_every_route_is_indexed_with_the_method_that_answers_it(self):
+        # The map already prints a controller's methods; what a change-impact question needs from the
+        # index is the URL and the handler under it, held as data rather than as a line of prose.
+        idx = self.scanner.scan()
+        routes = [route for entry in idx.controllers for route in entry["endpoints"]]
+        self.assertEqual([(r["verb"], r["path"], r["handler"]) for r in routes],
+                         [("POST", "/login", "LoginController.login")])
+        self.assertEqual(idx.stats["endpoints"], len(routes))
+
+    def test_a_type_that_extends_something_says_what(self):
+        idx = self.scanner.scan()
+        extends = {t["name"]: t["extends"] for entry in idx.repositories
+                   for t in entry["types"]}
+        self.assertEqual(extends["CustomerRepository"], ["JpaRepository"])
+
+    def test_the_build_files_answer_what_the_project_is(self):
+        from ai_code_engineer.repo_scanner import project_facts
+        self.assertEqual(project_facts(self.scanner.scan()),
+                         {"artifact": "auth-service", "build": "maven",
+                          "needs": "spring-boot-starter-web"})
+
+    def test_a_route_list_that_was_cut_is_indexed_as_cut(self):
+        # #8 asks "does anything answer this URL", and a list stopped at the ceiling cannot answer that
+        # on its length alone. The flag is carried rather than re-derived so the answer stays honest.
+        body = ("package com.example.web;\n"
+                "import org.springframework.web.bind.annotation.*;\n"
+                "@RestController\npublic class BigController {\n"
+                + "".join('    @GetMapping("/x%d") public String h%d() { return ""; }\n' % (n, n)
+                          for n in range(symbols.MAX_ENDPOINTS + 1)) + "}\n")
+        (self.root / "src/main/java/com/example/auth/web/BigController.java").write_text(
+            body, encoding="utf-8")
+        entry = next(e for e in self.scanner.scan().controllers
+                     if e["path"].endswith("BigController.java"))
+        self.assertEqual(len(entry["endpoints"]), symbols.MAX_ENDPOINTS)
+        self.assertTrue(entry["routes_capped"])
+
     def test_stats_correct(self):
         idx = self.scanner.scan()
         s = idx.stats
@@ -438,7 +474,7 @@ class TestRepoScanner(unittest.TestCase):
             "controllers", "services", "repositories", "entities",
             "dtos", "security", "configs", "messaging", "aspects",
             "tests", "utils", "components",
-            "dependency_graph", "stats", "generated_at",
+            "dependency_graph", "stats", "generated_at", "fingerprint",
         ]
         for key in required_keys:
             self.assertIn(key, parsed, f"Missing key: {key}")
@@ -471,7 +507,7 @@ class TestRepoScanner(unittest.TestCase):
             "controllers", "services", "repositories", "entities",
             "dtos", "security", "configs", "messaging", "aspects",
             "tests", "utils", "components",
-            "build_files", "dependency_graph", "stats",
+            "build_files", "dependency_graph", "stats", "fingerprint",
         ]
         for key in required_keys:
             self.assertIn(key, data, f"Missing key: {key}")
@@ -518,6 +554,101 @@ class TestRepoScanner(unittest.TestCase):
         self.assertTrue(any("LoginController" in p for p in top_paths))
         # Top entry should have layer metadata
         self.assertIn("layer", results[0])
+
+
+class IndexFreshnessTests(unittest.TestCase):
+    """An index is a picture of a tree, so it stays true only while that tree is the one on disk.
+
+    `get_or_create_index` used to answer from `project-index.json` forever once it existed, so a
+    controller renamed or deleted after the first scan kept being offered as the place to put a
+    change, with the confidence of an index. The stamp is path + size + `st_mtime_ns` over the files a
+    scan would read, and reading them is what the check avoids: a guard that costs as much as the work
+    it skips is a guard that gets skipped.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        _make_spring_project(self.root)
+        self.addCleanup(self._tmp.cleanup)
+        self.index_file = self.root / "project-index.json"
+
+    def index(self):
+        from ai_code_engineer.repo_scanner import get_or_create_index
+        return get_or_create_index(self.root)
+
+    def test_an_unchanged_tree_answers_from_the_file_it_already_wrote(self):
+        first = self.index()
+        self.assertTrue(self.index_file.is_file())
+        self.assertEqual(self.index().generated_at, first.generated_at)
+
+    def test_the_index_is_not_one_of_the_files_it_stamps(self):
+        # `save()` writes inside the folder it describes. Counted, every saved index would look stale
+        # the moment it was written, and the scan would run again on every turn for ever.
+        from ai_code_engineer.repo_scanner import fingerprint
+        index = self.index()
+        self.assertNotIn("project-index.json", _walk_files(self.root))
+        self.assertEqual(fingerprint(self.root), index.fingerprint)
+
+    def test_a_file_added_after_the_scan_forces_a_new_one(self):
+        first = self.index()
+        (self.root / "src/main/java/com/example/auth/web/PaymentsController.java").write_text(
+            "package com.example.web;\nimport org.springframework.web.bind.annotation.*;\n"
+            '@RestController\n@RequestMapping("/api")\npublic class PaymentsController {\n'
+            '    @PostMapping("/charge") public String charge() { return ""; }\n}\n',
+            encoding="utf-8")
+        fresh = self.index()
+        self.assertNotEqual(fresh.generated_at, first.generated_at)
+        routes = [route["path"] for entry in fresh.controllers for route in entry["endpoints"]]
+        self.assertIn("/api/charge", routes)
+
+    def test_an_edit_that_only_changes_the_routes_is_seen(self):
+        first = self.index()
+        controller = self.root / "src/main/java/com/example/auth/web/LoginController.java"
+        controller.write_text(controller.read_text(encoding="utf-8")
+                              .replace('"/login"', '"/signin"'), encoding="utf-8")
+        self.assertEqual([r["path"] for e in self.index().controllers
+                          for r in e["endpoints"]], ["/signin"])
+
+    def test_an_edit_that_keeps_the_length_is_still_seen(self):
+        # `@PostMapping` and `@DeleteMapping` are the same length, so a size-only stamp would call this
+        # tree unchanged and keep answering with the route that is no longer there.
+        first = self.index()
+        controller = self.root / "src/main/java/com/example/auth/web/LoginController.java"
+        controller.write_text(controller.read_text(encoding="utf-8")
+                             .replace("@PostMapping", "@DeleteMapping"), encoding="utf-8")
+        self.assertEqual([r["verb"] for e in self.index().controllers
+                          for r in e["endpoints"]], ["DELETE"])
+
+    def test_a_file_removed_after_the_scan_is_gone_from_the_index(self):
+        self.index()
+        (self.root / "src/main/java/com/example/auth/web/LoginController.java").unlink()
+        paths = [entry["path"] for entry in self.index().controllers]
+        self.assertFalse(any("LoginController" in p for p in paths), paths)
+
+    def test_an_index_written_by_an_older_build_is_scanned_once(self):
+        # An upgrade has no stamp to compare against, so the first call rebuilds and the file it writes
+        # carries one: after that the tree is believed again, which is the whole cost of upgrading.
+        from ai_code_engineer.repo_scanner import fingerprint, load_index
+        self.index()
+        data = json.loads(self.index_file.read_text(encoding="utf-8"))
+        data.pop("fingerprint")
+        self.index_file.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(load_index(self.root).fingerprint, "")
+        self.assertEqual(self.index().fingerprint, fingerprint(self.root))
+
+    def test_a_scan_that_fails_keeps_the_stale_index_rather_than_nothing(self):
+        # The tree has changed, so a rebuild is due, and the rebuild is what fails. An out-of-date map
+        # still beats no map: it says when it was written, and the loop keeps its file selection.
+        from unittest.mock import patch
+        from ai_code_engineer.repo_scanner import get_or_create_index
+        first = self.index()
+        (self.root / "note.md").write_text("# changed after the scan\n", encoding="utf-8")
+        with patch("ai_code_engineer.repo_scanner.RepoScanner.scan",
+                   side_effect=OSError("disk unreadable")):
+            kept = get_or_create_index(self.root)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.generated_at, first.generated_at)
 
 
 if __name__ == "__main__":

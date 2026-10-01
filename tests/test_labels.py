@@ -604,6 +604,27 @@ class TheRefusalSentences(unittest.TestCase):
             self.assertTrue(is_arabic(arabic_text), key)
             self.assertNotEqual(english, arabic_text, key)
 
+    def test_the_goal_and_resume_notes_answer_in_both_languages(self):
+        """V1 added eight sentences the windows owe for a goal tree and a stopped task.
+
+        The placeholders are checked as well as the script: `{step}` left out of the Arabic twin is a
+        sentence that names nothing, and both windows format the same field names.
+        """
+        fields = {"goal_written": {"count": 3}, "goal_skipped": {"reason": "no model"},
+                  "step_no_proof": {"step": 2, "reason": "no run"}, "step_unproven": {"step": 2},
+                  "plan_goal": {}, "plan_criteria": {}, "plan_uncovered": {}, "plan_unproven": {},
+                  "resume_line": {"count": 2}, "resume_gone": {}, "resume_busy": {},
+                  "resume_started": {"task": "fix add"}}
+        for key, sample in fields.items():
+            english, arabic_text = labels.NOTE_TEMPLATES[key]
+            self.assertTrue(is_arabic(arabic_text), key)
+            self.assertNotEqual(english, arabic_text, key)
+            self.assertEqual(labels.note(key, arabic=False, **sample), english.format(**sample), key)
+            joined = labels.note(key, arabic=True, **sample)
+            self.assertTrue(is_arabic(joined), key)
+            for value in sample.values():
+                self.assertIn(str(value), joined, f"{key} loses a field in Arabic")
+
     def test_a_declined_proposal_is_said_in_the_replayed_log(self):
         english = labels.log_line(False, {"kind": "proposal_rejected"})
         self.assertIn("Proposal declined", english)

@@ -111,6 +111,51 @@ class GoalTreeRunTests(ControllerCase):
                         "the missing tree is a said fact, not a silent hole")
 
 
+    def test_the_snapshot_carries_the_tree_the_client_draws(self):
+        from ai_code_engineer import labels
+        self.attach()
+        self.controller.start_plan("Scaffold the login work")
+        self.controller.join()
+        plan = self.controller.snapshot()["plan"]
+        self.assertEqual(plan["goal"], TREE["goal"])
+        self.assertEqual(plan["criteria"], TREE["criteria"])
+        self.assertEqual(plan["steps"][0]["accepts"], [1])
+        self.assertEqual(plan["steps"][1]["accepts"], [2])
+        self.assertEqual(plan["uncovered"], [])
+        self.assertEqual(plan["sub_goal"], "Auth API")
+        self.assertEqual(plan["strings"]["goal"], labels.NOTE_TEMPLATES["plan_goal"][0])
+
+    def test_the_tree_words_come_from_the_language_the_window_reads_in(self):
+        from ai_code_engineer import labels
+        self.attach()
+        self.controller.start_plan("ابنِ عملية تسجيل الدخول ورفض كلمة المرور الخطأ")
+        self.controller.join()
+        self.assertTrue(self.controller.arabic, "the window reads the task it was given")
+        plan = self.controller.snapshot()["plan"]
+        self.assertEqual(plan["strings"]["criteria"], labels.NOTE_TEMPLATES["plan_criteria"][1])
+        self.assertTrue(labels.is_arabic(plan["strings"]["uncovered"]))
+
+    def test_a_criterion_no_step_answers_arrives_marked_as_one(self):
+        partial = json.loads(json.dumps(TREE))
+        partial["steps"][1]["accepts"] = []
+
+        def author(path, book, provider, **kw):
+            tree = planbook.validate_tree(partial, [row["id"] for row in book["steps"]])
+            book.update(schema=2, goal=tree["goal"], criteria=tree["criteria"],
+                        sub_goals=tree["sub_goals"])
+            for entry, row in zip(tree["steps"], book["steps"]):
+                row["accepts"] = entry["accepts"]
+            return book, ""
+
+        self.attach()
+        with patch("ai_code_engineer.planbook.author_goal", side_effect=author):
+            self.controller.start_plan("Scaffold the login work")
+            self.controller.join()
+        plan = self.controller.snapshot()["plan"]
+        self.assertEqual(plan["uncovered"], [2])
+        self.assertEqual(plan["steps"][1]["accepts"], [])
+
+
 class VerifyButtonProofTests(unittest.TestCase):
     """The button closes a step on recorded proof, or records that it had none."""
 

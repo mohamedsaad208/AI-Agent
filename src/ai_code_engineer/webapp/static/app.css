@@ -563,6 +563,28 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 .task-item.now .task-status-icon { background: var(--accent); color: var(--accent-ink); }
 .task-item.pending .task-status-icon { background: var(--chip); color: var(--faint); }
 .task-item .task-title { flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.4; word-break: break-word; text-align: start; }
+.plan-goal {
+  margin-top: 10px; padding: 8px 10px; border: 1px solid var(--line-soft);
+  border-radius: var(--r-s); background: var(--field);
+}
+.plan-resume {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 8px; padding: 6px 8px; border: 1px dashed var(--line-soft);
+  border-radius: var(--r-s); font-size: 12px;
+}
+.plan-resume .quiet { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-criteria { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.plan-criterion { font-size: 12px; line-height: 1.45; display: flex; gap: 6px; align-items: baseline; }
+.plan-criterion b {
+  font-size: 10.5px; background: var(--chip); color: var(--faint); border-radius: 99px;
+  padding: 1px 6px; flex: none;
+}
+.plan-criterion.uncovered b { background: var(--bad-bg); color: var(--bad-ink); }
+.task-item .task-crit { font-size: 11px; flex: none; }
+.task-item .task-unproven {
+  width: 16px; height: 16px; border-radius: 99px; display: grid; place-items: center;
+  font-size: 10px; font-weight: 700; background: var(--bad-bg); color: var(--bad-ink); flex: none;
+}
 .step-exec-btn {
   display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 6px;
   font-size: 11px; font-weight: 600; background: var(--accent); color: var(--accent-ink);
@@ -852,6 +874,18 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 .chip-tag.auto { background: var(--warn-bg); color: var(--warn-ink) }
 .file-chip .chip-action {
   margin-inline-start: auto; font-size: 11.5px; color: var(--faint); white-space: nowrap;
+}
+/* What the change breaks in files it does not touch, above the buttons that would apply it. Amber
+   rather than red: this is a finding to read before deciding, not a failure the tool has proven. */
+.impact-block {
+  margin-top: 8px; padding: 8px 10px; border: 1px solid var(--warn-line);
+  border-inline-start: 3px solid var(--warn-ink); border-radius: var(--r-s);
+  background: var(--warn-bg);
+}
+.impact-head { font-size: 11.5px; font-weight: 700; color: var(--warn-ink); margin-bottom: 4px }
+.impact-line {
+  font-size: 11.5px; line-height: 1.5; color: var(--ink); font-family: var(--mono);
+  white-space: pre-wrap; overflow-wrap: anywhere; direction: auto;
 }
 .file-chip:hover .chip-action { color: var(--accent-text) }
 /* The added/removed pair, drawn by `diffStat` wherever a file is named. LTR by construction even on

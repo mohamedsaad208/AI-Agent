@@ -38,7 +38,7 @@ from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIEL
                       applied_line, applied_note, artifact_card, asked_of, batch_summary_line,
                       branch_started, branch_switched,
                       catalog_status_line, checkpoint_note, detail_section, executed_line,
-                      executing_line, friendly_error, fix_offers_off_line, is_arabic,
+                      executing_line, friendly_error, fix_offers_off_line, impact_lines, is_arabic,
                       log_dropped_line, log_line,
                       no_branch_note, no_checkpoint_note,
                       quote_reference, rejected_note,
@@ -366,6 +366,9 @@ class AgentController:
         self.projects: dict[str, str] = {}
         self.icons: dict[str, str] = {}
         self._saved_ui: dict = {}
+        # Tasks in this folder that stopped before they reached a result. Read once when a folder is
+        # opened and once when a job ends — never per snapshot, because the scan walks the run tree.
+        self.resumable: list[dict] = []
         try:
             registry = json.loads((self.app_dir / ".agent-projects.json").read_text(encoding="utf-8"))
             for entry in registry["projects"]:
@@ -977,6 +980,8 @@ class AgentController:
             # The first-run card: rows computed once and stored, never probed per snapshot.
             "setup": self.setup_view(),
             "queue": self._queue_view(),
+            # Stopped tasks in this folder. A strip and a press, never an automatic resume.
+            "resume": self.resumable,
             # The questions a worker is blocked on, with their ids: a page that connects after the
             # event was sent can still answer one, which is the whole of D33.
             "asks": [dict(a) for a in self._active_asks],
@@ -997,6 +1002,7 @@ class AgentController:
             "send": lambda: self.start_plan(payload.get("text", ""), payload.get("quote_of"),
                                             step_id=payload.get("step_id")),
             "complete_step": lambda: self.complete_step(int(payload.get("step_id") or 0)),
+            "resume_task": lambda: self.resume_task(str(payload.get("run_id", ""))),
             "reopen": self.reopen,
             "queue_add": lambda: self.queue_add(payload.get("text", ""), payload.get("quote_of")),
             "queue_edit": lambda: self.queue_edit(str(payload.get("id", "")),
@@ -1139,6 +1145,10 @@ class AgentController:
         # project_changed saved the state while the branch was still the previous one, so the
         # branch that was actually selected is written once more.
         self._save_state()
+        # Which tasks stopped in this folder is read when the folder is entered — not per snapshot:
+        # the scan walks the run tree, and a poll that lagged is the failure this project has already
+        # had to undo once.
+        self.refresh_resumable()
         self.subtitle = self._subtitle()
         # Arriving at a conversation that has something waiting starts it here; without this the
         # queue would only move when a job finished, and a stopped task never finishes again.
@@ -3542,6 +3552,68 @@ class AgentController:
         self.say(f"Plan step {step_id} verified from its recorded run.")
         self.line("tool", "Tool", f"Plan step {step_id}: {row.get('title', '')} verified.")
 
+    def refresh_resumable(self) -> None:
+        """Read which tasks stopped here. Showing them is the whole of what this decides."""
+        repo = self.repo.strip()
+        if not repo or not Path(repo).is_dir():
+            self.resumable = []
+            return
+        self.resumable = session_flow.resumable_runs(self.runs, repo, self._session_cache)
+
+    def resume_task(self, run_id: str = "") -> None:
+        """Continue a task that stopped before it reached a result. Pressed, never automatic."""
+        if self.busy:
+            self.status = shared_note("resume_busy", arabic=self.arabic)
+            return
+        found = next((row for row in self.resumable if row["run_id"] == run_id), None)
+        if found is None:
+            self.status = shared_note("resume_gone", arabic=self.arabic)
+            return
+        entry = self.selected_entry()
+        if entry is None:
+            self.status = status_text("pick_model", arabic=self.arabic)
+            return
+        cloud, paid = self.cloud_choice()
+        if cloud and not self.cloud_ok:
+            self.status = status_text("consent_message", arabic=self.arabic)
+            return
+        settings = self.task_settings(cloud)
+        if settings is None:
+            return
+        repo = self.repo.strip()
+        try:
+            session = load_session(self.runs / run_id / "session.json")
+        except (AgentError, OSError):
+            self.resumable = [row for row in self.resumable if row["run_id"] != run_id]
+            self.status = shared_note("resume_gone", arabic=self.arabic)
+            return
+        task = str(session.get("task") or "")[:MAX_TASK_CHARS]
+        plan_file = str((session.get("plan_reference") or {}).get("path") or "") or None
+        notes = str(session.get("memory") or "")
+        self._add("tool", "Tool", shared_note("resume_started", arabic=self.arabic,
+                                              task=str(found.get("task") or "")[:60]))
+
+        def work():
+            provider = make_provider(settings, allow_cloud=cloud,
+                                     data_class="public" if cloud else "restricted",
+                                     api_key=self.key.strip() or None, allow_paid=paid)
+            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+                        progress=lambda line: self._progress(line), step=self._step,
+                        cancelled=self.cancel_event.is_set, plan_file=plan_file,
+                        chat_id=session.get("chat_id"), plan_step=session.get("plan_step"),
+                        memory=notes, resume_run=run_id)
+
+        def done(path):
+            self.display_session(path)
+            self.refresh_resumable()
+            if self.session and self.session.get("changes"):
+                self.status = status_text("proposal_ready", arabic=self.arabic)
+                self._emit({"kind": "view", "value": "preview"})
+            else:
+                self.status = status_text("no_proposal", arabic=self.arabic)
+
+        self.run_job(work, done, "Continuing the stopped task…", cancellable=True)
+
     def refresh_plan_status(self) -> None:
         repo, plan_file = self.repo.strip(), self.plan_file.strip()
         if not repo or not plan_file or not Path(repo).is_dir():
@@ -3564,9 +3636,21 @@ class AgentController:
         verified = len(planbook.done_titles(book))
         return {"name": Path(book["plan_path"]).name, "step": row["id"] if row else len(book["steps"]),
                 "total": len(book["steps"]), "verified": verified,
+                "goal": planbook.goal_line(book),
+                "criteria": planbook.criteria_of(book),
+                "uncovered": planbook.uncovered_criteria(book),
+                "sub_goal": planbook.sub_goal_of(book, row),
+                "strings": {"goal": shared_note("plan_goal", arabic=self.arabic),
+                            "criteria": shared_note("plan_criteria", arabic=self.arabic),
+                            "uncovered": shared_note("plan_uncovered", arabic=self.arabic),
+                            "unproven": shared_note("plan_unproven", arabic=self.arabic)},
                 "note": planbook.progress_line(book),
                 "steps": [{"id": step["id"], "title": step["title"], "status": step["status"],
-                           "current": bool(row) and step["id"] == row["id"]} for step in book["steps"]]}
+                           "current": bool(row) and step["id"] == row["id"],
+                           "accepts": list(step.get("accepts") or []),
+                           "unproven": str(step.get("unproven") or ""),
+                           "sub_goal": planbook.sub_goal_of(book, step)}
+                          for step in book["steps"]]}
 
     # ------------------------------ sessions ------------------------------
     def _load_session_cached(self, path: Path) -> dict | None:
@@ -3883,8 +3967,22 @@ class AgentController:
             "reopenLabel": say(self.arabic, en="Reopen for review", ar="إعادة الفتح للمراجعة"),
             "files": files, "selected": min(self.review_file, max(0, len(changes) - 1)),
             "tab": self.diff_tab,
+            "impact": self._impact(),
             "view": {**uistate.file_view(chosen), "checks": runresults.checks_lines(session)},
         }
+
+    def _impact(self) -> dict:
+        """What this proposal breaks in the rest of the repository, in the task's own language.
+
+        The findings were computed once, when the proposal was recorded, and are stored on the session;
+        this only puts them into words. An empty dict is the honest answer for a change nothing else
+        names, and the client draws no block for it — a heading that promises findings and shows
+        nothing reads worse than no heading at all.
+        """
+        lines = impact_lines((self.session or {}).get("impact") or {}, arabic=self.arabic)
+        if not lines:
+            return {}
+        return {"heading": shared_note("impact_heading", arabic=self.arabic), "lines": lines}
 
     # ------------------------------ persistence ------------------------------
     def _sync_project(self) -> None:
