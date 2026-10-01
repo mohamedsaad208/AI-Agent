@@ -392,6 +392,7 @@ class FakeController:
                          "consent": self.consent},
             "draft": self.draft,
             "queue": {"items": self.queue, "held": self.queue_held, "elsewhere": 1,
+                      "chat": "c-1", "kind": "chat",
                       **labels.queue_notes(False, 1, False)},
             "artifact": labels.artifact_card(self.state, arabic=False, count=len(FILES),
                                              project="demo2",
@@ -429,6 +430,10 @@ class FakeController:
             "runConfig": {},
             "lastJob": None,
             "readiness": None,
+            "autoNotes": {"enabled": True, "updated_at": "", "purpose_and_stack": "", "components": [], "execution_commands": {}, "implemented_changes": [], "verification_results": "", "remaining_issues": []},
+            "cmdHistory": {"history": [], "favorites": []},
+            "diagnosis": None,
+            "repairBatch": None,
         }
 
     def _review(self) -> dict:
@@ -852,6 +857,20 @@ class FakeController:
             return {"status": 200, "headers": {}, "body": "OK"}
         elif type == "fix_errors":
             return {"status": "fix_requested"}
+        elif type == "run_custom":
+            return {"success": True, "exit_code": 0, "output": "Custom command executed"}
+        elif type == "get_cmd_history":
+            return {"history": [], "favorites": []}
+        elif type == "save_favorite_cmd":
+            return {"history": [], "favorites": []}
+        elif type == "diagnose_terminal":
+            return {"what_failed": "None", "likely_cause": "None", "evidence": "", "facts": [], "uncertainties": [], "solutions": []}
+        elif type == "toggle_auto_notes":
+            return {"enabled": True}
+        elif type == "save_auto_notes":
+            return {"saved": True}
+        elif type == "get_auto_notes":
+            return {"enabled": True}
         elif type in PREVIEW_ONLY:
             emit({"kind": "toast", "text": PREVIEW_ONLY[type]})
         else:

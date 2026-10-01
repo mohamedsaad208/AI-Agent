@@ -806,16 +806,15 @@ function renderHeader() {
   const btnChange = $('mode-btn-change');
   const btnRead = $('mode-btn-read');
   if (btnPlan && btnChange && btnRead) {
-    const isPlan = !!DATA.plan || DATA.composer === 'plan';
     const isChange = DATA.composer === 'change';
-    const isRead = DATA.composer === 'read';
+    const isRead = DATA.composer === 'read' || !!(DATA.declared && DATA.declared.sealed);
+    const isPlan = !isChange && !isRead;
     btnPlan.classList.toggle('on', isPlan);
-    btnChange.classList.toggle('on', !isPlan && isChange);
-    btnRead.classList.toggle('on', !isPlan && isRead);
+    btnChange.classList.toggle('on', isChange);
+    btnRead.classList.toggle('on', isRead);
 
     btnPlan.onclick = () => {
-      if (DATA.plan) toast('Plan mode is active (' + DATA.plan.name + ')');
-      else send('pick_plan');
+      if (DATA.composer !== 'chat') send('set_composer', { value: 'chat' });
     };
     btnChange.onclick = () => {
       if (DATA.composer !== 'change') send('set_composer', { value: 'change' });
@@ -1633,7 +1632,10 @@ function renderQueue() {
     note.style.cursor = 'pointer';
     note.title = 'Switch to the waiting chat';
     note.onclick = () => {
-      if (DATA.queue && DATA.queue.chat) send('open', { id: DATA.queue.chat, kind: 'session' });
+      if (DATA.queue && DATA.queue.chat) {
+        const destKind = DATA.queue.kind || (String(DATA.queue.chat).startsWith('c-') ? 'chat' : 'session');
+        send('open', { id: DATA.queue.chat, kind: destKind });
+      }
     };
     box.appendChild(note);
   }
@@ -1763,10 +1765,14 @@ function renderRail() {
   } else if (state.railSection === 'tasks') {
     if (DATA.plan) {
       const p = el('div', 'card tasks-card');
-      const pct = Math.round((DATA.plan.verified / Math.max(1, DATA.plan.total)) * 100);
-      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${DATA.plan.total} (${DATA.plan.verified} verified)</div>
+      const total = DATA.plan.total || 0;
+      const verified = DATA.plan.verified || 0;
+      const steps = DATA.plan.steps || [];
+      const needingAttention = steps.filter(s => s.status === 'failed' || s.status === 'rejected' || s.status === 'needs_review' || (s.current && DATA.artifact && DATA.artifact.state === 'VERIFICATION_FAILED')).length;
+      const pct = Math.round((verified / Math.max(1, total)) * 100);
+      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${total} · ${verified} verified · ${needingAttention} needing attention</div>
         <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="meta"><span>${DATA.plan.verified} verified</span><span>${esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
+        <div class="meta"><span>${verified} verified</span><span>${needingAttention ? needingAttention + ' needing attention' : esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
       const seqDiv = el('div', 'plan-seq-controls');
       if (!state.sequential) {
         const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
@@ -1883,12 +1889,25 @@ function renderRail() {
     const diag = (lastJob && lastJob.diagnosis && lastJob.diagnosis.kind !== 'none') ? lastJob.diagnosis : (activeSvc && activeSvc.diagnosis && activeSvc.diagnosis.kind !== 'none' ? activeSvc.diagnosis : null);
     if (diag) {
       const fixCard = el('div', 'fix-card');
+      const isBatch = DATA.repairBatch && DATA.repairBatch.status === 'in_progress';
       fixCard.innerHTML = `<div class="summary">❌ ${esc(diag.summary)}</div>
         <div class="suggestion">${esc(diag.suggestion || '')}</div>
-        <button class="fix-card-btn" id="fix-err-btn">🔧 Fix with Agent (حل الأخطاء)</button>`;
-      fixCard.querySelector('#fix-err-btn').onclick = () => {
-        send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : '') });
-      };
+        <div style="display:flex;gap:6px;margin-top:4px">
+          ${isBatch ? `<div class="muted" style="align-self:center">Attempt ${DATA.repairBatch.current_attempt} of ${DATA.repairBatch.max_attempts} in progress…</div>
+          <button class="fix-card-btn" id="fix-stop-btn" style="background:var(--bad)">⏹ Stop</button>` : `
+          <button class="fix-card-btn" id="fix-btn-single">🔧 Fix (1 attempt)</button>
+          <button class="fix-card-btn" id="fix-btn-batch" style="background:var(--accent-hover)">⚡ Fix batch (up to 3)</button>`}
+        </div>`;
+      if (isBatch) {
+        fixCard.querySelector('#fix-stop-btn').onclick = () => send('stop');
+      } else {
+        fixCard.querySelector('#fix-btn-single').onclick = () => {
+          send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : ''), batch_approved: false });
+        };
+        fixCard.querySelector('#fix-btn-batch').onclick = () => {
+          send('fix_errors', { source: (lastJob ? lastJob.type : 'service'), diagnosis: diag, output: (lastJob ? lastJob.output : ''), batch_approved: true, max_attempts: 3 });
+        };
+      }
       rail.appendChild(fixCard);
     }
 
@@ -1939,6 +1958,50 @@ function renderRail() {
       rail.appendChild(prevCard);
     }
 
+    // Custom Terminal Command Section
+    if (DATA.project) {
+      const customCard = el('div', 'card custom-cmd-card');
+      customCard.innerHTML = `<h5>Run custom command</h5>
+        <div class="custom-cmd-row">
+          <input class="custom-cmd-input" id="custom-cmd-input" placeholder="e.g. mvn clean, npm run lint" />
+          <input class="custom-cmd-sub" id="custom-cmd-sub" placeholder="subdir (opt)" title="Subdirectory within project (optional)" />
+          <button class="run-act-btn primary" id="custom-cmd-run" style="flex:none;padding:6px 12px">▶ Run</button>
+          <button class="icon-btn" id="custom-cmd-fav" title="Save as favorite" style="flex:none">★</button>
+        </div>
+        <div class="cmd-chips" id="custom-cmd-chips"></div>`;
+      const inp = customCard.querySelector('#custom-cmd-input');
+      const subInp = customCard.querySelector('#custom-cmd-sub');
+      const runBtn = customCard.querySelector('#custom-cmd-run');
+      const favBtn = customCard.querySelector('#custom-cmd-fav');
+      const chipsDiv = customCard.querySelector('#custom-cmd-chips');
+      
+      const history = (DATA.cmdHistory && DATA.cmdHistory.history) || [];
+      const favorites = (DATA.cmdHistory && DATA.cmdHistory.favorites) || [];
+      favorites.forEach(fav => {
+        const chip = el('button', 'cmd-chip', `★ ${esc(fav.name || fav.command)}`);
+        chip.onclick = () => { inp.value = fav.command; subInp.value = fav.subdir || ''; };
+        chipsDiv.appendChild(chip);
+      });
+      history.slice(0, 3).forEach(h => {
+        const chip = el('button', 'cmd-chip', esc(h.command));
+        chip.onclick = () => { inp.value = h.command; subInp.value = h.subdir || ''; };
+        chipsDiv.appendChild(chip);
+      });
+
+      runBtn.onclick = () => {
+        const cmd = inp.value.trim();
+        if (!cmd) return toast('Please enter a command to run');
+        send('run_custom', { command: cmd, subdir: subInp.value.trim() });
+      };
+      favBtn.onclick = () => {
+        const cmd = inp.value.trim();
+        if (!cmd) return toast('Please enter a command first');
+        const name = prompt('Favorite name:', cmd);
+        if (name) send('save_favorite_cmd', { command: cmd, subdir: subInp.value.trim(), name });
+      };
+      rail.appendChild(customCard);
+    }
+
     // Terminal Panel
     if ((DATA.services && DATA.services.length) || lastJob) {
       const termCard = el('div', 'card terminal-card');
@@ -1953,6 +2016,7 @@ function renderRail() {
           <span>${esc(title)}</span>
         </div>
         <div class="terminal-actions">
+          ${(lastJob && !lastJob.success) ? `<button id="term-debug" style="color:var(--bad-ink);background:var(--bad-bg)">🔍 Debug</button>` : ''}
           ${isRunning ? `<button id="term-stop" title="Stop service">⏹ Stop</button>` : ''}
           ${termSvc ? `<button id="term-restart" title="Restart service">↻ Restart</button>` : ''}
           <button id="term-copy" title="Copy output log">📋 Copy</button>
@@ -1963,6 +2027,11 @@ function renderRail() {
         <button class="terminal-jump-btn" id="term-jump">↓ Latest</button>
       </div>`;
 
+      if (termCard.querySelector('#term-debug')) {
+        termCard.querySelector('#term-debug').onclick = () => {
+          send('diagnose_terminal', { output: lastJob.output, command: lastJob.command, exit_code: lastJob.exit_code, cwd: lastJob.cwd });
+        };
+      }
       if (isRunning) {
         termCard.querySelector('#term-stop').onclick = () => send('stop_app', { id: termSvc.id });
       }
@@ -1989,7 +2058,75 @@ function renderRail() {
         jumpBtn.classList.remove('show');
       };
 
+      termBox.addEventListener('mouseup', () => {
+        const sel = window.getSelection().toString().trim();
+        if (sel && sel.length > 5) {
+          state.selectedTerminalText = sel;
+          if (!termCard.querySelector('#term-analyze-btn')) {
+            const analyzeBtn = el('button', 'solid', '🔎 Analyze selection');
+            analyzeBtn.id = 'term-analyze-btn';
+            analyzeBtn.style.fontSize = '10.5px';
+            analyzeBtn.style.padding = '2px 7px';
+            analyzeBtn.onclick = () => {
+              send('diagnose_terminal', { output: state.selectedTerminalText, is_selection: true });
+            };
+            termCard.querySelector('.terminal-actions').prepend(analyzeBtn);
+          }
+        }
+      });
+
+      // Completion Summary Box
+      if (lastJob) {
+        const summary = el('div', 'exec-summary');
+        const outcome = lastJob.success ? '✅ Passed' : '❌ Failed';
+        summary.innerHTML = `<div><b>Execution Summary:</b> ${outcome} (exit ${lastJob.exit_code}, ${lastJob.duration}s)</div>
+          <div><b>Ran:</b> <span class="mono">${esc(lastJob.command || lastJob.type)}</span></div>
+          <div><b>Working Dir:</b> <span class="mono">${esc(lastJob.cwd || '.')}</span></div>
+          <div class="step-next"><b>Next Step:</b> ${lastJob.success ? 'Service/build verified. You may proceed with testing or code changes.' : 'Check the diagnosis card below or click "Prepare fix" to repair.'}</div>`;
+        termCard.appendChild(summary);
+      }
+
       rail.appendChild(termCard);
+    }
+
+    // On-demand Terminal Diagnosis Card
+    if (DATA.diagnosis) {
+      const diagData = DATA.diagnosis;
+      const diagCard = el('div', 'card diag-card');
+      diagCard.innerHTML = `<div class="diag-head">
+        <span>🔍 Diagnosis: ${esc(diagData.what_failed)}</span>
+        <span class="muted" style="font-size:11px">${diagData.is_selection ? 'Selection' : 'Exit ' + diagData.exit_code}</span>
+      </div>
+      <div class="diag-sec"><b>Likely Cause:</b> ${esc(diagData.likely_cause)}</div>
+      <div class="diag-sec"><b>Evidence:</b> <span class="mono">${esc(diagData.evidence)}</span></div>
+      ${diagData.facts && diagData.facts.length ? `<div class="diag-sec"><b>Confirmed Facts:</b><ul style="margin:2px 0 0 16px">${diagData.facts.map(f => `<li>${esc(f)}</li>`).join('')}</ul></div>` : ''}
+      ${diagData.uncertainties && diagData.uncertainties.length ? `<div class="diag-sec"><b>Uncertainties:</b><ul style="margin:2px 0 0 16px">${diagData.uncertainties.map(u => `<li>${esc(u)}</li>`).join('')}</ul></div>` : ''}
+      <div class="diag-sec"><b>Practical Solutions:</b>
+        ${(diagData.solutions || []).map(s => `<div class="diag-sol-item">${s.order}. <b>${esc(s.action)}</b>: ${esc(s.suggestion)}</div>`).join('')}
+      </div>
+      <div class="diag-acts">
+        <button class="primary" id="diag-prep-fix">🔧 Prepare fix</button>
+        <button id="diag-run-again">↻ Run again</button>
+        <button id="diag-copy">📋 Copy diagnosis</button>
+      </div>`;
+      
+      diagCard.querySelector('#diag-prep-fix').onclick = () => {
+        const text = `Please investigate and fix the following issue:\nCommand: ${diagData.command}\nCause: ${diagData.likely_cause}\nEvidence: ${diagData.evidence}`;
+        const promptEl = $('prompt');
+        if (promptEl) {
+          promptEl.value = text;
+          promptEl.focus();
+        }
+        toast('Fix instructions copied to message prompt');
+      };
+      diagCard.querySelector('#diag-run-again').onclick = () => {
+        if (diagData.command) send('run_custom', { command: diagData.command, subdir: '' });
+      };
+      diagCard.querySelector('#diag-copy').onclick = () => {
+        navigator.clipboard.writeText(JSON.stringify(diagData, null, 2));
+        toast('Diagnosis copied to clipboard');
+      };
+      rail.appendChild(diagCard);
     }
 
     const s = el('div', 'card');
@@ -2731,10 +2868,21 @@ function openSettings(tab) {
     models: () => `
       <div class="field"><label>Filter models by name</label><input id="filter" placeholder="qwen"></div>
       <div class="field"><label>${esc(st.model_info || '')}</label></div>`,
-    notes: () => `
-      <div class="field"><label>Project notes — sent with every task in this folder</label>
+    notes: () => {
+      const an = DATA.autoNotes || {};
+      return `
+      <div class="field"><label>Handwritten project notes — sent with every task in this folder</label>
         <textarea id="memory" ${st.project ? '' : 'disabled placeholder="Choose a project folder first."'}>${esc(st.memory || '')}</textarea>
-        <div class="hint">${esc(st.memory_info || '')}</div></div>`,
+        <div class="hint">${esc(st.memory_info || '')}</div></div>
+      <div class="hr" style="margin:14px 0"></div>
+      <div class="field">
+        <label>Automatic project summary (grounded in files and verification proofs)</label>
+        <label class="switch"><input type="checkbox" id="auto-notes-toggle" ${an.enabled ? 'checked' : ''}> Automatically observe and summarize project stack, files, and verification proofs</label>
+        <div class="hint">Updated: ${esc(an.updated_at ? new Date(an.updated_at).toLocaleString() : 'Never')}</div>
+        ${an.purpose_and_stack ? `<div class="hint"><b>Observed Stack:</b> ${esc(an.purpose_and_stack)}</div>` : ''}
+        ${an.verification_results ? `<div class="hint"><b>Verification:</b> ${esc(an.verification_results)}</div>` : ''}
+      </div>`;
+    },
     overrides: () => {
       const o = DATA.overrides || {};
       const rows = (o.rows || []).map((r) => `
@@ -2793,6 +2941,7 @@ function openSettings(tab) {
     body.querySelector('#timeout')?.addEventListener('change', (e) => send('set_timeout', { value: +e.target.value }));
     body.querySelector('#filter')?.addEventListener('input', (e) => send('set_filter', { value: e.target.value }));
     body.querySelector('#memory')?.addEventListener('change', (e) => send('save_memory', { text: e.target.value }));
+    body.querySelector('#auto-notes-toggle')?.addEventListener('change', (e) => send('toggle_auto_notes', { enabled: e.target.checked }));
     body.querySelector('#profile')?.addEventListener('change', (e) => send('set_profile', { value: e.target.value }));
     body.querySelector('#mode')?.addEventListener('change', (e) => send('set_mode', { value: e.target.value }));
     // change, not input: the endpoint is checked on the server and a rejected value must not be

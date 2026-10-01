@@ -868,9 +868,14 @@ class AgentController:
                  "detached": bool(item.get("detached")), "at": item.get("at", ""),
                  "restored": bool(item.get("restored"))}
                 for item in self.queue if item.get("chat") == self.chat_id or item.get("detached")]
-        elsewhere = len([item for item in self.queue
-                         if item.get("chat") not in {self.chat_id, ""} and not item.get("detached")])
+        other_items = [item for item in self.queue
+                       if item.get("chat") not in {self.chat_id, ""} and not item.get("detached")]
+        elsewhere = len(other_items)
+        first_other = other_items[0] if other_items else None
+        target_chat = first_other.get("chat") if first_other else None
+        target_kind = "chat" if (target_chat and str(target_chat).startswith("c-")) else "session"
         return {"items": here, "held": bool(self._queue_held), "elsewhere": elsewhere,
+                "chat": target_chat, "kind": target_kind,
                 **queue_notes(self.arabic, elsewhere, bool(self._replies))}
 
     def join(self, timeout: float = 60.0) -> None:
@@ -1028,6 +1033,10 @@ class AgentController:
             "runConfig": service_runner.read_project_config(Path(self.repo)) if self.repo and Path(self.repo).is_dir() else None,
             "lastJob": getattr(self, "_last_job", None),
             "readiness": getattr(self, "_cached_readiness", None),
+            "autoNotes": self.get_auto_notes(),
+            "cmdHistory": self.get_custom_cmd_history(),
+            "diagnosis": getattr(self, "_current_diagnosis", None),
+            "repairBatch": getattr(self, "_repair_batch", None),
             # Which folder of a multi-project folder the command runs in. One entry means there is
             # nothing to choose, and the window says so rather than drawing a picker of one.
             "targets": [{"path": row["path"], "label": row["label"]} for row in self.targets],
@@ -1144,6 +1153,13 @@ class AgentController:
             "service_lines": lambda: self.get_service_lines(payload),
             "api_test": lambda: self.run_api_test(payload),
             "fix_errors": lambda: self.fix_run_failure(payload),
+            "run_custom": lambda: self.run_custom_cmd(payload),
+            "get_cmd_history": self.get_custom_cmd_history,
+            "save_favorite_cmd": lambda: self.save_favorite_cmd(payload),
+            "diagnose_terminal": lambda: self.diagnose_terminal(payload),
+            "toggle_auto_notes": lambda: self.toggle_auto_notes(payload),
+            "save_auto_notes": lambda: self.save_auto_notes(payload),
+            "get_auto_notes": self.get_auto_notes,
         }
         handler = handlers.get(type)
         if handler is None:
@@ -3336,6 +3352,17 @@ class AgentController:
             return
         self._last_fix_summary = summary
 
+        batch_approved = bool(payload.get("batch_approved", False))
+        max_attempts = int(payload.get("max_attempts") or 3)
+        self._repair_batch = {
+            "batch_approved": batch_approved,
+            "max_attempts": max_attempts,
+            "current_attempt": round_num,
+            "status": "in_progress",
+            "source": source,
+            "command": last_job.get("command", "")
+        }
+
         prompt = (
             f"Fix {source} failure: {summary}\n\n"
             f"Diagnostics:\n{diagnosis.get('suggestion', '')}\n\n"
@@ -3343,6 +3370,90 @@ class AgentController:
             "Please analyze the error and propose necessary code changes to fix it."
         )
         self.start_plan(prompt)
+
+    def run_custom_cmd(self, payload: dict | None = None) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        payload = payload or {}
+        command = str(payload.get("command") or "").strip()
+        if not command:
+            raise PolicyError("Command cannot be empty.")
+        subdir = str(payload.get("subdir") or "").strip()
+        fav_name = str(payload.get("favorite_name") or "").strip()
+        
+        # Record command in history/favorites (redacting secrets)
+        service_runner.record_custom_command(Path(self.repo), command, subdir, fav_name)
+        
+        self.status = f"Running: {command}…"
+        try:
+            res = service_runner.run_custom_command(Path(self.repo), command, subdir, timeout=300, on_output=self._build_line)
+        except PolicyError as err:
+            return {
+                "command": command,
+                "cwd": str(self.repo),
+                "exit_code": 1,
+                "output": str(err),
+                "duration": 0.0,
+                "success": False,
+                "error": str(err),
+            }
+        self._last_job = {"type": "custom", "subdir": subdir, **res}
+        outcome = "succeeded" if res["success"] else "FAILED"
+        self.status = f"Command {outcome} (exit {res['exit_code']}, {res['duration']}s)"
+        self._add("tool", "Terminal", f"⚡ Custom run {outcome} — {command} (exit {res['exit_code']}, {res['duration']}s)")
+        return res
+
+    def get_custom_cmd_history(self) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            return {"history": [], "favorites": []}
+        return service_runner.get_custom_command_history(Path(self.repo))
+
+    def save_favorite_cmd(self, payload: dict | None = None) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        payload = payload or {}
+        command = str(payload.get("command") or "").strip()
+        name = str(payload.get("name") or "").strip()
+        subdir = str(payload.get("subdir") or "").strip()
+        return service_runner.record_custom_command(Path(self.repo), command, subdir, name)
+
+    def diagnose_terminal(self, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        last_job = getattr(self, "_last_job", {}) or {}
+        output = payload.get("output") or last_job.get("output", "")
+        command = payload.get("command") or last_job.get("command", "")
+        cwd = payload.get("cwd") or last_job.get("cwd", str(self.repo))
+        exit_code = int(payload.get("exit_code") if payload.get("exit_code") is not None else last_job.get("exit_code", 1))
+        is_sel = bool(payload.get("is_selection", False))
+        
+        diag = service_runner.analyze_terminal_output(output, command, cwd, exit_code, is_selection=is_sel)
+        self._current_diagnosis = diag
+        return diag
+
+    def toggle_auto_notes(self, payload: dict | None = None) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        payload = payload or {}
+        notes = memory_store.read_auto_notes(self.memory_dir, self.repo)
+        enabled = bool(payload.get("enabled", not notes.get("enabled", True)))
+        notes["enabled"] = enabled
+        memory_store.write_auto_notes(self.memory_dir, self.repo, notes)
+        self.status = f"Automatic project notes {'enabled' if enabled else 'disabled'}."
+        return notes
+
+    def save_auto_notes(self, payload: dict | None = None) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            raise PolicyError("No project folder selected.")
+        payload = payload or {}
+        notes = payload.get("notes") or {}
+        memory_store.write_auto_notes(self.memory_dir, self.repo, notes)
+        self.status = "Automatic project notes updated."
+        return notes
+
+    def get_auto_notes(self) -> dict:
+        if not self.repo or not Path(self.repo).is_dir():
+            return memory_store.read_auto_notes(self.memory_dir, "")
+        return memory_store.read_auto_notes(self.memory_dir, self.repo)
 
     def round_history(self) -> list:
         """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window

@@ -793,3 +793,145 @@ def execute_bounded_job(command: str | list[str], cwd: Path, timeout: int = 300,
         "diagnosis": diagnosis,
         "success": exit_code == 0 and not timed_out,
     }
+
+
+def run_custom_command(
+    repo: Path,
+    command: str,
+    subdir: str = "",
+    timeout: int = 300,
+    on_output: Optional[Callable[[str], None]] = None
+) -> dict:
+    """Execute a user-specified command locally inside project or subdirectory.
+    Strictly verifies subdir is within repo to prevent path traversal."""
+    repo = Path(repo).resolve()
+    if not repo.is_dir():
+        raise PolicyError("No valid project directory selected.")
+    
+    subdir_clean = (subdir or "").strip().replace("\\", "/").strip("/")
+    target_cwd = (repo / subdir_clean).resolve() if subdir_clean else repo
+    
+    # Path traversal check
+    try:
+        target_cwd.relative_to(repo)
+    except ValueError:
+        raise PolicyError("Target working directory must stay within the project root.")
+    
+    if not target_cwd.is_dir():
+        raise PolicyError(f"Directory does not exist: {subdir_clean}")
+    
+    return execute_bounded_job(command, target_cwd, timeout=timeout, on_output=on_output)
+
+
+def get_custom_command_history(repo: Path) -> dict:
+    """Load command history and favorites from project run configuration."""
+    cfg = read_project_config(repo)
+    return {
+        "history": cfg.get("custom_history", []),
+        "favorites": cfg.get("custom_favorites", [])
+    }
+
+
+def record_custom_command(repo: Path, command: str, subdir: str = "", favorite_name: str = "") -> dict:
+    """Save command into project history/favorites, ensuring secret values are redacted."""
+    from .redaction import redact
+    cfg = read_project_config(repo)
+    history = list(cfg.get("custom_history", []))
+    favorites = list(cfg.get("custom_favorites", []))
+    
+    cmd_clean = redact(command.strip())
+    sub_clean = subdir.strip()
+    
+    entry = {"command": cmd_clean, "subdir": sub_clean, "time": time.time()}
+    history = [h for h in history if h.get("command") != cmd_clean]
+    history.insert(0, entry)
+    cfg["custom_history"] = history[:20]
+    if favorite_name:
+        fav_entry = {"name": favorite_name.strip(), "command": cmd_clean, "subdir": sub_clean}
+        favorites = [f for f in favorites if f.get("name") != fav_entry["name"]]
+        favorites.append(fav_entry)
+    cfg["custom_favorites"] = favorites[:20]
+        
+    save_project_config(repo, cfg)
+    return {"history": cfg.get("custom_history", []), "favorites": cfg.get("custom_favorites", [])}
+
+
+def analyze_terminal_output(
+    output: str,
+    command: str = "",
+    cwd: str = "",
+    exit_code: int = 1,
+    is_selection: bool = False,
+    max_log_chars: int = 5000
+) -> dict:
+    """Produces structured diagnosis of terminal output with facts vs uncertainties and practical solutions."""
+    from .redaction import redact
+    raw_output = str(output or "")
+    is_truncated = len(raw_output) > max_log_chars
+    log_snippet = raw_output[-max_log_chars:] if is_truncated else raw_output
+    clean_output = redact(log_snippet)
+    clean_command = redact(str(command or ""))
+
+    diag = diagnose_failure(clean_output, exit_code)
+    kind = diag.get("kind") or "unknown"
+    summary = diag.get("summary") or ("Execution failure" if exit_code != 0 else "Selected output analysis")
+    
+    facts = []
+    uncertainties = []
+    
+    if is_selection:
+        facts.append(f"Analyzing specific user-selected terminal snippet ({len(clean_output)} chars).")
+    else:
+        facts.append(f"Command '{clean_command}' exited with code {exit_code} in '{cwd}'.")
+    
+    if exit_code != 0:
+        facts.append(f"Process terminated with non-zero exit status ({exit_code}).")
+    else:
+        facts.append("Process exited normally with code 0.")
+        
+    evidence_lines = []
+    for line in clean_output.splitlines():
+        lower = line.lower()
+        if any(w in lower for w in ("error", "failed", "exception", "cannot find", "not found", "eaddrinuse", "fatal")):
+            evidence_lines.append(line.strip())
+            if len(evidence_lines) >= 3:
+                break
+                
+    evidence = " | ".join(evidence_lines) if evidence_lines else "No explicit error keywords detected in selected lines."
+    
+    solutions = []
+    if kind == "port_in_use":
+        facts.append("Identified port conflict or address already in use.")
+        solutions.append({"order": 1, "action": "Change the service port in .ai_project.json or command line", "suggestion": "Specify an unused port number (e.g. 8080 -> 8081)."})
+        solutions.append({"order": 2, "action": "Stop existing service running on the port", "suggestion": "Stop other running app instances."})
+    elif kind == "missing_dependency":
+        facts.append(f"Detected missing dependency / package: {summary}")
+        solutions.append({"order": 1, "action": "Install required dependencies", "suggestion": diag.get("suggestion", "Run dependency installation command.")})
+        solutions.append({"order": 2, "action": "Check lockfiles and environment configuration", "suggestion": "Ensure virtualenv or node_modules is active."})
+    elif kind == "missing_tool":
+        facts.append("Required compiler or runtime binary is not found on PATH.")
+        solutions.append({"order": 1, "action": "Verify toolchain installation", "suggestion": diag.get("suggestion", "Install the required tool on your machine.")})
+    elif kind == "syntax_error":
+        facts.append("Compilation or syntax failure found in source files.")
+        uncertainties.append("Exact line of failure depends on compiler output and file state.")
+        solutions.append({"order": 1, "action": "Prepare fix using AI Agent", "suggestion": "Click 'Prepare fix' to review and resolve syntax issues."})
+    else:
+        uncertainties.append("Root cause may stem from environmental variables, missing configuration, or unhandled exceptions.")
+        solutions.append({"order": 1, "action": "Review stack trace and recent code diffs", "suggestion": "Inspect error logs above for detailed exception traces."})
+        solutions.append({"order": 2, "action": "Re-run verification command", "suggestion": "Run the command again to confirm repeatability."})
+
+    return {
+        "kind": kind,
+        "command": clean_command,
+        "cwd": cwd,
+        "exit_code": exit_code,
+        "is_selection": is_selection,
+        "what_failed": summary,
+        "likely_cause": diag.get("details") or summary,
+        "evidence": evidence,
+        "facts": facts,
+        "uncertainties": uncertainties,
+        "solutions": solutions,
+        "truncated": is_truncated,
+        "sample_output": clean_output[:1200]
+    }

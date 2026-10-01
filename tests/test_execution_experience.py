@@ -125,6 +125,70 @@ class TestExecutionExperience(unittest.TestCase):
         self.c.fix_run_failure({"diagnosis": diag})
         self.assertIn("Identical failure repeated", self.c.status)
 
+    def test_custom_command_and_security(self):
+        # 1. Directory traversal rejected (controller catches PolicyError and returns error dict)
+        bad_res = self.c.run_custom_cmd({"command": "echo test", "subdir": "../../"})
+        self.assertFalse(bad_res["success"])
+        self.assertIn("stay within the project root", bad_res["output"])
+
+        # 2. Execution success and output
+        cmd = f'"{sys.executable}" -u -c "print(\'custom command ran\', flush=True)"'
+        good_res = service_runner.run_custom_command(self.repo, cmd)
+        self.assertTrue(good_res["success"])
+        self.assertEqual(good_res["exit_code"], 0)
+        self.assertIn("custom command ran", good_res["output"])
+
+        # 3. Secret redaction in history recording
+        secret_cmd = "curl -H 'Authorization: Bearer ghp_topsecrettoken1234567890123456' https://api.example.com"
+        service_runner.record_custom_command(self.repo, secret_cmd)
+        history_data = service_runner.get_custom_command_history(self.repo)
+        self.assertTrue(len(history_data["history"]) > 0)
+        self.assertNotIn("ghp_topsecrettoken1234567890123456", history_data["history"][0]["command"])
+        self.assertIn("[redacted]", history_data["history"][0]["command"])
+
+    def test_analyze_terminal_output(self):
+        # Python ModuleNotFoundError
+        output = "Traceback (most recent call last):\n  File 'app.py', line 2\nModuleNotFoundError: No module named 'requests'"
+        diag = service_runner.analyze_terminal_output(output, command="python app.py", cwd=str(self.repo), exit_code=1)
+        self.assertEqual(diag["kind"], "missing_dependency")
+        self.assertTrue(any("requests" in f for f in diag["facts"]) or any("dependency" in f for f in diag["facts"]))
+        self.assertTrue(len(diag["solutions"]) > 0)
+        self.assertIn("pip install requests", diag["solutions"][0]["suggestion"])
+
+        # Secret redaction in diagnosis
+        secret_output = "Error connecting with token: ghp_1234567890abcdef1234567890abcdef12345678 to https://github.com"
+        secret_diag = service_runner.analyze_terminal_output(secret_output, command="git fetch", exit_code=1)
+        self.assertNotIn("ghp_1234567890abcdef1234567890abcdef12345678", secret_diag["evidence"])
+        self.assertIn("[redacted]", secret_diag["evidence"])
+
+    def test_auto_notes_lifecycle(self):
+        from ai_code_engineer import memory as memory_store
+
+        # 1. Initial state
+        notes = memory_store.read_auto_notes(self.c.memory_dir, self.repo)
+        self.assertTrue(notes["enabled"])
+
+        # 2. Update from task with secrets and files
+        task_info = {
+            "title": "Build user login feature with password=secret_pwd_9999",
+            "stack": "Python / Flask",
+            "files": ["src/login.py"],
+            "verification": "pytest tests/test_login.py passed (1 passed)",
+        }
+        updated = memory_store.update_auto_notes_from_task(
+            self.c.memory_dir,
+            self.repo,
+            task_info,
+        )
+        self.assertIn("src/login.py", updated["components"])
+        self.assertNotIn("secret_pwd_9999", json.dumps(updated))
+        self.assertIn("pytest tests/test_login.py passed", updated["verification_results"])
+
+        # 3. Controller toggle
+        self.c.toggle_auto_notes({"enabled": False})
+        re_read = memory_store.read_auto_notes(self.c.memory_dir, self.repo)
+        self.assertFalse(re_read["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

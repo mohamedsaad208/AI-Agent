@@ -935,12 +935,25 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 
 .jump-latest {
   position: absolute; bottom: 84px; right: 32px; z-index: 20;
-  display: flex; align-items: center; gap: 6px; padding: 6px 14px;
+  display: none; align-items: center; gap: 6px; padding: 6px 14px;
   background: var(--panel); color: var(--ink); border: 1px solid var(--line-2);
   border-radius: 99px; box-shadow: var(--pop-shadow); font-size: 12px; font-weight: 500;
   cursor: pointer; transition: transform var(--t-fast), opacity var(--t-fast);
 }
+.jump-latest.show { display: flex; }
 .jump-latest:hover { border-color: var(--accent); color: var(--accent-text); transform: translateY(-1px); }
+
+.bub pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+  border-radius: var(--r-s);
+  background: var(--code);
+  padding: 8px 10px;
+  margin: var(--sp-2) 0;
+  border: 1px solid var(--line-soft);
+}
+.bub code { font-family: var(--mono); font-size: 0.9em; }
 
 .app-settings-btn { margin-right: 6px; color: var(--faint); }
 .app-settings-btn:hover { color: var(--ink); background: var(--hover); }
@@ -1065,3 +1078,50 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
   padding: 4px 0; border-bottom: 1px solid var(--line-soft);
 }
 .readiness-item:last-child { border-bottom: none; }
+
+/* Custom Terminal Command */
+.custom-cmd-card { display: flex; flex-direction: column; gap: 7px; margin-top: 6px; }
+.custom-cmd-row { display: flex; gap: 6px; align-items: center; }
+.custom-cmd-input {
+  flex: 1; padding: 6px 9px; font-size: 12px; font-family: var(--mono);
+  background: var(--field); color: var(--ink); border: 1px solid var(--line);
+  border-radius: var(--r-s); outline: none;
+}
+.custom-cmd-input:focus { border-color: var(--accent); }
+.custom-cmd-sub {
+  width: 90px; padding: 6px 8px; font-size: 11.5px; font-family: var(--mono);
+  background: var(--field); color: var(--ink-2); border: 1px solid var(--line);
+  border-radius: var(--r-s);
+}
+.cmd-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.cmd-chip {
+  padding: 2px 7px; font-size: 10.5px; font-family: var(--mono);
+  background: var(--hover); color: var(--ink-2); border: 1px solid var(--line-soft);
+  border-radius: 4px; cursor: pointer;
+}
+.cmd-chip:hover { border-color: var(--accent); color: var(--accent-text); }
+
+/* On-demand Terminal Diagnosis */
+.diag-card {
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-m);
+  padding: 11px 13px; display: flex; flex-direction: column; gap: 8px; margin-top: 8px;
+  box-shadow: var(--card-shadow);
+}
+.diag-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; font-size: 12.5px; }
+.diag-sec { font-size: 11.5px; line-height: 1.5; color: var(--ink-2); }
+.diag-sec b { color: var(--ink); }
+.diag-sol-item { padding: 4px 6px; background: var(--field); border-radius: var(--r-s); margin-top: 4px; font-size: 11.5px; }
+.diag-acts { display: flex; gap: 6px; margin-top: 4px; }
+.diag-acts button {
+  padding: 5px 11px; font-size: 11.5px; font-weight: 550; border-radius: var(--r-s);
+  border: 1px solid var(--line); background: var(--field); color: var(--ink); cursor: pointer;
+}
+.diag-acts button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+
+/* Post-Execution Summary */
+.exec-summary {
+  background: var(--field); border: 1px solid var(--line-soft); border-radius: var(--r-s);
+  padding: 8px 11px; font-size: 11.5px; line-height: 1.55; color: var(--ink-2); margin-top: 6px;
+}
+.exec-summary b { color: var(--ink); }
+.exec-summary .step-next { margin-top: 4px; color: var(--accent-text); font-weight: 500; }

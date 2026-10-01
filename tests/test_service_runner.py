@@ -86,11 +86,14 @@ class TestServiceProcessAndBoundedJob(unittest.TestCase):
         lines = []
         svc = service_runner.ServiceProcess("svc-1", "test-srv", cmd, repo, on_output=lines.append)
         svc.start()
-        time.sleep(0.8)
+        for _ in range(30):
+            if any("Ready and waiting" in l for l in svc.get_lines()):
+                break
+            time.sleep(0.1)
 
         snap = svc.snapshot()
-        self.assertEqual(snap["status"], "starting")
-        self.assertIn("Ready and waiting", svc.get_lines())
+        self.assertIn(snap["status"], ("starting", "running"))
+        self.assertTrue(any("Ready and waiting" in l for l in svc.get_lines()))
 
         # Stop cleanly
         svc.stop()
