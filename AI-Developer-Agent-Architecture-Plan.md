@@ -1,105 +1,106 @@
-# AI Developer Agent — خطة المعمارية والتنفيذ
+# AI Developer Agent — Architecture and Implementation Plan
 
-**الجمهور:** فريق Java/Spring يعمل في بيئة بنكية.  
-**آخر تحديث:** 23 سبتمبر 2026 — واجهة UI 2.1 وحالة التنفيذ الفعلية.  
-**آخر قرار معتمد:** Python لتنفيذ الـAgent بهدف تسريع النسخة الأولى، مع Ollama Local + OpenRouter. المستودعات المستهدفة تظل Java/Spring.  
-**الهدف:** بناء Agent للمطورين يستطيع فهم المستودع، اقتراح خطة، تعديل الكود، وتشغيل التحقق، بنفس منطق التشغيل سواء استخدم نموذجًا محليًا أو خدمة سحابية.
+**Target Audience:** Java/Spring engineering teams operating within banking/enterprise environments.  
+**Last Updated:** September 23, 2026 — UI 2.1 interface and verified implementation status.  
+**Adopted Architectural Decision:** Python for the Agent Runtime to accelerate Version 1 delivery, utilizing local Ollama + OpenRouter. Target repositories remain Java/Spring Boot.  
+**Core Objective:** Build a developer-centric coding agent capable of repository understanding, structured planning, bounded code modification, and automated verification, maintaining consistent orchestration logic whether backed by a local model or cloud providers.
 
-هذه الوثيقة تجمع محاور محادثة «ترحيب ودي» وتحوّلها إلى خطة تنفيذ. القسم التالي يصف ما نُفذ فعلًا؛ بقية المعمارية تصف الهدف الكامل، ولا تعني أن كل مكون أصبح جاهزًا. أمثلة العقود وPython وYAML في أقسام التصميم توضيحية ما لم يذكر سجل التنفيذ خلاف ذلك.
+This document consolidates earlier strategic discussions into an actionable implementation plan. Section 0 describes what has actually been implemented; the remaining architectural sections specify target design goals. Code contracts, Python snippets, and YAML examples in design sections serve as illustrative specifications unless noted otherwise in the implementation log.
 
-## 0. سجل التنفيذ والقرارات المعتمدة — 23 سبتمبر 2026
+---
 
-### تحديث UI 2.3 — مشروعات وشاتات بسياق منفصل
+## 0. Implementation Log and Approved Decisions — September 23, 2026
 
-- الشريط الجانبي أصبح شجرة **Projects & chats**: لكل مشروع شاتاته، ويمكن فتح/طي المشروع واختيار الشات أو إنشاء **New chat** تحته.
-- هوية المشروع هي المسار المطلق بعد تسويته، مع تجاهل اختلاف حالة الأحرف على Windows؛ الاسم وحده ليس هوية، ولذلك لا تُدمج مجلدات مختلفة متشابهة الاسم.
-- لكل شات `chat_id` مستقل، ولكل طلب جلسة تنفيذ مستقلة محفوظة مع جذر المشروع وهوية الشات. هوية الشات تدخل في بصمة الاقتراح الجديد.
-- متابعة شات قائم تضيف إلى طلب الموديل ملخص آخر أدواره فقط (حتى 6 أدوار، و4000 حرف أو سدس ميزانية السياق أيهما أصغر). يشترط تطابق **جذر المشروع وهوية الشات معًا**. لا يجري جمع تاريخ كل شاتات المشروع أو أي مشروع آخر.
-- سجل السياق يضم الطلب والحالة والملخص فقط؛ لا يعيد إرسال snapshots أو diffs أو الملفات القديمة. يقرأ الوكيل الملفات الحالية، ويميّز الاقتراح غير المطبق عن التغييرات المطبقة. يسجل معرفات الجلسات المستخدمة في `context_session_ids`.
-- تغيير المشروع يمسح مسودة الطلب والخطة المرفقة والمحادثة والنشاط والموافقة السحابية وحالة المراجعة. New chat يبدأ تاريخًا جديدًا داخل المشروع الحالي. فتح شات محفوظ يعيد مشروعه وخطته وتاريخه.
-- الشاتات القديمة تُجمع حسب جذر مشروعها، وتُعامل الجلسة القديمة كشات مستقل بمعرف الجلسة دون تعديل ملفاتها أو بصماتها.
-- تُحفظ قائمة مسارات المشروعات في `.agent-projects.json`، ويُحظر هذا الملف على أدوات الموديل مثل `.agent-runs`. الجلسات تظل في مخزن التطبيق المحلي الحالي مع فصل منطقي بالسجل؛ لم نضف عزل مستخدمي نظام التشغيل أو قاعدة بيانات منفصلة لكل مشروع.
-- فُحصت بيانات الطلب الفعلية عبر مزود اختباري: لم يدخل تاريخ مشروع آخر أو شات آخر في السياق، حتى عند تشابه معرف الشات بين مشروعين. نجحت فحوص الشجرة والتبديل ومحو السياق القديم والتوافق مع الجلسات القديمة، ونجحت 28 حالة اختبار للنواة. لم يُشغّل موديل حقيقي أو تطبيق Spring.
-- هذا التحديث يحل محل وصف UI 2.1 الذي قال إن كل إرسال بلا تاريخ؛ الآن الاستمرار داخل الشات يستخدم التاريخ المحدود المذكور أعلاه. النسخة الحالية في عنوان النافذة **UI 2.3**.
+### Update UI 2.3 — Projects and Chats with Isolated Contexts
 
-### تحديث UI 2.2 — النسخ واللصق
+- **Project Tree Sidebar:** The sidebar organizes **Projects & chats**: each project manages its own chat sessions, allowing users to expand/collapse projects, select existing chats, or initiate a **New chat**.
+- **Project Identity:** A project's identity is defined strictly by its normalized absolute path, case-folded on Windows. Folder names alone do not define identity, preventing distinct folders with identical names from colliding.
+- **Independent Sessions:** Every chat carries a unique `chat_id`. Each request generates an independent execution session saved alongside the project root and chat ID. The chat ID is incorporated into the proposal hash.
+- **Bounded Conversational Context:** Continuing within an existing chat injects a summary of its most recent turns only (capped at up to 6 turns, and 4,000 characters or one-sixth of the retrieval budget, whichever is smaller). Both **project root and chat ID must match simultaneously**. Chat histories across different projects or sibling chats are never blended.
+- **Structured Context Log:** Context history carries the user request, status, and summary only; prior raw snapshots, diffs, or stale file contents are never re-transmitted. The agent reads current disk state, distinguishing unapplied proposals from applied modifications, and logs utilized session IDs in `context_session_ids`.
+- **Project Switching:** Switching projects clears the composer draft, attached plan, active conversation, activity logs, cloud consent status, and review pane. Creating a new chat starts a fresh history under the active project. Opening an existing chat restores its associated project, plan, and message history.
+- **Legacy Chat Migration:** Older sessions are grouped by their project root, with each historical session treated as an independent chat keyed by its session ID, preserving original files and hashes.
+- **Project Registry:** The list of known project paths is stored in `.agent-projects.json`, which is strictly protected against agent tool access alongside `.agent-runs`. Sessions remain in local storage with logical isolation; operating-system-level multi-tenancy or separate per-project databases are not part of this layer.
+- **Test Verification:** Verified via mock provider tests: cross-project or cross-chat context leakage was confirmed absent, even when chat IDs were identical across distinct project roots. Tree navigation, project switching, context flushing, and backward compatibility passed all 28 core unit test cases. Live LLM execution and Spring Boot runtimes were not part of this harness.
+- **Supercedence:** This update supersedes the UI 2.1 stateless model; multi-turn execution now leverages the bounded history described above. The window title reflects **UI 2.3**.
 
-- استبدال نص الرسائل المرسوم بعناصر نصية للقراءة فقط تدعم تحديد النص بالماوس وCtrl+A ونسخه بـCtrl+C، مع الإبقاء على شكل الفقاعات.
-- إضافة قائمة كليك يمين للرسائل: Copy / Select all، ولصندوق الكتابة: Cut / Copy / Paste / Select all. اللصق في صندوق الطلب، وليس داخل الردود المعروضة.
-- منع القطع واللصق في صندوق الطلب أثناء تعطيله خلال العمل. تم إعادة فحوص تخطيط الواجهة والتنقل وحالات الانشغال بنجاح دون توليد أو تغيير ملفات المشروع التجريبي.
-- عنوان النسخة الأحدث **AI Code Engineer · UI 2.2**؛ قسم UI 2.1 أدناه يصف التصميم الذي بُني عليه هذا التحديث.
+### Update UI 2.2 — Copy and Paste Interactions
 
-### مكان التشغيل والنسخة الحالية
+- Replaced rendered message text with read-only text widgets supporting mouse selection, Ctrl+A (Select All), and Ctrl+C (Copy), while preserving visual bubble styling.
+- Added context menus (right-click) for messages (Copy / Select all) and the prompt composer (Cut / Copy / Paste / Select all). Pasting is permitted into the prompt composer only, never into assistant response bubbles.
+- Disabled cut and paste operations within the composer while the agent is actively executing. Layout rendering, navigation, and busy-state inspections passed verification without generating or altering demo files.
+- Window title reflects **AI Code Engineer · UI 2.2**; the UI 2.1 design detailed below forms the foundation for this enhancement.
 
-- المشروع الفعلي: `D:\AI\AI-Agent`، والتشغيل من `Run-Agent.bat` الموجود داخله.
-- الواجهة الحالية: **UI 2.1**؛ رقمها ظاهر في عنوان النافذة للتمييز عن النسخ المفتوحة القديمة. يجب إغلاق النافذة القديمة وإعادة تشغيل الباتش بعد تحديث الملفات.
-- `Run-Agent-CLI.bat` يفتح القائمة النصية. لا توجد حاجة إلى تثبيت مكتبات واجهة خارجية؛ الواجهة الحالية Python/Tkinter.
-- المستودع التجريبي الحالي: `examples/demo2` والخطة المرجعية له `examples/demo2/plan.md`. هذه خطة تطبيق Spring منفصلة، وليست خطة تطوير الـAgent نفسه، ولم تُعدّل ضمن تحديث الواجهة.
+### Deployment Environment and Current Version
 
-### ما نُفذ بالفعل
+- **Active Codebase:** `D:\AI\AI-Agent`, launched via `Run-Agent.bat`.
+- **Interface Version:** **UI 2.1**; indicated in the window title to distinguish from older processes. The batch launcher must be restarted after code changes.
+- **Interactive Terminal:** `Run-Agent-CLI.bat` launches the text-based console menu. No external GUI dependencies required; standard library Python/Tkinter is utilized.
+- **Reference Demo Repository:** Located at `examples/demo2`, accompanied by reference plan `examples/demo2/plan.md`. This represents a separate Spring Boot application plan, not the agent's internal development plan.
 
-| المحور | التنفيذ الحالي |
-|---|---|
-| اللغة | Python 3.11+ لتسريع النسخة الأولى، مع استمرار استهداف مشروعات Java/Spring. Python اختيار تنفيذي وليست شرطًا معماريًا. |
-| المزودون | Ollama محليًا وOpenRouter للسحابة، من خلال طبقة مزود مستقلة عن واجهة المستخدم. |
-| اختيار الموديل | قراءة قائمة Ollama عند بدء التشغيل وعند Refresh؛ المستخدم يختار من كل العناصر التي تعيدها الخدمة. قائمة OpenRouter حية، مع أوضاع Free/Paid والبحث بالاسم ومعلومات السياق والسعر المتاحة. |
-| ضوابط السحابة | موافقة صريحة على إرسال كود عام/تجريبي؛ نماذج Ollama السحابية تخضع لنفس الضابط. الوضع المدفوع اختيار صريح ولا يوجد انتقال تلقائي إليه. مفتاح الواجهة لا يُحفظ على القرص. |
-| حلقة الوكيل | إجراءات JSON محددة، قراءة/بحث/قائمة ملفات، اقتراح أو إعلان تعذر التنفيذ؛ حدود لعدد الأدوار ومحاولات الإجراءات غير الصالحة. لا توجد صلاحية shell للموديل. |
-| السياق | Repo map مع بحث نصي وقراءة مقيدة بالسياسة؛ لا يوجد AST/LSP أو vector index بعد. |
-| الملفات الجديدة | قراءة ملف غير موجود ترجع `not_found` وإشارة سياسة لإمكانية إنشائه بدل إفشال المهمة. الإنشاء يُقترح أولًا ويُطبق بعد الموافقة. |
-| إرفاق الخطة | Attach/View/Clear لملف Markdown أو نص داخل المشروع؛ المحتوى يدخل سياق الموديل منفصلًا عن حد وصف المهمة (4000 حرف)، وبحد مستقل لحجم المرجع. طلب المستخدم الحالي يحدد المرحلة ويتقدم على تعليمات مرحلة قديمة داخل الخطة. |
-| حماية المرجع | خطة مرفقة للقراءة فقط، يُسجل مسارها وبصمتها في الجلسة، ولا يسمح للاقتراح بتعديلها، وتُراجع البصمة قبل التطبيق. CLI يدعم `--plan-file`. |
-| المراجعة | اقتراح محفوظ في `.agent-runs/<id>/session.json`، ملخص وDiff وBefore/After؛ موافقة مرتبطة ببصمة الاقتراح ثم فحص الملفات قبل الكتابة. الحد الحالي 8 ملفات في الاقتراح الواحد. |
-| التراجع | استعادة التغييرات الخاصة بالجلسة مع حماية تعديلات المستخدم اللاحقة. حفظ حالات التطبيق الجزئي أو المنقطع للمراجعة. |
-| التحقق | فحص صياغة اختياري ووصفات build/test ثابتة عبر Docker فقط؛ لا تُدّعى نتائج اختبارات مشروع لم تُنفذ. غياب العزل المطلوب يمنع تشغيل الوصفات. |
-| التشغيل الخلفي | العمل الطويل في thread وخانة نشاط؛ إيقاف التخطيط عند حد آمن بعد اكتمال الطلب الجاري. |
+### Verified Capabilities Matrix
 
-### الواجهة الحالية UI 2.1
+| Dimension | Implemented Reality |
+| :--- | :--- |
+| **Language** | Python 3.11+ to accelerate initial delivery, targeting Java/Spring Boot repositories. Python is an execution choice, not an architectural limitation. |
+| **Providers** | Local Ollama and cloud OpenRouter, interfaced through a provider layer decoupled from the user interface. |
+| **Model Selection** | Enumerates local Ollama models upon startup and refresh; users select from available models. OpenRouter models update dynamically, supporting Free/Paid modes, name search, and context/pricing metadata. |
+| **Cloud Controls** | Explicit consent prompt required before transmitting code to cloud endpoints; cloud-hosted Ollama models enforce identical controls. Paid tier selection requires explicit activation; API keys remain ephemeral in memory and are never written to disk. |
+| **Agent Loop** | Bounded JSON actions: `list_files`, `read_file`, `search_code`, `propose`, or `blocked`. Enforces hard limits on execution turns and invalid tool attempts. Direct arbitrary shell execution is denied to the model. |
+| **Context Retrieval** | Repository map paired with lexical search and policy-bounded file reads; AST/LSP and vector indexing are not yet present in this tier. |
+| **File Creation** | Reading a non-existent file returns `not_found` with policy metadata permitting creation rather than aborting. New files must be formally proposed and approved before disk writes. |
+| **Plan Attachment** | Attach/View/Clear functionality for project Markdown plans. Plan text is injected into prompt context outside the 4,000-character task prompt limit, under dedicated reference limits. The immediate user prompt specifies the target phase and takes precedence over historical plan steps. |
+| **Plan Protection** | Attached plans are strictly read-only. File path and SHA-256 digest are recorded in the session ledger; proposals are prevented from altering the plan, and digests are re-verified prior to apply. CLI supports `--plan-file`. |
+| **Review & Diffs** | Proposals are stored in `.agent-runs/<id>/session.json`, providing summary, unified diff, and Before/After inspections. User approval is cryptographically tied to the proposal hash, followed by pre-write file version checks. Proposals are capped at 8 files per turn. |
+| **Rollback** | Restores session-specific file changes while protecting subsequent user edits. Interrupted or partial apply states are persisted for recovery. |
+| **Verification** | Optional syntax checks and fixed build/test recipes executed strictly via Docker; unexecuted test claims are rejected. Absences of required isolation blocks execution. |
+| **Background Execution**| Long-running operations execute on worker threads with activity status feedback; planning terminates safely at the next turn boundary upon stop requests. |
 
-الواجهة باللغة الإنجليزية، والتصميم مستوحى من الصورة التي اختارها المستخدم:
+### UI 2.1 Interface Overview
 
-- شريط جانبي فاتح للمشروع والمهام الحديثة وفتح مهمة محفوظة.
-- مساحة محادثة برسائل منفصلة وفقاعات زرقاء للطلب؛ صندوق كتابة منخفض بحواف دائرية في الأسفل.
-- زر إرفاق الخطة واختيار الموديل بجانب الكتابة، بدل عرض نموذج إعدادات طويل طوال الوقت.
-- الضغط على اسم الموديل أو **Project & model settings** يفتح إعدادات المشروع والمزود والموديل والبحث والمفتاح والموافقة السحابية.
-- بطاقة **Outputs / Sources** على اليمين لعرض الملفات المقترحة والخطة. تُخفى في النوافذ الضيقة لإبقاء صندوق الكتابة قابلًا للاستخدام؛ الإعدادات والإرفاق يظلان متاحين من الأسفل.
-- تنقل خفيف **Chat / Changes / Activity** بدل تبويبات كبيرة محاطة بحدود. مراجعة الملفات والتطبيق والتراجع داخل Changes.
-- **Ctrl+Enter** يرسل طلب اقتراح، وEnter يضيف سطرًا. زر Stop يظهر فقط أثناء عملية يمكن إيقافها.
-- هذه واجهة مهام واقتراحات وليست محادثة عامة ذات ذاكرة ممتدة: المشروع والخطة يظلان في النموذج، لكن كل إرسال يبدأ اقتراحًا جديدًا بناءً على الطلب والملفات الحالية.
+The interface features a modern dark/light layout tailored for developer workflows:
+- Light sidebar displaying the active project, recent tasks, and session loader.
+- Conversational thread with blue user prompt bubbles; rounded composer dock at the bottom.
+- Plan attachment and model selector buttons situated beside the composer dock.
+- Clicking the active model name or **Project & model settings** opens provider, model, search, API key, and cloud consent configurations.
+- **Outputs / Sources** inspector card on the right displaying proposed files and attached plans; automatically collapses on narrow windows.
+- Streamlined **Chat / Changes / Activity** navigation. File review, approval, and rollback reside within Changes.
+- **Ctrl+Enter** submits proposals; Enter adds a newline. The Stop button appears only during cancellable operations.
+- The interface acts as a proposal review workbench rather than an open-ended conversational chat: project context and plan remain bound, but each submission generates a discrete proposal based on immediate requests and current disk state.
 
-### سير عمل التطبيق التجريبي
+### Demo Application Workflow
 
-1. افتح `Run-Agent.bat` وتأكد من ظهور **UI 2.1** في العنوان.
-2. اختر `D:\AI\AI-Agent\examples\demo2` ثم أرفق `plan.md` الموجود فيه.
-3. اختر موديلًا من قائمة Ollama أو أحد أوضاع OpenRouter حسب تصنيف البيانات والميزانية.
-4. اكتب المرحلة المطلوبة صراحة، مثل: `Read the attached plan and inspect the current project. Implement Phase 1 only. Preserve existing work. Do not run builds, tests, or the application.`
-5. أرسل الطلب، وافتح Changes لمراجعة الملفات؛ ضع علامة الموافقة ثم Apply.
-6. جرّب التطبيق يدويًا أو شغّل تحققًا مأذونًا به، ثم اطلب المرحلة التالية. نجاح إنشاء الاقتراح لا يعني نجاح تشغيل التطبيق.
+1. Launch `Run-Agent.bat` and confirm **UI 2.1** appears in the title.
+2. Select `D:\AI\AI-Agent\examples\demo2` and attach `plan.md`.
+3. Choose an Ollama model or an OpenRouter tier based on data sensitivity and budget.
+4. Specify the target phase explicitly, e.g.:  
+   `Read the attached plan and inspect the current project. Implement Phase 1 only. Preserve existing work. Do not run builds, tests, or the application.`
+5. Submit the prompt, navigate to Changes to inspect proposed diffs, check approval, and click Apply.
+6. Verify the application manually or trigger authorized test recipes before advancing to subsequent phases.
 
-### ما جرى التحقق منه وحدوده
+### Verified Testing Boundaries
 
-- كانت هناك نتائج تحقق سابقة للنواة، لكنها لا تثبت سلامة كل تحديث لاحق. تحديثات اختيار الموديلات والملفات الجديدة وإرفاق الخطة نُفذت أولًا دون اختبارات بناءً على طلب المستخدم وقتها.
-- المستخدم سمح لاحقًا بتشغيل وتجربة الواجهة. في UI 2.1 نجح فحص صياغة الملف وتشغيل Tk وفحص تخطيط فعلي عند 1500×880 و1000×650 و1850×950.
-- نجح فحص فتح الإعدادات، عرض اختيار موديل ببيانات اختبار محلية، حالات busy/Stop، الانتقال إلى Changes، بدء مهمة جديدة، وقراءة `demo2/plan.md` دون تعديله.
-- جرى تشغيل نافذة معاينة؛ **لم تكتمل معاينة صورة النافذة**: أداة Windows أعادت مهلة إذن ثم `no screenshot targets found`. لا يُعد فحص المقاسات موافقة بصرية نهائية.
-- لم يُرسل طلب توليد للتحقق من هذا التحديث، ولم تُطبق تغييرات على تطبيق Spring، ولم تُشغّل build أو اختبارات المشروع التجريبي.
+- Historical core tests do not inherently validate subsequent UI updates. Initial model selection, file creation, and plan attachment features were initially implemented without unit tests per user direction.
+- UI validation subsequently verified Tk initialization, layout responsiveness across 1500×880, 1000×650, and 1850×950 resolutions, modal drawers, busy/Stop states, Changes pane transitions, and read-only plan ingestion.
+- Automated window screenshot captures encountered Windows authorization timeouts; dimensional checks do not substitute for visual human inspection.
+- Cloud generation, Spring Boot code modifications, and live test runs were not executed during UI smoke tests.
 
-### العمل المتبقي وأولوية المرحلة التالية
+### Immediate Backlog Priorities
 
-1. إكمال معاينة الواجهة بصريًا على جهاز المستخدم وتجربة المسار الكامل: Attach → اختيار الموديل → اقتراح → مراجعة → تطبيق.
-2. تجربة Spring authentication على مراحل صغيرة وفق `examples/demo2/plan.md`، وعدم اعتماد التطبيق قبل تحقق تشغيل فعلي.
-3. إثبات عزل Docker على جهاز مجهز وإضافة تقارير تحقق قابلة للقراءة آليًا؛ لا تزال فحوص Gradle بحاجة إلى استكمال.
-4. إضافة دورة إصلاح محدودة وموافقات جديدة للاقتراحات البديلة، وتحسين قدرات الأدوات والسياق حسب القياسات.
-5. إضافة workspace locks/worktrees واستعادة أكثر متانة للجلسات، ثم Skills وMCP والتكامل مع IDE.
-6. استكمال متطلبات الإنتاج البنكي: SSO، تشفير واحتفاظ وتدقيق للجلسات، سياسة خروج بيانات مركزية، تقييمات للموديلات والمهام، واختبارات عزل وأمن. النسخة الحالية MVP وليست منتجًا بنكيًا جاهزًا للإنتاج.
+1. Complete visual UI verification and test the end-to-end lifecycle: Attach → Select Model → Propose → Review → Apply.
+2. Execute Spring authentication increments following `examples/demo2/plan.md`, validating live execution before approving changes.
+3. Validate Docker container isolation on a configured host and add machine-readable test reports; finalize Gradle test inspection.
+4. Implement bounded repair cycles, alternative proposal approvals, and context tool enhancements.
+5. Introduce workspace locks/worktrees, robust session recovery, Skills, MCP, and IDE integration.
+6. Fulfill enterprise banking prerequisites: SSO, session encryption/auditing, centralized data egress enforcement, model benchmarking, and security isolation. The current release represents an MVP workbench.
 
-**قاعدة توثيق:** عند التعارض مع وصف مستقبلي في الأقسام التالية، هذا السجل هو مرجع ما نُفذ بالفعل. لا يُعلّم أي بند إنتاجي مكتملًا دون دليل تحقق مناسب.
+---
 
-## 1. القرار المعماري
+## 1. Architectural Decision
 
-نبني **Agent Runtime مستقلًا عن مزود الموديل**، ونبدأ بـAgent واحد له قدرات تخطيط وتنفيذ واختبار ومراجعة. نفصل المكونات داخليًا، دون البدء بمنظومة microservices أو عدة agents.
+We construct an **Agent Runtime decoupled from the model provider**, starting as a single orchestrated agent with planning, execution, testing, and review capabilities. Components are separated internally within a modular architecture, avoiding premature microservice or multi-agent complexity.
 
-الموديل يقترح الخطوة؛ الـRuntime يتحقق من صحتها وصلاحيتها وينفذها ويراقب نتيجتها. جودة كتابة الكود وحدها لا تكفي: النجاح هو تغيير قابل للمراجعة، بأدلة تحقق، داخل حدود الأمان والتكلفة.
+The model proposes actions; the runtime validates schemas, enforces policy permissions, executes actions within sandboxes, and verifies outcomes. High code generation quality alone is insufficient: success requires reviewable diffs, empirical verification evidence, and strict security and budget guardrails.
 
 ```text
 Developer → CLI / Web / IDE
@@ -133,43 +134,49 @@ Developer → CLI / Web / IDE
        Observe → Verify → Fix / Report
 ```
 
-كل مسارات التنفيذ، بما فيها MCP وhooks وscripts، تمر عبر السياسة. استدعاءات الموديل نفسها تمر عبر ضوابط تصنيف البيانات وخروجها. الـSandbox حد أمني فعلي؛ Git worktree وسيلة عزل للتغييرات فقط.
+All execution paths—including MCP adapters, hooks, and local scripts—must pass through the policy engine. Model inference requests adhere to data classification and egress policies. Sandboxes provide true security isolation; Git worktrees provide workspace isolation.
 
-## 2. لماذا Python؟ وهل هي مطلوبة؟
+---
 
-**Python ليست شرطًا.** استخدامها في الهيكل السابق كان مثالًا لتسريع التجريب، وليس اعتمادًا معماريًا. تشغيل inference في خدمة منفصلة يسمح بكتابة الـAgent بأي لغة مناسبة.
+## 2. Why Python? And is it Mandatory?
 
-| الجانب | Python | Java | Kotlin |
-|---|---|---|---|
-| التجريب وبحث AI | مناسبة جدًا وتجاربها عادة مختصرة | مناسبة، مع إعداد أكثر أحيانًا | كود مختصر مع مكتبات JVM |
-| الملاءمة لفريق Java/Spring | لغة وأدوات تشغيل إضافية | الأقرب لمهارات الفريق وإجراءاته | جيدة إذا كانت مستخدمة بالفعل |
-| العقود وإعادة الهيكلة | typing واختبارات وأدوات فحص ضرورية | static typing وعقود واضحة | static typing وnull safety على مستوى اللغة |
-| التكامل المؤسسي | ممكن، لكنه يحتاج توحيدًا مع منصة البنك | مناسب لمنظومة Spring الحالية | تكامل JVM/Spring مع حاجة لخبرة Kotlin |
-| التشغيل والصيانة | إدارة بيئة وحزم Python | نفس أدوات JVM والمراقبة المعتادة | نفس منصة JVM مع اعتبارات توافق المكتبات |
-| تدريب النماذج والتجارب المتخصصة | غالبًا الاختيار الأسهل | استهلاك خدمات inference غالبًا أنسب | مثل Java في هذا الجانب |
+**Python is not mandatory.** Its adoption in the initial prototype served to accelerate experimentation rather than establish an immutable architectural requirement. Decoupling model inference behind a standard protocol allows the Agent Runtime to be authored in any suitable language.
 
-**القرار المعتمد من المستخدم:** Python لتنفيذ الـAgent وتسريع بناء النسخة الأولى. كانت Java/Spring توصية سابقة لتقليل اختلاف تقنيات التشغيل، لكنها أصبحت بديلًا للمقارنة وليست خطة التنفيذ. نستخدم typing وعقودًا واضحة واختبارات وحدات وتكامل، ونثبت dependencies لضمان قابلية الصيانة. لا يلزم أن تطابق لغة الـAgent لغة المستودعات التي يعدلها؛ سيستمر في خدمة Java/Spring وتشغيل Maven/Gradle داخل worker معزول.
+| Evaluation Criteria | Python | Java | Kotlin |
+| :--- | :--- | :--- | :--- |
+| **Prototyping & AI Ecosystem** | Highly suitable; compact experimentation loops | Mature; requires additional scaffolding | Concise syntax with JVM ecosystem access |
+| **Team Alignment (Java/Spring)** | Requires additional tooling and runtime management | Directly aligns with team skills and CI/CD pipelines | Excellent if already adopted within the organization |
+| **Type Contracts & Refactoring** | Requires external type checking (mypy) and disciplined testing | Robust static typing and compile-time contract enforcement | Strong static typing with language-level null safety |
+| **Enterprise Integration** | Viable, but requires integration with banking platforms | Native fit for existing Spring enterprise stacks | Seamless JVM/Spring interop with Kotlin runtime |
+| **Operations & Maintenance** | Requires Python virtual environments and package curation | Leverages existing JVM monitoring, profiling, and deployment tools | Standard JVM operations with library compatibility checks |
+| **Model Fine-Tuning & Specialized Research** | Predominant industry choice | Typically consumes inference endpoints | Consumes inference endpoints via JVM clients |
 
-نبدأ بحزمة Python واحدة ذات modules واضحة، وCLI وprovider adapters منفصلة، دون اشتراط framework للـAgents. نستخدم مكتبات HTTP/validation معتمدة عند التنفيذ، ونحتفظ بمنطق orchestration والسياسة داخل المشروع. Spring AI مرجع للبديل JVM فقط، وليس dependency في التنفيذ المعتمد. [مرجع Spring AI](https://docs.spring.io/spring-ai/reference/).
+**Approved Decision:** Python is selected for the Agent Runtime to accelerate initial version delivery. While Java/Spring was evaluated to eliminate operational divergence, Python remains the active implementation language. We maintain strict type annotations, explicit contracts, comprehensive unit/integration test suites, and pinned dependencies. The agent's implementation language does not need to match target repositories: it manages Java/Spring codebases and executes Maven/Gradle toolchains within isolated workers.
 
-لغة الـRuntime ليست معيار اختيار الموديل. نقيس الموديل على مستودعات Java/Kotlin الفعلية، ودقة الأدوات والتعديلات، والزمن، والذاكرة، والتكلفة؛ لا نفترض أن نموذجًا محليًا صغيرًا يعادل نموذجًا سحابيًا.
+The agent runtime is structured as a modular Python package with explicit boundaries, decoupled CLI frontends, and provider adapters, avoiding framework lock-in. Production logic, orchestration, and policy rules remain native to the repository. Spring AI serves as a reference for JVM alternatives rather than an active dependency.
 
-## 3. حدود المكونات ومسؤولياتها
+The runtime language does not dictate model selection. Models are benchmarked on real Java/Kotlin repositories, evaluating tool accuracy, patch reliability, latency, memory consumption, and cost.
 
-| المكوّن | مسؤوليته | ما لا يملكه |
-|---|---|---|
-| Orchestrator | حالة المهمة، الانتقالات، الميزانيات، الإلغاء | تنفيذ shell مباشرة |
-| Planner | هدف قابل للاختبار، ملفات متوقعة، مخاطر وتحقق | منح صلاحيات |
-| Context Engine | بحث وفهرسة وانتقاء سياق موثق | رفع كامل المستودع تلقائيًا |
-| Model Gateway | توحيد الطلبات والنتائج والقدرات | تجاوز سياسة خروج البيانات |
-| Policy Engine | Allow / Deny / RequireApproval | الاعتماد على وعد الموديل بالأمان |
-| Tool Runtime | validation، execution، timeouts، نتائج منظمة | توسيع نطاق الطلب |
-| Verifier | تشغيل checks وتقييم الأدلة | اعتبار كلام الموديل دليل نجاح |
-| Session Store | checkpoints وقرارات وأحداث قابلة للاستئناف | تخزين أسرار أو تفكير داخلي خام |
+---
 
-ابدأ بتطبيق modular monolith للتحكم وworker منفصل للعمل غير الموثوق. لا تشغّل build المشروع داخل عملية الخدمة التي تحمل credentials الإدارة.
+## 3. Component Boundaries and Responsibilities
 
-## 4. Model abstraction والعقود
+| Component | Core Responsibility | Explicit Exclusions |
+| :--- | :--- | :--- |
+| **Orchestrator** | Task lifecycle, state transitions, budgets, cancellation | Direct shell execution |
+| **Planner** | Testable objectives, file scopes, risk classification, checks | Granting permissions |
+| **Context Engine** | Search, indexing, symbol maps, context budgeting | Blindly uploading entire repositories |
+| **Model Gateway** | Unifying requests, schemas, responses, and capabilities | Bypassing data egress policies |
+| **Policy Engine** | Deterministic decisions: Allow / Deny / RequireApproval | Trusting model self-attestations |
+| **Tool Runtime** | Schema validation, execution, timeouts, structured outputs | Expanding task scopes |
+| **Verifier** | Executing test recipes and evaluating empirical evidence | Accepting prose as proof of success |
+| **Session Store** | Checkpoints, decisions, auditable resumable events | Storing raw secrets or chain-of-thought scratchpads |
+
+The system begins as a modular monolith control plane paired with isolated worker processes for untrusted code execution. Build and test recipes never execute inside the privileged control process.
+
+---
+
+## 4. Model Abstraction and Contracts
 
 ```python
 from __future__ import annotations
@@ -201,23 +208,24 @@ class ModelProvider(Protocol):
     ) -> ModelTurn: ...
 ```
 
-تعريفات `ModelRequest` و`ModelTurn` و`CancellationToken` جزء من implementation وليست أنواعًا جاهزة في Python. هذا مثال لعقد typing وليس تطبيقًا مستقلًا قابلًا للتشغيل. يشمل الطلب الرسائل، schemas للأدوات المسموحة، deadline وميزانية المخرجات. تشمل النتيجة النص وطلبات الأدوات وسبب التوقف وusage إن توفر. نتحقق من المدخلات والنتائج وقت التشغيل؛ type hints وحدها لا تفرض صحة البيانات.
+`ModelRequest`, `ModelTurn`, and `CancellationToken` define runtime interface protocols. Requests carry message histories, allowed tool schemas, timeouts, and output budgets. Responses return text content, tool calls, finish reasons, and usage metrics. Inputs and outputs are validated at runtime; type annotations alone do not guarantee payload validity.
 
-المحولات المعتمدة للنسخة الأولى: `OllamaProvider` و`OpenRouterProvider` خلف نفس `ModelProvider`. يمكن إعادة استخدام transport متوافق مع OpenAI داخل محول OpenRouter، مع إبقاء إعدادات routing والخصوصية خاصة به. نؤجل `OpenAiProvider` المباشر وGemini/Groq/Azure إلى وجود حاجة فعلية. ويمكن إضافة محول لخوادم محلية مثل نشر vLLM مختار لاحقًا. تشابه API لا يضمن تطابق capabilities أو token accounting أو أخطاء streaming.
+Initial provider adapters: `OllamaProvider` (local) and `OpenRouterProvider` (cloud) implementing the unified `ModelProvider` protocol. OpenRouter adapters utilize OpenAI-compatible transports while maintaining distinct routing and privacy controls. Direct adapters for OpenAI, Azure, Gemini, or vLLM can be added as needed. API compatibility does not imply identical token accounting, tool reliability, or streaming semantics.
 
-قواعد التنفيذ:
+Implementation Rules:
+- Configure provider/model selections via external configuration; avoid hardcoding model IDs in business logic.
+- Execute contract tests across supported model and server versions, validating multi-tool calling, invalid JSON recovery, timeouts, truncation, and cancellation.
+- Accumulate complete streaming tool arguments before executing; partial streaming execution is prohibited.
+- Reject unrecognized tool names or arguments violating JSON schemas. Allow bounded recovery turns for malformed responses without extracting shell commands from unstructured text.
+- If a model fails tool-calling contract tests, restrict it to advisory chat mode; do not grant it write execution tools.
+- Network errors employ bounded exponential backoff. Regenerating responses incurs cost; side-effecting tools require state reconciliation prior to retry.
+- Silent fallback from local to cloud execution is strictly prohibited. Altering data processing boundaries requires explicit user authorization.
 
-- اختر provider/model بإعدادات معتمدة؛ لا تنشر أسماء موديلات ثابتة في منطق الـAgent.
-- نفّذ contract tests لكل model + server version، تشمل tool calls متعددة، JSON غير صالح، timeout، truncation والإلغاء.
-- اجمع tool arguments كاملة ثم تحقق منها؛ لا تنفذ أجزاء streaming.
-- ارفض tool name غير معروف أو arguments خارج schema. اسمح بمحاولة تصحيح محدودة للرد غير الصالح، دون استخراج shell من نص حر.
-- إذا كان الموديل لا يجتاز اختبارات الأدوات، اجعله للاستشارة فقط أو استخدم structured action schema مثبت الاختبار؛ لا تمنحه تنفيذًا عامًا.
-- أخطاء الاتصال تستعمل backoff محدودًا. إعادة توليد رد قد تكلف مالًا؛ إعادة تنفيذ أداة ذات أثر جانبي تحتاج مصالحة للحالة قبل أي retry.
-- لا يوجد fallback صامت من local إلى cloud. تغيير جهة معالجة البيانات يحتاج سياسة صريحة وصلاحية مناسبة.
+In function-calling architectures, models emit structured tool calls; the runtime executes them and returns results correlated by call ID. Valid JSON does not confer authorization.
 
-في function calling ينتج الموديل طلب الأداة ويقوم التطبيق بتنفيذها ثم يعيد النتيجة المرتبطة بمعرّف الطلب. صلاحية JSON لا تعني أن العملية مصرح بها. [مرجع OpenAI](https://developers.openai.com/api/docs/guides/function-calling). وOllama يوفر مسار tool calling للنماذج الداعمة؛ يجب اختبار النموذج المختار نفسه. [مرجع Ollama](https://docs.ollama.com/capabilities/tool-calling).
+---
 
-## 5. Agent loop وحالة المهمة
+## 5. Agent Loop and Task State Machine
 
 ```text
 CREATED → DISCOVERING → PLANNING → [WAITING_APPROVAL]
@@ -228,13 +236,13 @@ CREATED → DISCOVERING → PLANNING → [WAITING_APPROVAL]
 Any active state → CANCELLED / FAILED / BLOCKED
 ```
 
-1. سجّل هوية المستخدم والمستودع والتصنيف والطلب ومعايير القبول.
-2. التقط baseline: commit، حالة الملفات والتغييرات الموجودة، وإصدارات build/model/policy.
-3. اجمع السياق، واقترح خطة محددة بالنطاق.
-4. احصل على الموافقة إن تطلبت السياسة؛ احفظها بمدة ونطاق واضحين.
-5. في كل دورة: ابنِ السياق → اطلب خطوة → تحقق من tool call → قيّم السياسة → نفّذ → سجّل النتيجة.
-6. نفذ التحقق عند اكتمال التعديلات، وأصلح ضمن حدود المحاولات.
-7. أنشئ تقريرًا صادقًا بالتغييرات ونتائج checks وما لم يتم التحقق منه.
+1. **Intake:** Record user identity, repository path, data classification, task prompt, and acceptance criteria.
+2. **Baseline:** Capture baseline git commit, working tree state, and toolchain versions.
+3. **Discovery & Planning:** Assemble context, inspect symbols, and propose a scoped plan.
+4. **Approval:** Solicit explicit user approval when required by policy; record approval duration and hash scope.
+5. **Execution Cycle:** Construct context → request model action → validate schema → evaluate policy → execute in sandbox → record observation.
+6. **Verification & Repair:** Execute test recipes upon change completion; trigger bounded repair rounds upon failure.
+7. **Reporting:** Emit an empirical report detailing applied changes, verification test results, and unexecuted checks.
 
 ```text
 while task is active and budget remains:
@@ -249,33 +257,33 @@ while task is active and budget remains:
         execute once in sandbox; record observation and checkpoint
 ```
 
-قيم بداية مقترحة، تضبط بالتجربة: 30 model turns، 60 tool calls، 3 repair attempts، و20 دقيقة للمهمة، مع timeouts منفصلة للبناء. اكتشف تكرار نفس الفشل ونفس patch وتوقف برسالة واضحة. نفاد الميزانية لا يتحول إلى نجاح.
+Initial operational thresholds: 30 model turns, 60 tool invocations, 3 repair attempts, and a 20-minute overall task timeout with independent build step timeouts. Detect repetitive identical failures and break loops with actionable diagnostic messages. Budget exhaustion is recorded as a failure, never as a completion.
 
-خزّن `taskId`, `toolCallId`, state, baseline, plan version, approvals, policy version, model version, artifact hashes ونتائج الأدوات. عند الانقطاع استأنف من checkpoint؛ reconcile أي عملية غير مؤكدة بدل تكرار push أو إنشاء طلب خارجي. استخدم idempotency keys حيث يدعم النظام المستهدف ذلك.
+Persist `taskId`, `toolCallId`, status, baselines, plan versions, approvals, policy versions, model identifiers, artifact hashes, and tool results. Resume interrupted runs from checkpoints; reconcile uncertain states before re-executing remote mutations. Employ idempotency keys where supported.
 
-## 6. Context engineering وRepo Map
+---
 
-ابدأ بـripgrep + Git metadata + build metadata، ثم parser للرموز. لا تجعل vector database شرطًا للنسخة الأولى.
+## 6. Context Engineering and Repository Mapping
+
+Initial implementation utilizes ripgrep, Git metadata, and build toolchain descriptors, followed by symbol extraction. Vector databases are not mandatory for initial versions.
 
 ```text
 Repo snapshot → File inventory → Symbol index → Repo map
 Task terms → lexical search → related symbols/tests → selected excerpts
 ```
 
-لكل symbol احفظ: الاسم، النوع، التوقيع، الملف ونطاق الأسطر، module، hash الملف، وروابط محتملة للمراجع والاختبارات. Repo Map ملخص للهيكل، وليس نسخة مضغوطة من كل الكود. استخدام خرائط الرموز والسياق المحدود له مثال عملي في [Aider repository map](https://aider.chat/docs/repomap.html).
+For each indexed symbol, record: identifier name, type, signature, file path, line range, module association, file SHA-256 hash, and potential import/call references. The Repository Map represents an architectural summary rather than an exhaustive code dump.
 
-لفريق Spring:
+Spring Boot Specifics:
+- Detect Maven/Gradle multi-module hierarchies, Java/Kotlin versions, and test source sets.
+- Map controller endpoints to corresponding DTOs, service beans, repositories, and unit/integration tests.
+- Tree-sitter provides polyglot structural parsing; JavaParser provides deep Java analysis; LSP integration provides semantic reference graphs.
+- Treat detected relationships as heuristics given Spring's dynamic reflection and runtime dependency injection; corroborate findings against source declarations and test executions.
+- Invalidate cache entries by file content hash; isolate caches per repository and branch; re-read source files prior to patching.
+- Exclude `.git`, build directories, compiled binaries, credentials, and sensitive data files from indexing. Enforce read restrictions across untracked files and symlinks.
+- Integrate local embeddings only if empirical benchmarks demonstrate that lexical search and symbol indexing are insufficient.
 
-- اكتشف Maven/Gradle modules وJava/Kotlin versions وtest source sets.
-- اربط controller endpoint بـDTO وservice وrepository والاختبارات المرتبطة قدر الإمكان.
-- Tree-sitter مناسب للاستخراج البنيوي المتعدد اللغات؛ JavaParser خيار Java، وLSP يفيد لاحقًا في references والدلالات.
-- لا تعتبر العلاقات المكتشفة يقينية مع reflection وSpring injection وgenerated code؛ ارجع إلى المصدر والاختبارات.
-- أعد فهرسة الملفات المعدلة بالـhash، وافصل caches لكل repo/branch/task، وأعد قراءة المصدر قبل patch.
-- استبعد `.git`، build outputs، binaries، credentials، وملفات البيانات الحساسة قبل الفهرسة والإرسال. طبّق قيود القراءة حتى على الملفات غير المتتبعة وsymlinks.
-- أضف embeddings محلية فقط إذا أثبتت evals أن البحث المعجمي والرموز غير كافيين. تعامل معها كبيانات مشتقة حساسة لها صلاحيات وretention.
-
-مثال repo map:
-
+Sample Repository Map:
 ```text
 payments-api
   TransferController.transfer(TransferRequest)
@@ -284,51 +292,56 @@ payments-api
   TransferServiceTest
 ```
 
-احجز من context window مساحة للمخرجات ونتائج الأدوات المقبلة. مثال مبدئي من المساحة المتاحة للمدخلات: 15% سياسات وعقد المهمة، 15% خطة وملخص، 50% كود واختبارات ذات صلة، 20% نتائج حديثة. النسب تجريبية. لخّص المخرجات الطويلة مع مرجع للملف الكامل؛ لا تحذف الأخطاء الحاسمة ولا تخزن summaries باعتبارها مصدر الحقيقة.
+Reserve context window space for model output generation and tool observation payloads. Indicative allocation: 15% system policies and task contract, 15% plan and summary, 50% relevant source code and test fixtures, 20% recent execution turns. Summarize large tool outputs with references to complete files; preserve critical error diagnostics.
 
-## 7. الأدوات وTool Registry
+---
 
-| المجموعة | أدوات البداية | الضوابط |
-|---|---|---|
-| قراءة | list_files, read_file, search_code, find_symbol | مسارات مصرح بها وحدود حجم |
-| تعديل | create_file, apply_patch | expected hash، حدود diff، كتابة atomic |
-| Git | git_status, git_diff | repo محدد وقراءة metadata اللازمة |
-| تحقق | compile_project, run_tests, run_test, run_lint | build recipes معتمدة داخل sandbox |
-| تبعيات | read_build_file, inspect_dependency | cache/mirror معتمد، لا تنزيل خفي |
-| Shell | restricted_shell | مغلق افتراضيًا، executable وargv محددان |
+## 7. Tools and Tool Registry
 
-كل Tool Definition يتضمن JSON Schema، وصفًا دقيقًا، أثرًا جانبيًا، required permissions، timeout، output limit، وإمكانية idempotency. النتيجة تشمل `status`, `exitCode`, `duration`, `stdout/stderr` المنقحين، `artifacts`, `changedPaths`, `truncated` ومعرّف الخطأ.
+| Tool Category | Initial Toolset | Enforcement Controls |
+| :--- | :--- | :--- |
+| **Read** | `list_files`, `read_file`, `search_code`, `find_symbol` | Authorized paths, character and byte limits |
+| **Write** | `create_file`, `apply_patch` | Expected pre-write hash, diff line ceilings, atomic replacement |
+| **Git** | `git_status`, `git_diff` | Scoped repository root, metadata inspection only |
+| **Verification** | `compile_project`, `run_tests`, `run_test`, `run_lint` | Approved build recipes inside isolated sandbox |
+| **Dependencies** | `read_build_file`, `inspect_dependency` | Approved mirrors and internal caches; no unauthorized downloads |
+| **Shell** | `restricted_shell` | Disabled by default; explicit executable and argument array |
 
-`apply_patch` يتحقق من محتوى الملف المتوقع، ويمنع overwrite عند تغيّر الملف من المستخدم أو أداة أخرى. نفّذ التعديلات متسلسلة لكل workspace. يمكن تشغيل قراءات مستقلة بالتوازي بعد ضبط snapshot consistency.
+Tool definitions include JSON Schema specifications, descriptive summaries, side-effect classifications, required permissions, execution timeouts, output size ceilings, and idempotency guarantees. Tool results return `status`, `exitCode`, `duration`, redacted `stdout/stderr`, `artifacts`, `changedPaths`, truncation indicators, and structured error payloads.
 
-شغّل الأوامر بصيغة executable + argument array، دون تركيب shell string من كلام الموديل. allowlist لكلمة `mvn` أو `gradle` وحدها غير كافية: build plugins وtests وwrappers تشغّل كودًا تعسفيًا. العزل مطلوب حتى مع أدوات build المسموح بها.
+`apply_patch` verifies expected file contents prior to writing, preventing accidental overwrites if files were edited concurrently. Modifications execute sequentially per workspace; read operations may execute concurrently under snapshot consistency.
 
-## 8. Permissions وPolicy Engine
+Execute processes using direct executable and argument arrays, avoiding shell string interpolation. Bare allowlists for `mvn` or `gradle` are insufficient, as build plugins, wrappers, and test suites execute arbitrary code. Sandboxed isolation remains mandatory for all build recipes.
 
-السياسة كود حتمي خارج الموديل، وقراراتها `ALLOW`, `DENY`, `REQUIRE_APPROVAL`. كل deny له سبب قابل للعرض؛ أي خطأ في السياسة أو إعداد غير معروف يؤدي إلى fail closed.
+---
 
-| المستوى | أمثلة | القرار الافتراضي المقترح |
-|---|---|---|
-| Read | قراءة كود مسموح، بحث، diff | تلقائي داخل نطاق المهمة |
-| Write | patch/create | داخل خطة مصرح بها وworkspace معزول |
-| Execute | compile/tests | worker معزول ووصفة معتمدة |
-| External effect | push، إرسال بيانات، تعديل issue | موافقة محددة على العملية والمحتوى والوجهة |
-| Production | نشر production، قواعد بيانات حقيقية، أسرار تشغيل | ممنوع على الـAgent في النطاق الأول |
+## 8. Permissions and Policy Engine
 
-ترتيب الثقة المقترح: سياسة المؤسسة → إعدادات المشروع الموثوقة → نطاق المستخدم المصرح → تعليمات repo/skills المراجعة → مخرجات النموذج والمحتوى الخارجي غير الموثوق. `AGENTS.md` يصف قواعد العمل لكنه لا يستطيع توسيع صلاحيات المؤسسة. أي طلب أعلى صلاحية يحتاج قناة إدارية مستقلة.
+The Policy Engine executes deterministic code outside the LLM, issuing decisions: `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Denials provide human-readable rationales; configuration errors fail closed.
 
-حماية عملية:
+| Privilege Level | Operations | Default Policy |
+| :--- | :--- | :--- |
+| **Read** | Authorized file reads, code search, diff inspection | Automatic within task workspace scope |
+| **Write** | Patch application, file creation | Permitted within approved plan and isolated workspace |
+| **Execute** | Project compilation, test suite execution | Isolated worker running approved recipes |
+| **External Effect** | Git push, remote data transfer, ticket updates | Explicit approval per action, payload, and destination |
+| **Production** | Production deployment, live databases, production secrets | Strictly prohibited within initial agent scope |
 
-- حل canonical path وافحص traversal وsymlinks وWindows junctions؛ لا تعتمد على string prefix فقط.
-- أعد فحص الهدف عند فتحه وتنفيذه لتقليل race conditions؛ امنع mount أو رابط خارج workspace.
-- افصل صلاحية قراءة secret عن صلاحية إرسال محتوى إلى model provider.
-- قيّد CPU/RAM/processes/disk/time، امنع privilege escalation وhost mounts وDocker socket.
-- عامل scripts وMCP responses وREADME وتعليقات الكود كبيانات قد تحتوي prompt injection.
-- استخدم هويات قصيرة العمر محدودة الصلاحيات؛ لا ترث environment المستخدم بالكامل.
+Trust Hierarchy: Enterprise Policy → Trusted Project Settings → Authorized User Scope → Reviewed Repository Skills → Model Outputs and Untrusted Data. `AGENTS.md` and repository instructions cannot expand enterprise permissions. Privilege escalation requires out-of-band administrative authorization.
 
-## 9. التخطيط والموافقة
+Practical Safeguards:
+- Resolve canonical filesystem paths and reject traversal attempts (`..`), symlinks, and Windows junctions.
+- Re-verify target paths upon opening to mitigate race conditions (TOCTOU).
+- Decouple secret read access from model provider transmission permissions.
+- Enforce resource quotas across CPU, memory, child processes, disk writes, and execution duration; disallow privilege escalation, host mounts, and Docker socket exposure.
+- Treat external scripts, MCP responses, README documentation, and code comments as untrusted data susceptible to prompt injection.
+- Execute with least-privilege service identities rather than inheriting full developer user environments.
 
-الخطة كيان محفوظ وليست فقرة دردشة فقط. تحتوي الهدف، معايير القبول، الملفات المتوقعة، الأدوات، البيانات الخارجة، الاختبارات، المخاطر، الاستثناءات وrollback.
+---
+
+## 9. Planning and Approval
+
+A Plan represents a persisted, auditable entity rather than transient conversational text. It encapsulates objectives, acceptance criteria, target files, tooling requirements, data egress parameters, verification checks, risk levels, and rollback procedures.
 
 ```yaml
 planVersion: 1
@@ -346,13 +359,15 @@ checks:
 risk: medium
 ```
 
-في الوضع البنكي الأول: قراءة وتحليل تلقائيان، ثم موافقة خطة قبل التعديل. لاحقًا يمكن اعتماد auto-edit للتغييرات الصغيرة المحددة بسياسة الفريق. لا نطلب نفس الموافقة مرارًا داخل النطاق؛ تغيّر ملفات محمية أو وجهة بيانات أو أثر خارجي يعيد التقييم.
+In initial enterprise deployments: read-only analysis proceeds automatically, followed by plan approval prior to code modification. Teams may subsequently enable auto-apply for low-risk changes under predefined policies. Approvals are not re-requested within approved scopes; modifications to protected files or external destinations trigger re-evaluation.
 
-اربط approval بهوية المستخدم، task، plan hash، نوع الفعل، args/targets، صلاحية زمنية وpolicy version. الموافقة على خطة تعديل لا تعني الإذن بالنشر أو push. العمليات الخارجية تعرض المحتوى والوجهة النهائية قبل تنفيذها.
+Approvals are cryptographically bound to user identity, task ID, plan hash, action type, target arguments, expiration timestamps, and policy versions. Approving a code change plan does not grant permission to push to remote repositories.
 
-## 10. Skills وتعليمات المستودع وHooks
+---
 
-Skills حزم معرفة إجرائية صغيرة، تُحمّل حسب الحاجة بدل system prompt ضخم:
+## 10. Skills, Repository Instructions, and Hooks
+
+Skills are modular, versioned packages of procedural knowledge loaded on demand, replacing oversized static system prompts:
 
 ```text
 skills/
@@ -367,13 +382,15 @@ skills/
   debugging/SKILL.md
 ```
 
-لكل skill: وصف ونطاق انطباق، version/hash، خطوات، references، ومعايير تحقق. سجّل سبب اختيارها. مثال: تعديل login response يحمّل Spring وsecurity وAPI compatibility، دون تحميل Kotlin إذا لم يكن له صلة.
+Each Skill specifies applicability criteria, version/hash, execution guidelines, reference links, and verification criteria. Selection rationales are recorded in the audit log. Example: modifying an authentication endpoint loads Spring, Security, and API Compatibility skills, excluding Kotlin if inapplicable.
 
-راجِع مصدر skill وأي scripts مرفقة بها، وثبّت إصدارات الحزم المعتمدة. Skills تقدم إرشادات؛ لا تمنح صلاحيات. اكتشاف تعليمات repo يكون من المسار الموثوق للأعلى/للملف حسب قواعد ثابتة ومعلنة، مع إظهار التعارض.
+Review skill sources and bundled scripts; pin trusted package versions. Skills provide contextual guidance; they do not grant permissions. Repository instructions are discovered hierarchically from trusted paths according to deterministic precedence rules.
 
-Hooks مثل `pre_tool`, `post_edit`, `pre_report` قد تنفذ فحصًا إضافيًا أو تحجب إجراءً. لا تسمح لـhook بتجاوز policy أو تنفيذ كود خارج sandbox. فشل hook أمني مطلوب يمنع الإكمال.
+Hooks (`pre_tool`, `post_edit`, `pre_report`) execute validation checks or intercept actions. Hooks cannot override security policies or execute un-sandboxed code. Failure of a mandatory security hook halts task execution.
 
-## 11. Verification loop
+---
+
+## 11. Verification Loop
 
 ```text
 Patch → Compile → Lint / Static checks → Unit tests
@@ -383,21 +400,23 @@ Patch → Compile → Lint / Static checks → Unit tests
                       └─ Failure → Diagnose → Bounded fix → Recheck
 ```
 
-حدد checks حسب نوع التغيير: تعديل DTO يحتاج API/serialization validation، وتعديل persistence يحتاج اختبارات معاملات أو تكامل ذات صلة. لا تستخدم production database؛ استخدم fixtures صناعية وبيئة اختبار معزولة.
+Tailor verification checks to the modification: DTO changes require serialization and API contract validation; persistence alterations require transactional or integration tests. Production databases are never utilized; isolated test environments and synthetic fixtures are mandatory.
 
-- التقط baseline checks ذات الصلة قبل التعديل حيث أمكن لتمييز الفشل القديم من الجديد.
-- اربط نتيجة كل check بنسخة الكود/hash التي اختُبرت؛ أي تعديل لاحق يبطل checks المتأثرة.
-- خزّن الأمر الفعلي والنتيجة وعدد الاختبارات والتقارير. Exit code صفر مع صفر tests قد لا يحقق المطلوب.
-- لا تسمح بالإصلاح عبر تعطيل test أو security rule أو تغيير assertion لإخفاء الفشل دون مبرر ومراجعة.
-- بعد 3 محاولات إصلاح افتراضية، أخرج partial/blocked مع آخر سبب وفارق الكود.
-- فشل تنزيل dependency أو غياب Docker لا يساوي فشل الكود ولا نجاحه؛ سجّل check على أنه غير منفذ.
-- Diff review يفحص scope creep، الأسرار، breaking changes، generated files والتغييرات غير المطلوبة.
+- Capture baseline test results prior to modifications to differentiate pre-existing defects from regressions.
+- Correlate test outcomes with specific code commits/hashes; subsequent edits invalidate affected checks.
+- Persist executed command strings, exit codes, test counts, and report files. Exit code 0 without executed tests does not constitute verification.
+- Prohibit repairing code by disabling tests, suppressing security rules, or weakening assertions without explicit justification and review.
+- Terminate with a partial/blocked status after 3 failed repair rounds, presenting diagnostic outputs and current diffs.
+- Tooling failures (missing Docker daemon, dependency download timeouts) are recorded as unexecuted checks rather than test passes or code failures.
+- Diff review inspects for scope creep, secrets, breaking API changes, and unexpected generated artifacts.
 
-نهاية كل مهمة: ما تغير، لماذا، الملفات، الاختبارات ونتائجها، checks غير المنفذة، المخاطر المتبقية وطريقة التراجع. لا توجد عبارة «تم التحقق» دون artifacts داعمة.
+Every completed task emits an empirical report: modifications made, rationale, modified files, test outputs, unexecuted checks, remaining risks, and rollback commands. Verification claims require backing artifacts.
 
-## 12. MCP كطبقة تكامل
+---
 
-Core tools محلية للبداية. أضف MCP Client لتكاملات GitLab/GitHub وJira وSonarQube وConfluence وواجهات البنك عند وجود حاجة وserver موثوق ومتاح؛ القائمة تصور تكاملات وليست ضمانًا لتوفر خوادمها.
+## 12. Model Context Protocol (MCP) as an Integration Layer
+
+Core filesystem and build tools remain built-in. MCP clients provide extensibility for GitLab/GitHub, Jira, SonarQube, Confluence, and internal enterprise services as reliable servers become available.
 
 ```text
 MCP Server discovery → Approved registry → Tool schema normalization
@@ -405,28 +424,29 @@ MCP Server discovery → Approved registry → Tool schema normalization
                    → Output validation / redaction → Agent context
 ```
 
-ثبت server identity ونسخته والأدوات المسموحة وschemas. تغيّر schema أو ظهور tool جديد يحتاج مراجعة. metadata مثل read-only وdestructive إشارات غير كافية لإثبات الأمان؛ نحن نصنف المخاطر بأنفسنا.
+Pin server identities, versions, allowed tools, and schemas. Schema alterations or newly introduced tools require administrative review. Server-reported metadata (e.g. read-only) provides advisory signals; the runtime independently evaluates policy risks.
 
-في local stdio يبدأ الـRuntime عملية محددة مع environment محدود. في remote transport استخدم الهوية والتفويض الملائمين للإصدار المختار، scopes دنيا، وتحقيق الوجهة. لا تمرر tokens بين خدمات دون تصميم تفويض صحيح، وامنع SSRF والوصول إلى metadata endpoints. [مرجع أمان MCP](https://modelcontextprotocol.io/docs/2025-11-25/tutorials/security/security_best_practices).
+For local stdio transports, spawn dedicated processes with sanitized environments. For remote transports, enforce authentication, least-privilege scopes, and destination validation. Mitigate SSRF vulnerabilities and block access to cloud metadata endpoints.
 
-لا نربط التصميم بادعاء أن إصدارًا معينًا هو «الأحدث». ثبّت protocol version متوافقًا مع client/server واختبر negotiation وtimeouts والإلغاء وتغير الأدوات. فشل MCP اختياري لا يعطّل الأدوات الأساسية؛ تعذر دليل تحقق مطلوب يمنع إعلان نجاح المهمة.
+Pin protocol versions compatible across client and server implementations; test negotiation, timeouts, cancellation, and tool schema evolution. Failures in optional MCP tools must not impair core agent operations; unexecuted verification checks prevent claiming task completion.
 
-## 13. Online / Offline deployment profiles
+---
 
-| البند | Air-gapped | Bank on-prem | Online controlled |
-|---|---|---|---|
-| inference | محلي داخل البيئة المعزولة | خادم داخلي معتمد | مزود سحابي عبر gateway معتمد |
-| الشبكة | لا مسارات خارج المنطقة؛ loopback فقط إذا كان inference محليًا | allowlist داخلية دون إنترنت | egress محدود إلى جهات معتمدة |
-| dependencies | حزم وimages مجهزة مسبقًا | artifact mirror داخلي | mirror معتمد وتنزيلات بسياسة |
-| MCP | محلي داخل المنطقة | خوادم داخلية محددة | خوادم محددة لكل تكامل |
-| embeddings | محلية أو معطلة | داخلية | تخضع لتصنيف البيانات نفسه |
-| telemetry | محلية فقط | منصة البنك | منقحة ووجهتها معتمدة |
-| fallback cloud | ممنوع | ممنوع افتراضيًا | فقط ضمن سياسة صريحة |
+## 13. Online / Offline Deployment Profiles
 
-Offline ليس مجرد تغيير model URL. يشمل package registries وtokenizers وmodel weights وlicense checks وtelemetry وcrash reporting وMCP وDNS. حتى شبكة on-prem ليست air gap كاملًا.
+| Dimension | Air-Gapped Environment | Enterprise On-Premises | Controlled Online |
+| :--- | :--- | :--- | :--- |
+| **Inference** | Local within isolated perimeter | Internal enterprise model server | Approved cloud provider via secure gateway |
+| **Network** | Zero outbound routing; loopback only for local inference | Internal allowlist; no public internet | Egress restricted to approved endpoints |
+| **Dependencies** | Pre-bundled packages and container images | Internal artifact mirrors (Nexus/Artifactory) | Approved mirrors with policy-governed downloads |
+| **MCP** | Local within secure zone | Internal enterprise servers | Scoped servers per integration |
+| **Embeddings** | Local or disabled | Internal services | Subject to data classification policies |
+| **Telemetry** | Local storage only | Enterprise telemetry platform | Redacted and sent to approved collectors |
+| **Cloud Fallback** | Strictly prohibited | Disabled by default | Permitted only under explicit policy |
 
-مثال schema مقترح يطبقه تطبيقنا، وليس ملف إعداد جاهزًا لمكتبة خارجية:
+Offline deployments encompass package registries, tokenizers, model weights, license validations, telemetry, crash reporting, MCP endpoints, and DNS resolution. On-premises networks are not automatically air-gapped.
 
+Proposed Configuration Schema:
 ```yaml
 profile: bank-onprem
 model:
@@ -453,11 +473,13 @@ policy:
   planApproval: required
 ```
 
-حل `*Ref` من registry يديره المسؤول. لا تُخزن tokens في YAML. في profile الهواء المعزول استبدل الخدمات بموارد محلية وجهّز dependencies والـJDK والـbuild plugins مسبقًا. نفّذ اختبار تشغيل من صورة نظيفة مع قطع egress على مستوى الشبكة، وأثبت أن التحقق لا يعتمد على cache شخصي مجهول.
+Resolve references (`*Ref`) through an administrator-managed registry. API tokens are never stored in plain YAML configuration files. In air-gapped profiles, pre-bundle dependencies, JDKs, and build plugins. Validate execution from clean container images with network egress severed at the infrastructure level.
 
-التشغيل الأول: CLI على جهاز المطور مع worker معزول وmodel server محلي أو داخلي. عند المشاركة: Python API/control plane + PostgreSQL للحالة + artifact store داخلي + workers مؤقتة لكل مهمة وهوية. Kubernetes اختياري إذا كان منصة البنك المعتمدة، وليس شرطًا للـMVP.
+Initial deployment: Local CLI on developer workstations with isolated worker processes and local/internal model servers. Multi-user deployment: Python API control plane + PostgreSQL state storage + internal artifact cache + ephemeral per-task workers. Kubernetes orchestration remains optional based on organizational standards.
 
-## 14. هيكل المشروع المقترح
+---
+
+## 14. Target Codebase Structure
 
 ```text
 ai-code-engineer/
@@ -476,158 +498,169 @@ ai-code-engineer/
     mcp/                          # Client and approved registry
     memory/                       # Events, checkpoints, recovery
     worker/                       # Isolated execution and cancellation
-    cli/                          # First user interface
-    server/                       # Optional API/events for team use
+    cli/                          # Console interface
+    server/                       # WebApp control plane and API
   skills/                         # SKILL.md packages
-  policies/                       # Permission/command/path rules
-  profiles/                       # Offline/on-prem/online references
+  policies/                       # Permission, command, and path rules
+  profiles/                       # Offline, on-prem, and online presets
   tests/
     unit/
     contract/                     # Provider and tool contracts
     integration/
     security/
-  evals/                          # Representative tasks and rubrics
-  docs/                           # ADRs, threat model, runbooks
+  evals/                          # Representative benchmarks and rubrics
+  docs/                           # Architecture decision records, specifications
 ```
 
-نثبت إصدار Python المدعوم وإصدارات الحزم في ملف قفل عند بدء التنفيذ، ونجهز wheelhouse للاستخدام المعزول. أدوات JDK/Maven/Gradle تخص بيئة اختبار المستودع المستهدف، وليست build system للـAgent نفسه.
+Pin supported Python and package versions via lockfiles; maintain wheels for offline deployment. JDK, Maven, and Gradle installations belong to the target project testing environment rather than the agent's build system.
 
-المجلدات حدود منطقية؛ يمكن دمج modules الصغيرة في MVP. اتجاه dependencies: applications/adapters → core → domain. الـCore يعتمد على interfaces ولا يستورد classes خاصة بمزود نموذج. يبقى التحقق من السياسة على مسار كل استدعاء فعلي، حتى إذا وفرت مكتبة AI تنفيذ tools تلقائيًا.
+Directory boundaries establish logical decoupling. Dependency flow: applications/adapters → core orchestration → domain models. Core logic relies on abstract interfaces rather than concrete provider SDKs. Policy enforcement intercepts all tool invocations regardless of underlying automation libraries.
 
-واجهات خدمة مقترحة: إنشاء task، قراءة الحالة/events، قراءة plan/diff، إرسال approval محدد، cancel، والحصول على artifacts. طبّق authorization على كل task/artifact، لا على تسجيل الدخول فقط.
+API Endpoints: Task creation, status/event streaming, plan/diff inspection, scoped approval submission, cancellation, and artifact retrieval. Authorization is enforced across individual tasks and artifacts.
 
-## 15. Workflow عملي: validation لتحويل بنكي
+---
 
-**الطلب:** «أضف رفض المبلغ صفرًا أو السالب في Transfer API دون تغيير error contract».
+## 15. Practical Workflow: Bank Transfer Validation
 
-1. يتحقق agent من workspace والتغييرات الحالية ثم يقرأ TransferController وTransferRequest وservice والاختبارات.
-2. يحمل skills الخاصة بـJava/Spring/testing/API compatibility.
-3. يكتشف نمط Bean Validation وglobal exception handler الموجود، بدل اختراع نمط جديد.
-4. يعرض خطة: تعديل validation على DTO، اختبارات zero/negative/valid ومراجعة null حسب العقد الحالي، مع التأكد من عدم استدعاء service للطلب غير الصالح.
-5. بعد الموافقة، يطبق patch محميًا بالـhash داخل worktree/sandbox معزول.
-6. يشغّل compile والاختبارات المحددة، يقرأ تقارير الفشل، ويصلح ضمن الميزانية.
-7. يشغّل contract checks المطلوبة ويفحص diff والأسرار.
-8. يعرض patch ونتائج فعلية. إنشاء branch أو PR أو push يتم فقط إذا كان مصرحًا ضمن workflow المستخدم.
+**Task Prompt:** *"Reject zero and negative transfer amounts in Transfer API while preserving existing error contract."*
 
-**مثال التشفير المذكور في المحادثة:** عند طلب تشفير login response يبدأ العمل بتحديد threat model والعقد مع العملاء وإدارة المفاتيح وسبب الحاجة فوق TLS. وجود `CryptoUtil` لا يكفي لإثبات سلامته. نستخدم مكونات تشفير معتمدة بعد المراجعة، ونختبر التوافق وتدوير المفاتيح ومعالجة الأخطاء وعدم تسريب plaintext. لا يبتكر الـAgent خوارزمية تشفير أو يدّعي أن إضافة encrypted fields وحدها تحقق الأمان.
+1. **Intake & Discovery:** The agent inspects the workspace and active changes, analyzing `TransferController`, `TransferRequest`, services, and existing tests.
+2. **Skill Ingestion:** Ingests Java, Spring, Testing, and API Compatibility skills.
+3. **Pattern Recognition:** Identifies existing Bean Validation annotations and global `@ControllerAdvice` exception handlers, avoiding custom ad-hoc error structures.
+4. **Planning:** Emits a plan: add validation constraints to DTO, add unit/integration tests covering zero, negative, valid, and null amounts, and verify that services are not invoked on invalid requests.
+5. **Approval:** Upon user approval, applies cryptographic hash-locked patches within an isolated worktree/sandbox.
+6. **Verification & Repair:** Executes compilation and focused test suites, analyzes failure reports, and performs bounded repairs within budget.
+7. **Quality Audit:** Executes contract tests, inspects diffs, and verifies secret redaction.
+8. **Completion:** Presents unified diffs and empirical test proofs. Git branching or PR generation occurs only under authorized developer commands.
 
-## 16. Git وrollback وحماية عمل المطور
+**Cryptographic Hardening Note:** Requests involving sensitive cryptographic operations (e.g. payload encryption) require formal threat modeling, key management lifecycles, and TLS layer evaluations. Agents utilize approved cryptographic libraries rather than implementing custom algorithms.
 
-- سجّل baseline commit وdirty files قبل التنفيذ. لا تمسح uncommitted changes للمستخدم.
-- يفضل worktree لكل مهمة؛ التغييرات غير المحفوظة لا تنتقل تلقائيًا، لذلك حدد snapshot صراحة إذا كانت جزءًا من الطلب.
-- احفظ patches وfile hashes قبل وبعد التعديل. Rollback يعكس تغييرات المهمة فقط بعد فحص عدم وجود تعديل لاحق متعارض.
-- لا تستخدم reset/clean واسعًا كطريقة إصلاح. عند التعارض توقف وقدم الملفات المعنية.
-- rollback المحلي لا يعكس آثارًا خارجية؛ push أو تحديث issue يحتاج إجراء تعويض مستقل ومصرح.
+---
 
-## 17. Roadmap بمخرجات قابلة للقبول
+## 16. Git, Rollback, and Preserving Developer Work
 
-ننقل أساس السياسة والعزل إلى البداية بدل تأجيلهما لما بعد التنفيذ. باقي محاور الخطة الأصلية محفوظة ومجمعة لتكوين مراحل قابلة للتسليم.
+- Record baseline commits and dirty file states prior to execution. Never clobber uncommitted developer modifications.
+- Isolate task execution within dedicated git worktrees; uncommitted changes are not migrated automatically without explicit instruction.
+- Record file patches and SHA-256 digests before and after modification. Rollback operations revert task-specific edits after confirming no conflicting subsequent edits exist.
+- Prohibit indiscriminate `git reset --hard` or `git clean -fd` as recovery mechanisms. If conflicts arise, halt and present affected files.
+- Local rollback cannot reverse external side effects (remote pushes, ticket updates); compensatory actions require distinct authorized workflows.
 
-| المرحلة | التنفيذ | بوابة الخروج |
-|---|---|---|
-| 0 — Foundation | threat model، scope، data classification، worker isolation، read-only CLI، baseline eval set | منع الخروج من workspace وegress غير المصرح في اختبارات فعلية |
-| 1 — Providers & tools | model SPI، Ollama adapter، OpenRouter adapter على كود تجريبي، typed tool registry | نفس سيناريو tool calling يمر عبر العقود لكل مزود، ورفض malformed calls؛ تثبيت نموذجين سحابيين بعد تقييمهما |
-| 2 — Agent loop | state machine، budgets، events، cancellation، limited tools | مهمة صغيرة end-to-end واستئناف آمن بعد interruption |
-| 3 — Context | repo map، search، Java/Spring metadata، token budgets | استرجاع ملفات وأماكن التعديل الصحيحة في benchmark مع تكلفة سياق مقاسة |
-| 4 — Plan & edit | خطة/موافقة، scoped patching، worktree، diff/rollback | لا تعديل خارج النطاق، وحماية edits المستخدم |
-| 5 — Verify & repair | build/test/lint/security recipes، bounded repair | bug-fix fixtures تتحقق؛ timeout/missing tests لا ينتجان نجاحًا زائفًا |
-| 6 — Skills & policy hardening | skill routing، trusted packages، hooks، adversarial cases | prompt injection لا يوسع permissions، والموافقة لا يعاد استخدامها خارج نطاقها |
-| 7 — MCP | registry، auth، tool normalization، audit | server غير معتمد أو tool متغيرة تُحجب، وفشل التكامل يُعالج بوضوح |
-| 8 — Deployment profiles | offline packaging، internal mirrors، online egress gateway | تشغيل offline من بيئة نظيفة دون اتصالات خارجية؛ اختبار منع تسرب cloud |
-| 9 — Team pilot | Web/IDE، SSO/RBAC، metrics، operational runbooks | نجاح تجريبي وفق عتبات محددة مسبقًا ومراجعة بشرية للتغييرات |
-| 10 — Scale | tuning، caching، queues، optional sub-agents | تحسن مثبت في الجودة أو الزمن دون تراجع العزل أو تضاعف تكلفة غير مبرر |
+---
 
-ابدأ بـvertical slice واحد: قراءة مشروع Spring صغير → خطة → تعديل validation → tests → diff، داخل sandbox. لا تبدأ بكل integration أو vector store أو multi-agent. إذا أضفنا sub-agents لاحقًا فلكل منها scope وbudget وأدوات محدودة، وتظل السياسة المركزية مطبقة وتمنع تعارض الكتابة.
+## 17. Roadmap with Acceptance Deliverables
 
-ترتيب أول backlog: domain contracts → sandbox/policy deny-default → read tools → provider adapter → task loop → scoped patch → verification → durable recovery → repo map → approved external integrations.
+Core security policies and sandboxed execution are prioritized at the foundation rather than deferred.
 
-## 18. التقييم والمراقبة والتشغيل
+| Phase | Core Deliverables | Exit Gate / Acceptance Criteria |
+| :--- | :--- | :--- |
+| **0 — Foundation** | Threat model, scope boundaries, data classification, worker isolation, read-only CLI, baseline evals | Proven blocking of workspace escapes and unauthorized egress in automated tests |
+| **1 — Providers & Tools** | Model SPI, Ollama adapter, OpenRouter adapter, typed tool registry | Identical tool-calling scenarios pass across providers; malformed calls rejected; 2 cloud models benchmarked |
+| **2 — Agent Loop** | State machine, resource budgets, event streaming, cancellation, basic tool suite | Small end-to-end task completion and safe recovery after process interruption |
+| **3 — Context Engine** | Repository map, lexical search, Java/Spring metadata, token budgeting | Correct retrieval of target files and edit sites on benchmark tasks under measured budgets |
+| **4 — Plan & Edit** | Plan schemas, user approval gates, scoped patching, worktrees, rollback | Zero out-of-scope edits; developer uncommitted work preserved |
+| **5 — Verify & Repair** | Build/test/lint/security recipes, JUnit parsing, bounded repair loop | Bug-fix benchmarks verified; timeouts/missing tests do not emit false passes |
+| **6 — Skills & Policy** | Skill routing, versioned packages, execution hooks, adversarial injection tests | Prompt injection cannot expand permissions; approvals cannot be replayed across targets |
+| **7 — MCP Integration** | Server registry, authentication, tool normalization, audit logging | Unapproved servers and schema drift blocked; integration failures handled gracefully |
+| **8 — Deployment Profiles** | Offline packaging, internal mirrors, egress proxy configuration | Offline execution validated on clean environment without external network calls; cloud leak prevention verified |
+| **9 — Team Pilot** | Web/IDE interfaces, SSO/RBAC, operational metrics, incident runbooks | Pilot acceptance criteria satisfied; human review required for all applied changes |
+| **10 — Scale & Evolution** | Performance tuning, caching, task queuing, optional specialized subagents | Measurable improvements in quality or latency without compromising sandbox isolation or multiplying costs |
 
-أنشئ corpus أوليًا من 20–30 مهمة منزوعة الحساسية: validation، regression fix، refactor محدود، إضافة test، تغيير Kotlin إن وجد، وفشل build سابق. أضف مهام عدائية منفصلة لاختبار المسارات والـprompt injection وتسريب البيانات.
+Development commences with a single vertical slice: reading a Spring Boot project → proposing a plan → patching validation logic → running tests → inspecting diffs within a sandbox. Multi-agent swarms and complex vector databases are deferred until core reliability is established.
 
-قارن configurations على نفس baseline وبنفس معايير القبول، مع تكرار المهام لقياس تفاوت النتيجة. لا تستخدم إجابة model judge وحدها؛ اجمع اختبارات مستقلة ومراجعة diff بشرية. اختيار النموذج مبني على نجاح التغيير لا جمال الشرح.
+---
 
-المقاييس: نسبة قبول المهام، نسبة نجاح الاختبارات، regressions، tools denied، approval frequency، repair count، context size، زمن المهمة p50/p95، token/cost، ومقدار تعديل الإنسان بعد التسليم. ضع عتبات مناسبة مع الفريق قبل pilot؛ لا توجد أرقام نجاح مضمونة من هذه الخطة.
+## 18. Evaluation, Observability, and Operations
 
-Audit event يحتوي actor/task/tool ونسخة السياسة والقرار والوقت والمدة ومرجع artifacts؛ يُنقح قبل التخزين. لا تسجل raw prompts أو source code أو tokens افتراضيًا. ضع retention وaccess controls وسجلات مقاومة للعبث، مع فصل بيانات المشاريع. استرجاع logs أو memory لا يتجاوز صلاحيات المستخدم الحالية.
+Establish an initial benchmark corpus of 20–30 sanitized enterprise tasks: input validation, regression fixes, targeted refactoring, test additions, Kotlin interop, and build failure remediation. Incorporate adversarial test cases evaluating prompt injection, path traversal, and data exfiltration.
 
-جهّز runbooks لفشل inference، امتلاء القرص، worker عالق، انقطاع artifact mirror، فشل الاستئناف وحادثة تسرب. وفر kill switch يوقف التنفيذ والـegress، وخطة نشر تدريجي وتراجع لإصدارات runtime/model/policy/skills.
+Benchmark configurations against identical baselines and acceptance rubrics, executing multiple runs to measure variance. Do not rely solely on automated LLM-as-a-judge evaluations; combine deterministic test suite outcomes with human code review.
 
-## 19. Security considerations
+Key Operational Metrics: Task acceptance rate, test pass rate, regression frequency, denied tool invocations, approval frequency, repair round distribution, context token consumption, p50/p95 task duration, cost per task, and post-delivery human modification volume.
 
-| التهديد | التحكم المطلوب | دليل التحقق |
-|---|---|---|
-| Prompt injection في repo/docs/tool result | فصل الثقة، سياسة خارج النموذج، عدم تنفيذ نص حر | fixture تطلب تسريبًا وتُحجب |
-| تسريب source/secrets للـcloud | classification، تصفية السياق، egress gateway، منع fallback | اختبارات منع upload واتصالات غير مسموحة |
-| قراءة خارج workspace | canonical paths، منع links/mount escapes، قيود نظام التشغيل | traversal وjunction/symlink tests |
-| build أو test خبيث | worker منخفض الصلاحيات وحدود موارد وشبكة | محاولة قراءة host secret أو إنشاء child process خارج السياسة |
-| MCP server أو skill مخترق | registry موثوق، تثبيت versions/hashes، scopes محدودة | schema drift وserver غير معتمد محجوبان |
-| اعتماديات ونماذج ملوثة | مصدر معتمد، integrity checks، SBOM، vulnerability/license review | تثبيت قابل للتكرار وقائمة مكونات معتمدة |
-| إعادة استخدام approval | ربطها بالخطة والفعل والوجهة والمدة | تبديل target/args يبطل الموافقة |
-| فساد edits أو تعارضها | expected hashes، قفل لكل workspace، checkpoint | concurrent edit لا يُكتب فوقه |
-| عبور مستخدم/مشروع لآخر | authorization لكل artifact وcache namespace | اختبارات cross-tenant access |
-| نجاح مزيف | verifier حتمي وتقارير مرتبطة بـcode hash | tests المتخطاة أو القديمة لا تحقق بوابة الإكمال |
+Audit Logging: Events record actor, task ID, tool identifier, policy version, decision, timestamp, duration, and artifact references. Raw prompts, source code, and secrets are redacted prior to storage. Enforce access controls and retention policies with project isolation.
 
-الـOffline يقلل خروج البيانات لكنه لا يمنع كودًا خبيثًا أو إساءة الصلاحيات. Secret scanning طبقة مساعدة وليس ضمانًا؛ لا تدخل secrets إلى سياق الموديل من الأصل. البيانات الاختبارية صناعية، وأي استثناء لبيانات حقيقية يخضع لمسار المؤسسة خارج صلاحيات الـAgent الافتراضية.
+Operational Runbooks: Prepare runbooks covering inference outages, disk exhaustion, stuck workers, artifact mirror disconnections, failed resumes, and exfiltration incidents. Implement global kill switches to sever execution and network egress instantly.
 
-الخطة ليست شهادة امتثال. يحدد فريق أمن البنك الضوابط التنظيمية ذات الصلة وتصنيف البيانات والموردين المقبولين وretention، ويعتمد التهديدات المتبقية قبل التوسع.
+---
+
+## 19. Security Considerations
+
+| Threat Vector | Required Mitigation | Verification Proof |
+| :--- | :--- | :--- |
+| **Prompt Injection via repo/docs/tools** | Decoupled trust zones, deterministic policy enforcement, no raw text execution | Injection fixtures attempting exfiltration are blocked |
+| **Source / Secret Exfiltration to Cloud** | Data classification, context sanitization, egress gateway, no silent fallback | Automated tests verifying blocking of unauthorized uploads |
+| **Filesystem Traversal outside Workspace** | Canonical path resolution, symlink/junction rejection, OS-level constraints | Traversal and junction escape test suites pass |
+| **Malicious Build or Test Scripts** | Least-privilege workers, resource quotas, severed network access | Attempts to access host secrets or spawn unauthorized processes fail |
+| **Compromised MCP Server or Skill** | Approved server registry, cryptographic hash pinning, minimal scopes | Schema drift and unapproved server connections blocked |
+| **Tainted Dependencies and Models** | Approved internal repositories, integrity checks, SBOMs, vulnerability scans | Reproducible clean builds from verified package mirrors |
+| **Replay of Prior User Approvals** | Approval cryptographically bound to plan hash, action, target, and expiration | Altering target arguments invalidates approval |
+| **Corrupted or Conflicting Edits** | Pre-write expected file hashes, per-workspace file locks, checkpoint commits | Concurrent external edits reject overwrite |
+| **Cross-Tenant / Cross-Project Leakage** | Explicit authorization per artifact and isolated cache namespaces | Cross-tenant access test suites pass |
+| **False Completion Claims** | Deterministic verifier requiring fresh test reports bound to code hash | Skipped tests or exit code 0 without tests reject completion |
+
+Offline operation reduces external exfiltration risks but does not eliminate malicious code execution. Secret scanning provides defense in depth; secrets should never be loaded into context. Test data must be synthetic; production data requires out-of-band enterprise authorization.
+
+---
 
 ## 20. Production Definition of Done
 
-### جاهزية الـRuntime
+### Runtime Readiness Checklist
 
-- [ ] العقود منفصلة عن provider وتم اجتياز contract tests لكل configuration منشورة.
-- [ ] السياسة deny-default وتُطبق على built-in tools وMCP وhooks وخروج بيانات الموديل.
-- [ ] العزل مثبت باختبارات هروب وegress؛ worker لا يحمل credentials إنتاجية.
-- [ ] الموافقات محددة ومسجلة ولا تتسع أو تتكرر خارج نطاقها.
-- [ ] cancel وtimeout وrestart/recovery لا يسببون replay غير آمن.
-- [ ] edits المستخدم محمية وrollback محدد ويمكن اختباره.
-- [ ] لا اكتمال ناجح مع check مطلوب فاشل أو غير منفذ.
-- [ ] offline يعمل من installation package نظيفة مع dependencies مجهزة ومصدرها معلوم.
-- [ ] online يستخدم جهات معالجة بيانات معتمدة مع ضوابط واضحة.
-- [ ] عزل المستخدمين والمشاريع وartifacts والذاكرة مختبر.
-- [ ] logs منقحة، retention محدد، audit متاح للمخولين.
-- [ ] evals ممثلة اجتازت العتبات المتفق عليها، مع مراجعة جودة بشرية.
-- [ ] vulnerability/license checks وSBOM وتثبيت الإصدارات ضمن release pipeline.
-- [ ] SLOs ودعم وتشغيل وkill switch وخطة incident response معتمدة.
+- [ ] Core contracts decoupled from providers; contract test suites pass across all deployment configurations.
+- [ ] Policy engine defaults to deny, governing built-in tools, MCP adapters, hooks, and model egress.
+- [ ] Sandboxed isolation validated via container escape and network egress tests; workers carry zero production credentials.
+- [ ] Approvals are scoped, auditable, and non-reusable across targets.
+- [ ] Cancellation, timeouts, and restart recovery prevent unsafe state replay.
+- [ ] Developer uncommitted changes are protected; rollback is deterministic and testable.
+- [ ] Task completion requires all mandatory verification checks to pass.
+- [ ] Offline profile operates from clean packages with pre-bundled dependencies and verified provenance.
+- [ ] Online profile routes exclusively through approved enterprise gateways with data controls.
+- [ ] Project, user, artifact, and memory isolation are validated.
+- [ ] Audit logs are redacted, retention policies enforced, and records accessible to authorized reviewers.
+- [ ] Benchmark evaluations meet target accuracy thresholds with human review.
+- [ ] Vulnerability scans, license audits, and SBOM generations integrated into release pipelines.
+- [ ] SLOs, support runbooks, emergency kill switches, and incident response procedures approved.
 
-### اكتمال كل مهمة تطوير
+### Task Completion Checklist
 
-- [ ] الهدف ومعايير القبول واضحان والخطة ضمن الصلاحيات.
-- [ ] التغيير محدود ومراجع ولا يحتوي أسرارًا أو scope creep.
-- [ ] build/tests/checks المطلوبة ناجحة على النسخة النهائية نفسها.
-- [ ] القيود والفحوص غير المنفذة معلنة؛ إذا كانت إلزامية فالحالة غير مكتملة.
-- [ ] diff والأدلة وملخص الأثر وطريقة التراجع متاحة للمطور.
-- [ ] أي نشر أو أثر خارجي تم عبر مسار مصرح ومحدد.
+- [ ] Task objective and acceptance criteria clearly defined; plan operates within authorized scope.
+- [ ] Code modifications are targeted, reviewed, and free of secrets or scope creep.
+- [ ] Mandatory build, lint, and test checks pass on final patched code.
+- [ ] Unexecuted checks and limitations are explicitly reported; incomplete mandatory checks block completion.
+- [ ] Unified diffs, empirical test evidence, impact summaries, and rollback instructions provided to developer.
+- [ ] External actions (push, PR creation) occur only through authorized explicit commands.
 
-## 21. مراجع التنفيذ
+---
 
-مصدر نطاق الخطة هو محادثة «ترحيب ودي». المراجع التالية تدعم التفاصيل التقنية المرتبطة بها، وليست اعتمادًا لكل اختيارات هذه المعمارية:
+## 21. Implementation References
 
-1. [Spring AI Reference](https://docs.spring.io/spring-ai/reference/) — abstractions وتكاملات JVM.
-2. [OpenAI Function Calling](https://developers.openai.com/api/docs/guides/function-calling) — دورة tool calls ونتائجها.
-3. [Ollama Tool Calling](https://docs.ollama.com/capabilities/tool-calling) — تشغيل الأدوات مع النماذج الداعمة.
-4. [Aider Repository Map](https://aider.chat/docs/repomap.html) — اختيار سياق عبر خريطة رموز المستودع.
-5. [MCP Security Best Practices](https://modelcontextprotocol.io/docs/2025-11-25/tutorials/security/security_best_practices) — اعتبارات أمان التكامل والتفويض.
+The scope originates from initial architecture alignment discussions. The following technical specifications support implementation details:
 
-## 22. تحديث معتمد: Cloud مجاني داخل التول
+1. [Spring AI Reference](https://docs.spring.io/spring-ai/reference/) — Abstractions and JVM ecosystem integrations.
+2. [OpenAI Function Calling](https://developers.openai.com/api/docs/guides/function-calling) — Tool invocation lifecycles and structured outputs.
+3. [Ollama Tool Calling](https://docs.ollama.com/capabilities/tool-calling) — Native tool invocation on local open models.
+4. [Aider Repository Map](https://aider.chat/docs/repomap.html) — Context selection via structural symbol graphs.
+5. [MCP Security Best Practices](https://modelcontextprotocol.io/docs/2025-11-25/tutorials/security/security_best_practices) — Integration security and delegated authorization.
 
-هذا القسم يعتمد آخر إضافة في الشات القديم، ويحدد نطاق أول إصدار: **Python + Ollama Local + OpenRouter**. نخدم عدة cloud models عبر محول OpenRouter واحد، ونؤجل التكامل المباشر مع Gemini وGroq وغيرهما.
+---
 
-### اختيار الموديل
+## 22. Approved Update: Integrated Cloud Tiers
 
-تقدم التول ثلاثة اختيارات، مع بقاء الـAgent Core مستقلًا عن المزود:
+This section incorporates the initial provider baseline: **Python + Local Ollama + OpenRouter**. We interface multiple cloud models through a unified OpenRouter adapter, deferring direct custom SDK integrations for Gemini, Groq, and others until necessary.
 
-| الاختيار | الاستخدام |
-|---|---|
-| `local` | نموذج محلي معتمد عبر Ollama؛ الافتراضي للكود البنكي |
-| `cloud-free` | نموذج مجاني محدد ومختبر عبر OpenRouter، لكود تجريبي مسموح |
-| `cloud-auto` | `openrouter/free` لاستكشاف النماذج على بيانات عامة أو صناعية |
+### Model Tiers
 
-وثائق OpenRouter تؤكد أن `openrouter/free` يختار نموذجًا مجانيًا عشوائيًا من النماذج المتاحة المتوافقة مع خصائص الطلب مثل tool calling. لذلك نستخدم نموذجًا محددًا لاختبارات المقارنة القابلة للتكرار، ونسجل الموديل الذي خدم كل رد عند استخدام الوضع التلقائي. [Free Models Router](https://openrouter.ai/docs/guides/routing/routers/free-router).
+The tool exposes three operational tiers, maintaining agent core independence:
 
-مثال إعدادات لتطبيقنا؛ قيم `modelRef` أسماء داخل registry وليست model IDs جاهزة للإرسال:
+| Tier | Primary Use Case |
+| :--- | :--- |
+| `local` | Approved local models via Ollama; default for enterprise codebases |
+| `cloud-free` | Specific, benchmarked free cloud models via OpenRouter for non-sensitive code |
+| `cloud-auto` | `openrouter/free` router for exploratory evaluation on public or synthetic data |
 
+OpenRouter documentation indicates that `openrouter/free` dynamically routes across available free endpoints matching request parameters (such as tool calling). Consequently, reproducible benchmark evaluations require pinning specific model identifiers, logging the serving model for each generation turn.
+
+Configuration Example:
 ```yaml
 models:
   local:
@@ -651,40 +684,40 @@ routing:
     - local
 ```
 
+CLI Interface Example:
 ```text
 agent --model local
 agent --model cloud-free
 agent --model cloud-auto
 ```
 
-خيارات CLI وإعدادات YAML عقد مقترح للتنفيذ وليست أوامر أداة مبنية بالفعل. تعرض واجهة الاختيار الاسم الفعلي، المزود، قدرات الأدوات، وسياسة البيانات؛ الاختيار لا يغير صلاحيات المهمة.
+The selection interface displays model name, provider, tool capabilities, and data policy; selecting a model does not alter task permissions.
 
-### Fallback وحدود الاستخدام
+### Fallback Rules and Quota Management
 
-مسار التجربة: نموذج مجاني أساسي → بديل مجاني معتمد → Ollama محلي. يطبق الـRuntime هذا المسار على أخطاء التوفر أو rate limit المؤقتة فقط، مع retry محدود واحترام تعليمات الانتظار من المزود. بلوغ quota مشتركة قد يؤثر على جميع النماذج المجانية؛ تغيير النموذج لا يضمن استعادة الخدمة. [Limits](https://openrouter.ai/docs/api_reference/limits).
+Operational Fallback Chain: Primary Free Model → Approved Secondary Free Model → Local Ollama. The runtime triggers this fallback strictly upon availability errors or rate limits, applying bounded retries and respecting provider `Retry-After` headers. Shared upstream quotas may affect multiple free endpoints simultaneously; switching models does not guarantee immediate availability.
 
-قبل التحويل افحص السياسة وtool capabilities وحجم السياق، ثم أعد بناء request من الحالة المحفوظة بالصيغة المناسبة للمزود الجديد. لا تُعد تشغيل أداة نُفذت بالفعل. أخطاء credentials أو رفض السياسة تتوقف بتفسير واضح؛ ولا نتحول إلى نموذج مدفوع تلقائيًا. لا انتقال من offline إلى cloud، ويُعرض أي تبديل للموديل في سجل المهمة.
+Prior to fallback transitions, verify policy compliance, tool capabilities, and context limits, rebuilding request payloads from persisted state for the target provider. Never re-execute side-effecting tools that already succeeded. Authentication failures or policy denials halt execution with clear diagnostic messages; automatic transitions to paid endpoints are prohibited. Offline profiles never fall back to cloud endpoints.
 
-الميزانية المجانية تحد استدعاءات الموديل، لا عدد المهام المكتملة؛ مهمة agent واحدة قد تحتاج استدعاءات عديدة. نخزن limits كإعدادات قابلة للتحديث ونراقب الاستهلاك، ولا نبني سلوك التطبيق على عدد ثابت للنماذج أو requests/day.
+Free quotas govern model calls rather than complete task outcomes; a single coding task may require multiple turns. Monitor usage metrics and decouple behavior from hardcoded daily quotas.
 
-### اختيار النماذج للـPOC
+### Model Evaluation for POC
 
-الأسماء التي طُرحت في آخر رسالة قديمًا — North Mini Code، Laguna S 2.1، Nemotron 3 Ultra، وNemotron 3.5 Lightning — **مرشحات وردت في المحادثة وليست قائمة توفر معتمدة في هذه الوثيقة**. لا نعتمد model IDs أو context sizes المذكورة قبل التحقق من الكتالوج والصفحة الرسمية لكل نموذج وقت التنفيذ.
+Model candidates discussed in early planning (e.g. specialized coding checkpoints) represent illustrative exploratory candidates. Specific model identifiers and context capacities are validated directly against current provider catalogs during implementation.
 
-خطوة التنفيذ التالية ضمن مرحلة providers: تكوين shortlist من 5–7 نماذج مجانية متاحة بالفعل، أو أقل إذا لم تتوفر خيارات تستوفي الشروط، ثم اختيار أساسي واحتياطي بناءً على:
+Model Selection Criteria:
+1. Verified free API availability and validated tool-calling accuracy in contract tests.
+2. Code generation quality on Java/Spring tasks: Bean Validation, bug fixing, test authorship, and multi-file editing.
+3. Patch success rates, test pass rates, generation latency, effective context window, and endpoint stability.
+4. Provider data handling terms, retention policies, and training opt-outs.
+5. Successful completion of the same policy and contract tests applied to local models.
 
-1. توفر API مجاني فعلي ودعم tool calling صالح في اختباراتنا.
-2. جودة مهام Java/Spring: validation، bug fixing، اختبارات، وتعديل عدة ملفات.
-3. معدل نجاح patches والاختبارات، latency، context الفعلي، واستقرار التوفر.
-4. شروط معالجة البيانات والاحتفاظ والتدريب لكل provider route.
-5. اجتياز نفس policy/contract tests المستخدمة للموديل المحلي.
+Benchmark results are recorded with measurement timestamp, model ID, and active provider route. Large nominal context windows alone do not guarantee agent suitability.
 
-تُحفظ النتائج بتاريخ القياس وmodel ID وprovider الفعلي. لا نعتبر اتساع context وحده دليل جودة أو ملاءمة للـAgent.
+### Data Isolation between Free Tiers and Enterprise Code
 
-### فصل تجربة المجاني عن كود البنك
+Cloud free tiers are restricted to experimental repositories and public or synthetic datasets. Data processing terms vary across providers, and OpenRouter privacy configurations must be evaluated alongside inference provider terms.
 
-Cloud free في المرحلة الأولى مخصص لمستودع تجريبي وبيانات عامة أو صناعية. شروط معالجة البيانات تختلف بين المزودين، وتوجد إعدادات خصوصية على OpenRouter يجب مراجعتها مع شروط الجهة التي تنفذ inference. [Data Collection](https://openrouter.ai/docs/guides/privacy/data-collection).
+Labeling an endpoint as free or altering logging levels does not authorize transmitting proprietary banking source code. Enterprise code remains restricted to local or on-premises infrastructure unless explicit institutional authorization is granted. If provider routing cannot be restricted to compliant endpoints, `cloud-auto` is disabled for that data classification.
 
-لا يكفي وصف الخدمة بأنها مجانية أو تغيير إعداد logging لإجازة إرسال source code بنكي. يظل هذا الكود على local/on-prem ما لم تعتمد المؤسسة جهة المعالجة والمسار صراحة. إذا تعذر تقييد الوجهة الفعلية وفق السياسة، يُمنع `cloud-auto` لهذا التصنيف.
-
-**قرار البداية المعتمد:** Python Agent Runtime + Ollama Local + OpenRouter + أدوات صغيرة + sandbox وسياسة من اليوم الأول + verification loop. تُختار النماذج السحابية بعد قياسها، وتبقى إضافة providers مباشرة وتعدد الـAgents مراحل لاحقة.
+**Approved Baseline:** Python Agent Runtime + Local Ollama + OpenRouter + Focused Tooling + Day-One Sandboxing and Policy Engine + Automated Verification Loop. Cloud models are integrated following empirical evaluation; direct proprietary provider SDKs and autonomous subagent swarms remain future phases.

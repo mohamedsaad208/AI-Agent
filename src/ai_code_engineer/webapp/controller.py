@@ -2001,6 +2001,8 @@ class AgentController:
             except (AgentError, OSError) as exc:
                 self.status = friendly_error(exc)
                 return
+        ledger_path = book = row = None
+        step_note = ""
         if chained_plan:
             try:
                 ledger_path, book = planbook.open_book(self.plans, Workspace(Path(repo)), plan_file)
@@ -2018,7 +2020,8 @@ class AgentController:
                     else:
                         step_id = row["id"]
                 if chained_plan and row is not None:
-                    task = planbook.task_for(book, row, task if (task and task != row.get("title")) else "")
+                    step_note = task if (task and task != row.get("title")) else ""
+                    task = planbook.task_for(book, row, step_note)
             except (AgentError, OSError) as exc:
                 self.say(friendly_error(exc))
                 return
