@@ -52,7 +52,7 @@ from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
 from .. import (git_integration, host, ignore, intent, modes, overrides, planbook, repair,
-                runner, setup, symbols)
+                runner, session_flow, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 from . import connection, projects, requestqueue, runresults, uistate
@@ -2823,14 +2823,10 @@ class AgentController:
             self.refresh_recipes()
 
     def target_label(self) -> str:
-        return next((row["label"] for row in self.targets if row["path"] == self.target), "")
+        return session_flow.label_for(self.targets, self.target)
 
     def selected_recipe(self) -> str | None:
-        labels = [runner.RECIPES[name]["label"] for name in self.recipes]
-        try:
-            return self.recipes[labels.index(self.recipe)]
-        except ValueError:
-            return None
+        return session_flow.recipe_for(self.recipes, self.recipe)
 
     # The only states that lock the Run control: work in front of the user that has not been written
     # yet. Every other state -- including a task that blocked, cancelled or rolled back, and a folder
@@ -3259,17 +3255,12 @@ class AgentController:
         return memory_store.read_auto_notes(self.memory_dir, self.repo)
 
     def round_history(self) -> list:
-        """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window
-        only knows where its own chat lives."""
-        if not self.session:
-            return []
-        return repair.round_history(self.runs, self.session["root"], self.chat_id)
+        """Every attempt in this chat and folder, oldest first."""
+        return session_flow.attempt_history(self.runs, self.session, self.chat_id)
 
     def fix_rounds(self) -> list:
-        """The attempt rows the offer, the stop line and the report all read: what ran, what it cost."""
-        if not self.session:
-            return []
-        return repair.attempts_of(self.runs, self.session["root"], self.chat_id)
+        """The attempt rows the offer, the stop line and the report all read."""
+        return session_flow.attempt_rows(self.runs, self.session, self.chat_id)
 
     def _show_rounds(self) -> None:
         """Put the attempts on record where they stay readable after the round counter has moved on."""
@@ -3393,17 +3384,16 @@ class AgentController:
 
     # ------------------------------ plan ledger ------------------------------
     def ledger_for(self, session: dict) -> tuple[Path, dict] | None:
-        reference, step_id = session.get("plan_reference"), session.get("plan_step")
-        if not reference or step_id is None:
+        """The ledger a stored session belongs to, or None when it is not a plan step.
+
+        Which pair this window is standing on is state, so it is recorded here; the rule that decides
+        whether a ledger may be trusted at all is `session_flow.ledger_for`, shared with Tk.
+        """
+        found = session_flow.ledger_for(self.plans, session)
+        if found is None:
             return None
-        try:
-            path, book = planbook.open_book(self.plans, Workspace(Path(session["root"])), reference["path"])
-        except (AgentError, OSError):
-            return None
-        if book.get("plan_sha256") != reference["sha256"]:
-            return None
-        self.ledger_path, self.ledger = path, book
-        return path, book
+        self.ledger_path, self.ledger = found
+        return found
 
     def advance_plan(self, result) -> None:
         session = self.session
@@ -3507,36 +3497,10 @@ class AgentController:
 
     # ------------------------------ sessions ------------------------------
     def _load_session_cached(self, path: Path) -> dict | None:
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._session_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            session = load_session(path)
-        except (AgentError, OSError):
-            session = None
-        self._session_cache[path] = (key, session)
-        return session
+        return session_flow.read_cached(self._session_cache, path, load_session)
 
     def _load_chat_cached(self, path: Path) -> dict | None:
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._chat_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            chat = load_chat(path)
-        except (AgentError, OSError):
-            chat = None
-        self._chat_cache[path] = (key, chat)
-        return chat
+        return session_flow.read_cached(self._chat_cache, path, load_chat)
 
     def _nav_projects(self) -> list[dict]:
         """The sidebar's project nodes: one per granted folder, holding its tasks and bound chats.

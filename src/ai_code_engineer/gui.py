@@ -29,7 +29,7 @@ from .labels import note as shared_note      # `note` is a local variable in two
 from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
-from . import planbook, repair, runner
+from . import planbook, repair, runner, session_flow
 from . import host, intent, modes, setup
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
@@ -1577,19 +1577,16 @@ class AgentWindow:
         self.plan_status.set(line)
 
     def ledger_for(self, session: dict) -> tuple[Path, dict] | None:
-        """The ledger a stored session belongs to, or None when it is not a plan step."""
-        reference, step_id = session.get("plan_reference"), session.get("plan_step")
-        if not reference or step_id is None:
+        """The ledger a stored session belongs to, or None when it is not a plan step.
+
+        The trust rule is shared with the web window through `session_flow`; which ledger this window
+        is standing on is its own state, so that part is recorded here.
+        """
+        found = session_flow.ledger_for(self.plans, session)
+        if found is None:
             return None
-        try:
-            path, book = planbook.open_book(self.plans, Workspace(Path(session["root"])),
-                                            reference["path"])
-        except (AgentError, OSError):
-            return None
-        if book.get("plan_sha256") != reference["sha256"]:
-            return None
-        self.ledger_path, self.ledger = path, book
-        return path, book
+        self.ledger_path, self.ledger = found
+        return found
 
     def advance_plan(self, result) -> None:
         """Close a step on proven evidence and move the ledger to the next one."""
@@ -1959,36 +1956,10 @@ class AgentWindow:
             self.status.set(shared_note("stop_requested", arabic=self.arabic))
 
     def _load_session_cached(self, path: Path):
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._session_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            session = load_session(path)
-        except (AgentError, OSError):
-            session = None
-        self._session_cache[path] = (key, session)
-        return session
+        return session_flow.read_cached(self._session_cache, path, load_session)
 
     def _load_chat_cached(self, path: Path):
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        key = (info.st_mtime_ns, info.st_size)
-        cached = self._chat_cache.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        try:
-            chat = load_chat(path)
-        except (AgentError, OSError):
-            chat = None
-        self._chat_cache[path] = (key, chat)
-        return chat
+        return session_flow.read_cached(self._chat_cache, path, load_chat)
 
     def _search_focus(self, _event=None):
         focused = self.root.focus_get() is self.search_box
@@ -2314,14 +2285,10 @@ class AgentWindow:
             self.refresh_recipes()
 
     def target_label(self) -> str:
-        return next((row["label"] for row in self.targets if row["path"] == self.target), "")
+        return session_flow.label_for(self.targets, self.target)
 
     def selected_recipe(self):
-        labels = [runner.RECIPES[name]["label"] for name in self.recipes]
-        try:
-            return self.recipes[labels.index(self.recipe.get())]
-        except ValueError:
-            return None
+        return session_flow.recipe_for(self.recipes, self.recipe.get())
 
     def request_timeout_seconds(self) -> int:
         try:
@@ -2486,17 +2453,12 @@ class AgentWindow:
         self.advance_plan(result)
 
     def round_history(self):
-        """Every attempt in this chat and folder, oldest first. `repair` reads the record; this window
-        only knows where its own chat lives."""
-        if not self.session:
-            return []
-        return repair.round_history(self.runs, self.session["root"], self.chat_id)
+        """Every attempt in this chat and folder, oldest first."""
+        return session_flow.attempt_history(self.runs, self.session, self.chat_id)
 
     def fix_rounds(self):
-        """The attempt rows the offer, the stop line and the report all read: what ran, what it cost."""
-        if not self.session:
-            return []
-        return repair.attempts_of(self.runs, self.session["root"], self.chat_id)
+        """The attempt rows the offer, the stop line and the report all read."""
+        return session_flow.attempt_rows(self.runs, self.session, self.chat_id)
 
     def _show_rounds(self):
         """Put the attempts on record where they stay readable after the round counter has moved on."""
