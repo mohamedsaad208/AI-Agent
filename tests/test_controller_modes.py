@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
-from ai_code_engineer import git_integration, intent, modes, runner, setup
+from ai_code_engineer import intent, modes, runner
 from ai_code_engineer.engine import atomic_json, project_key
 from doubles import (
                      CALCULATOR_BAD, CALCULATOR_GOOD, ChatModel, OLLAMA_ENTRY, ProposalModel,

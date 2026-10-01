@@ -10,7 +10,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 from ai_code_engineer import setup
-from ai_code_engineer.config import Settings
 from ai_code_engineer.webapp.controller import AgentController
 from helpers import sandbox_repo
 from controller_case import Scripted, patched_catalog

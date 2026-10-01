@@ -10,8 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
-from ai_code_engineer import labels, memory, repair, runner
-from ai_code_engineer.config import Settings
+from ai_code_engineer import labels, memory, repair
 from ai_code_engineer.engine import atomic_json, load_session
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp.controller import AgentController
