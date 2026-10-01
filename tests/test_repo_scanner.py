@@ -335,7 +335,7 @@ class TestRepoScanner(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
+        self.root = Path(self._tmp.name).resolve()
         _make_spring_project(self.root)
         self.scanner = RepoScanner(self.root)
 
@@ -345,7 +345,7 @@ class TestRepoScanner(unittest.TestCase):
     def test_scan_returns_project_index(self):
         idx = self.scanner.scan()
         self.assertIsInstance(idx, ProjectIndex)
-        self.assertEqual(idx.root, str(self.root))
+        self.assertEqual(Path(idx.root), self.root.resolve())
 
     def test_controllers_classified(self):
         idx = self.scanner.scan()
