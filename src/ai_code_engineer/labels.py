@@ -483,6 +483,24 @@ NOTE_TEMPLATES = {
                       "implemented again.",
                       "أُعيد فتح الخطوة {step} من الخطة: الملفات التي نجحت زالت، لذا يجب تنفيذ الخطوة "
                       "من جديد."),
+    # The goal tree of a plan is written by a model turn, so its two outcomes are both worth a sentence:
+    # what the plan now carries, and why it carries nothing.
+    "goal_written": ("The plan now carries its goal and {count} acceptance criteria; each step names the "
+                     "criteria it answers.",
+                     "الخطة الآن تحمل هدفها و{count} من معايير القبول؛ كل خطوة تذكر معايير القبول التي تجيب عنها."),
+    "goal_skipped": ("This plan runs without a goal tree: {reason}",
+                     "هذه الخطة تعمل بدون شجرة أهداف: {reason}"),
+    # The verify button refuses, and the refusal has to say what is missing rather than repeat a
+    # status code: the operator clicked because they believe the step is done.
+    "step_no_proof": ("Plan step {step} stays open: {reason}. Run its command and let the result "
+                      "prove it, or roll the step back.",
+                      "الخطوة {step} من الخطة ستبقى مفتوحة: {reason}. شغّل أمرها ودع النتيجة تثبتها، "
+                      "أو تراجع الخطوة."),
+    # Said after the operator chooses to close a step the runtime could not prove. The row says so, and
+    # the conversation says it in the same words, so nobody reads the ledger as a passing run later.
+    "step_unproven": ("Plan step {step} was marked verified by you, not by a command run: the ledger "
+                      "records it as unproven.",
+                      "الخطوة {step} عُلِّمت كمنتهية بقرارك وليس بتشغيل أمر: السجل يسجّلها بدون إثبات."),
     # Leading spaces are part of the text: these three are appended to `prior_write`, which ends in a
     # full stop. Keeping the space here is what lets both windows join the same two pieces.
     "apply_rerun_warning": ("\nIt will then run {label} again in that folder, which executes the "

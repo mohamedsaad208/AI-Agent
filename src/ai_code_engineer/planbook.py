@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 import re
 
-from .engine import atomic_json, parse_action
+from .engine import atomic_json, now, parse_action
 from .errors import AgentError, Cancelled, PolicyError
 from . import memory as memory_store
 from .redaction import redact
@@ -171,9 +171,10 @@ GOAL_SYSTEM = '''You turn one work request into a goal tree. Return ONE JSON obj
  "sub_goals": [{"id": 1, "title": "short phrase"}, ...0 to 6],
  "steps": [{"id": 1, "accepts": [1, 2], "sub_goal": 1}, ...]}
 "steps" must contain exactly the step numbers listed below and no others: the plan owns its own
-steps, and a number you invent is refused. Every step needs at least one entry in "accepts",
-holding the numbers of the criteria that step answers. Keep every key name exactly as shown,
-put no file path and no code into the answer, and write in the language of the request.'''
+steps, and a number you invent is refused. In "accepts", list the numbers of the criteria each step
+leaves true; a step that answers none of them is allowed, and is reported as covering nothing.
+Keep every key name exactly as shown, put no file path and no code into the answer, and write in the
+language of the request.'''
 
 
 def goal_prompt(book: dict, task: str = "", plan_text: str = "") -> str:
@@ -456,6 +457,21 @@ def mark_failed(path: Path, book: dict, step_id: int, reason: str = "") -> dict:
 
 def failed_count(book: dict) -> int:
     return len([row for row in book["steps"] if row.get("status") == "failed"])
+
+
+def mark_unproven(path: Path, book: dict, step_id: int, reason: str = "") -> dict:
+    """Close a step the operator says is done, and record on the row that no command run said so.
+
+    The status has to be `verified` or the next step's task would offer to redo it, so the truth goes in
+    beside it: a ledger that cannot tell "a run proved this" from "the user clicked" is worth nothing to
+    the verification gate that reads it later.
+    """
+    row = step(book, step_id)
+    if row is None:
+        raise PolicyError("Unknown plan step: " + str(step_id)[:20])
+    row.update(status="verified", verified_at=now(), unproven=redact(reason)[:200])
+    atomic_json(path, book)
+    return book
 
 
 def progress_line(book: dict) -> str:

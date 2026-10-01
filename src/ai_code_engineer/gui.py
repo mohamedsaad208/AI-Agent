@@ -1602,6 +1602,10 @@ class AgentWindow:
         if row is None or row["status"] == "verified":
             return
         if result["status"] != "passed":
+            try:
+                book = planbook.mark_failed(path, book, step_id, runner.summarize(result))
+            except (AgentError, OSError) as exc:
+                self.chat_message("Tool", "The plan ledger was not updated: " + friendly_error(exc))
             self.status.set(planbook.progress_line(book) + " — step " + str(step_id) +
                             " stays open until a command run proves it.")
             return
@@ -1840,6 +1844,8 @@ class AgentWindow:
                 self.status.set(friendly_error(exc))
                 return
         step_id = None
+        ledger_path = book = row = None
+        step_note = ""
         if chained_plan:
             try:
                 ledger_path, book = planbook.open_book(self.plans, Workspace(Path(repo)), plan_file)
@@ -1847,7 +1853,8 @@ class AgentWindow:
                 if row is None:
                     raise PolicyError("Every step of this plan is already verified by a passing run.")
                 step_id = row["id"]
-                task = planbook.task_for(book, row, task)
+                step_note = task
+                task = planbook.task_for(book, row, step_note)
             except (AgentError, OSError) as exc:
                 self.status.set(friendly_error(exc))
                 return
@@ -1879,9 +1886,34 @@ class AgentWindow:
         def work():
             provider = make_provider(settings, allow_cloud=cloud, data_class="public" if cloud else "restricted", api_key=key,
                                      allow_paid=paid)
-            return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
+            current_book = book
+            current_row = row
+            run_task = task
+            if (chained_plan and current_book is not None and ledger_path is not None
+                    and current_book.get("schema", 1) >= 2 and not planbook.has_goal(current_book)):
+                # The same rule the web window follows: a goal tree is a model round trip, so it is
+                # asked for on the job thread, and a plan that already carries one is never re-asked.
+                try:
+                    plan_text = Workspace(Path(repo)).read(current_book["plan_path"])["content"]
+                except (AgentError, OSError):
+                    plan_text = ""
+                current_book, refusal = planbook.author_goal(ledger_path, current_book, provider, task=task,
+                                                             plan_text=plan_text,
+                                                             cancelled=self.cancel_event.is_set)
+                self.events.put(("progress", shared_note(
+                    "goal_skipped" if refusal else "goal_written", arabic=self.arabic,
+                    **({"reason": refusal} if refusal
+                       else {"count": len(current_book.get("criteria") or [])}))))
+                if not refusal:
+                    current_row = planbook.step(current_book, step_id) or current_row
+                    run_task = planbook.task_for(current_book, current_row, step_note)
+            goal = planbook.goal_line(current_book) if current_book else ""
+            criteria = planbook.criteria_of(current_book) if current_book else None
+            accepts = (current_row.get("accepts") or []) if current_row else None
+            return plan(Workspace(Path(repo)), run_task, provider, settings, self.runs,
                         progress=lambda line: self.events.put(("progress", line)), cancelled=self.cancel_event.is_set,
-                        plan_file=plan_file, chat_id=chat_id, plan_step=step_id, memory=notes)
+                        plan_file=plan_file, chat_id=chat_id, plan_step=step_id, memory=notes,
+                        goal=goal, criteria=criteria, accepts=accepts)
 
         def done(path):
             if step_id is not None:

@@ -590,7 +590,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
          runs: Path, progress=print, cancelled=None, plan_file: str | None = None,
          chat_id: str | None = None, extra_context: str | None = None,
          plan_step: int | None = None, memory: str | None = None, step=None,
-         on_token=None) -> Path:
+         on_token=None, goal: str = "", criteria: list[str] | None = None,
+         accepts: list[int] | None = None) -> Path:
     """Run the tool loop until the model proposes a change.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
@@ -666,6 +667,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         if not isinstance(plan_step, int) or not 1 <= plan_step <= 99:
             raise PolicyError("Plan step must be a small positive number.")
         session["plan_step"] = plan_step
+        if goal:
+            session["goal"] = str(goal)[:300]
+        if criteria:
+            session["criteria"] = [str(c)[:200] for c in criteria[:8]]
+        if accepts:
+            session["accepts"] = [int(a) for a in accepts if isinstance(a, int)]
     if memory and memory.strip():
         if len(memory) > memory_module.MAX_MEMORY:
             raise PolicyError(f"Project notes must stay within {memory_module.MAX_MEMORY} characters.")
