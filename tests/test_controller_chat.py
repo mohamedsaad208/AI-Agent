@@ -16,7 +16,8 @@ from ai_code_engineer.engine import atomic_json, load_session
 from ai_code_engineer.webapp.controller import AgentController, LineFeed
 from doubles import CALCULATOR_BAD, ChatModel, OLLAMA_ENTRY
 from helpers import sandbox_repo
-from controller_case import Scripted, SteppingModel, StreamingModel, ThinkingModel, patched_catalog
+from controller_case import (ControllerCase, Scripted, StreamingModel, ThinkingModel,
+                             patched_catalog)
 
 
 class TheLineFeedThatWaitsForAKey(unittest.TestCase):
@@ -151,7 +152,7 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
         controller.start_chat("q", Settings(), False, False, None)
         controller.join()
         self.assertTrue(controller.snapshot()["messages"])
-class TheThoughtRowInAWindow(unittest.TestCase):
+class TheThoughtRowInAWindow(ControllerCase):
     """UI 4.2 phase 2, on the surface: the thinking arrives as a row the reader can open.
 
     The window is where this either pays or costs. A row that dumps 1 200 characters of chain of
@@ -160,21 +161,10 @@ class TheThoughtRowInAWindow(unittest.TestCase):
     row — the thread is read for what happened.
     """
 
+    model_factory = ThinkingModel
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = ThinkingModel()
-        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patched_catalog()):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        super().setUp()
         self.events: list[dict] = []
 
     def step_rows(self):
@@ -293,7 +283,7 @@ class WithdrawnQuestionTests(unittest.TestCase):
         self.controller.set_reply(self.events[0]["id"], {"ok": True})
         self.assertEqual(self.controller._answers, {},
                          "a reply for a dead question must not sit in the store forever")
-class DecliningAProposal(unittest.TestCase):
+class DecliningAProposal(ControllerCase):
     """UI 4.6: Reject answers a proposal without discarding it or writing it.
 
     There was no way to say no before this: dismissing an offer meant rolling back a write that had
@@ -303,20 +293,7 @@ class DecliningAProposal(unittest.TestCase):
     """
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = SteppingModel()
-        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patched_catalog()):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        super().setUp()
         self.controller.start_plan("Fix add in calculator.py")
         self.controller.join()
 
@@ -400,7 +377,7 @@ class DecliningAProposal(unittest.TestCase):
         self.controller.reopen()
         self.assertTrue(self.controller.rejected())
         self.assertFalse(self.controller.snapshot()["review"]["canReopen"])
-class AnsweringAnEarlierMessage(unittest.TestCase):
+class AnsweringAnEarlierMessage(ControllerCase):
     """UI 4.6: a message can point back at one already in the thread.
 
     Three things had to hold together. The quotation is read out of the window's own record rather than
@@ -411,20 +388,7 @@ class AnsweringAnEarlierMessage(unittest.TestCase):
     """
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = SteppingModel()
-        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patched_catalog()):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        super().setUp()
         self.events: list[dict] = []
         self.controller.start_plan("Fix add in calculator.py")
         self.controller.join()

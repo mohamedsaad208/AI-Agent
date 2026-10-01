@@ -9,12 +9,17 @@ with the definition, which is how a double gets quietly changed to make a test p
 
 Imported as a top-level module, so each file adds its own directory to `sys.path` first — that is what
 makes `python -m unittest discover -s tests` and `python -m unittest tests.test_controller` agree.
+
+`ControllerCase` at the bottom is the other half: the eleven opening lines nine of those suites each
+wrote out for themselves.
 """
 from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import threading
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
 
 from ai_code_engineer.webapp.controller import AgentController
-from doubles import CALCULATOR_GOOD, patched_catalog as shared_patched_catalog
+from doubles import CALCULATOR_GOOD, OLLAMA_ENTRY, patched_catalog as shared_patched_catalog
+from helpers import sandbox_repo
 
 
 def patched_catalog():
@@ -164,3 +170,52 @@ class StreamingModel:
         if not json_mode:
             return "".join(self.pieces)
         return json.dumps(self.envelope)
+
+
+class ControllerCase(unittest.TestCase):
+    """One throwaway app folder, one scripted window, no Tk, no browser, no network.
+
+    Nine suites opened with the same eleven lines: a temporary app dir, a fixture repo in it, the two
+    patches that keep the suite off the network and off a real model, then a `Scripted` window told
+    which folder it is standing in. That is written once here. A suite chooses the three things that
+    actually differ between them as class attributes:
+
+      `model_factory`   the fake `make_provider` hands back
+      `extra_patches`   callables returning further patchers, started after those two
+      `opens_window`    whether setUp builds the window, or the test does it after its own setup
+
+    The cleanup order is the one the copies already had, read bottom-up as `addCleanup` runs it: the
+    window closes, the patches stop, the temporary folder goes. Two suites set `opens_window = False`
+    because they make the folder a git repository before the window is pointed at it, and the order is
+    the point. Two others keep their own `build()` instead — they hold a list of windows and *drain*
+    them (cancel, join) rather than close them, because a plan step they advance starts a job of its
+    own.
+    """
+
+    model_factory = SteppingModel
+    extra_patches: tuple = ()
+    opens_window = True
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.temp.cleanup)
+        self.app_dir = Path(self.temp.name).resolve()
+        self.repo = sandbox_repo(self.app_dir)
+        self.model = self.model_factory()
+        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider",
+                              return_value=self.model),
+                        patched_catalog(),
+                        *(make() for make in self.extra_patches)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if self.opens_window:
+            self.controller = self.window()
+
+    def window(self, answers=None):
+        """A scripted window on the folder this case already made — a second one, if a test wants it."""
+        controller = Scripted(self.app_dir, answers)
+        controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
+        controller.model = "test-local"
+        controller.set_repo(str(self.repo))
+        self.addCleanup(controller.close)
+        return controller

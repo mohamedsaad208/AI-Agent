@@ -10,31 +10,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
-from ai_code_engineer import memory, runner
 from ai_code_engineer.webapp.controller import AgentController
-from doubles import OLLAMA_ENTRY, PROOF, run_result
-from helpers import sandbox_repo
-from controller_case import GatingModel, Scripted, patched_catalog
+from doubles import PROOF, run_result
+from controller_case import ControllerCase, GatingModel, Scripted
 
 
-class QueueTests(unittest.TestCase):
+class QueueTests(ControllerCase):
+    """A prompt that arrives mid-flight waits its turn: the order, the chat it belongs to, the stop
+    that holds the queue, and the drain that takes a row exactly once."""
+
+    model_factory = GatingModel
+    extra_patches = (lambda: patch("ai_code_engineer.runner.run",
+                                   return_value=run_result(proof=PROOF)),)
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = GatingModel()
-        started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                   patched_catalog(),
-                   patch("ai_code_engineer.runner.run", return_value=run_result(proof=PROOF))]
-        for patcher in started:
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        super().setUp()
         self.events = []
 
     def emit(self, event):

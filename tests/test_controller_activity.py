@@ -2,46 +2,27 @@
 
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
-from ai_code_engineer import labels, memory, runner
+from ai_code_engineer import labels
 from ai_code_engineer.engine import atomic_json, load_session
 from ai_code_engineer.webapp.controller import MAX_LOG_ENTRIES
 from ai_code_engineer.webapp import runresults
-from doubles import OLLAMA_ENTRY, PLAN, run_result
-from helpers import sandbox_repo
-from controller_case import Scripted, SteppingModel, patched_catalog
+from doubles import run_result
+from controller_case import ControllerCase
 
 
-class TheActivityFeed(unittest.TestCase):
+class TheActivityFeed(ControllerCase):
     """UI 3.4: what the agent did reaches the chat, and the line that says it survives a push.
 
     The class of defect this holds against is a sentence that exists only in the server's own
     memory: `controller.status` was assigned in about sixty places and read by no client, so the
     progress line went into the header subtitle instead and the next state push erased it.
     """
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = SteppingModel()
-        started = [patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                   patched_catalog()]
-        for patcher in started:
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
 
     def steps(self):
         return [message["text"] for message in self.controller.snapshot()["messages"]
@@ -180,7 +161,7 @@ class TheActivityFeed(unittest.TestCase):
         said = " ".join(self.row_by_author("Tool"))
         self.assertIn("\u26d4", said)
         self.assertIn("the repository has no build file", said)
-class TheStepRows(unittest.TestCase):
+class TheStepRows(ControllerCase):
     """UI 4.1: every step row is a handle on a record, and what it opens is fetched, not shipped.
 
     Three things had to hold at once, and each is a failure mode this window has already paid for: the
@@ -191,20 +172,7 @@ class TheStepRows(unittest.TestCase):
     """
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = SteppingModel()
-        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patched_catalog()):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        super().setUp()
         self.events: list[dict] = []
 
     def step_rows(self):
@@ -328,7 +296,7 @@ class TheStepRows(unittest.TestCase):
         self.assertLessEqual(len(state["log"]), MAX_LOG_ENTRIES)
         self.assertGreater(state["log_dropped"], 0)
         self.assertTrue(state["log_note"])
-class TheReplayedActivityLog(unittest.TestCase):
+class TheReplayedActivityLog(ControllerCase):
     """UI 4.6: a reopened task's Activity rows are sentences, not the engine's notebook.
 
     `display_session` rebuilt each row by joining the stored record's own fields, so the list an
@@ -337,22 +305,6 @@ class TheReplayedActivityLog(unittest.TestCase):
     file's worth of text. The rows now go through `labels.log_line`, in the language the task was
     asked in — the same reason the step rows already had (`_history_steps`).
     """
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
-        self.model = SteppingModel()
-        for patcher in (patch("ai_code_engineer.webapp.controller.make_provider", return_value=self.model),
-                        patched_catalog()):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
 
     def reopen(self, task="Fix add in calculator.py", events=()):
         self.controller.start_plan(task)

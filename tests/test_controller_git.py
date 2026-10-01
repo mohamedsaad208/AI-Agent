@@ -11,12 +11,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # so `doubles` is importable either way
-from ai_code_engineer import git_integration, memory, runner
+from ai_code_engineer import git_integration
 from ai_code_engineer.engine import project_key
 from ai_code_engineer.errors import PolicyError
 from doubles import CALCULATOR_BAD, CALCULATOR_GOOD, OLLAMA_ENTRY, ProposalModel, run_result
 from helpers import sandbox_repo
-from controller_case import DualModel, Scripted, patched_catalog
+from controller_case import ControllerCase, DualModel, Scripted, patched_catalog
 
 
 class BranchTests(unittest.TestCase):
@@ -592,30 +592,21 @@ class BranchTests(unittest.TestCase):
         controller.join()
         self.assertEqual(len(self.model.prose), 1)
         self.assertEqual(self.model.actions, [])
-class CheckpointTests(unittest.TestCase):
+class CheckpointTests(ControllerCase):
     """UI 3.0 §4: an apply inside a git folder leaves a commit the developer can find."""
 
+    model_factory = ProposalModel
+    opens_window = False
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
+        super().setUp()
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
                  "calculator.py")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "commit",
                  "-q", "--no-verify", "-m", "first")
-        for patcher in (patched_catalog(),
-                        patch("ai_code_engineer.webapp.controller.make_provider",
-                              return_value=ProposalModel())):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        self.controller = self.window()
 
     def git(self, *args):
         finished = subprocess.run([git_integration.git_program(), *args], cwd=str(self.repo),
@@ -790,34 +781,25 @@ class TaskBranchTests(unittest.TestCase):
         row = str(controller.snapshot()["messages"])
         self.assertIn("تم إنشاء فرع git باسم " + moved, row)
         self.assertNotIn("Started git branch", row)
-class GitRestoreTests(unittest.TestCase):
+class GitRestoreTests(ControllerCase):
     """The escalation path: a rollback the session cannot do, git can, for those files only.
 
     These are live-repository tests on purpose. The whole claim is about bytes on disk — which copy
     survives, and whose does not — and a scripted git would only re-state the code's own assumption.
     """
 
+    model_factory = ProposalModel
+    opens_window = False
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.temp.cleanup)
-        self.app_dir = Path(self.temp.name).resolve()
-        self.repo = sandbox_repo(self.app_dir)
+        super().setUp()
         (self.repo / "notes.md").write_text("work in progress\n", encoding="utf-8", newline="\n")
         self.git("init", "-q")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "add", "--",
                  "calculator.py", "notes.md")
         self.git("-c", "user.email=agent@example.invalid", "-c", "user.name=Agent", "commit",
                  "-q", "--no-verify", "-m", "first")
-        for patcher in (patched_catalog(),
-                        patch("ai_code_engineer.webapp.controller.make_provider",
-                              return_value=ProposalModel())):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.controller = Scripted(self.app_dir)
-        self.controller.catalogs["Ollama"] = [OLLAMA_ENTRY]
-        self.controller.model = "test-local"
-        self.controller.set_repo(str(self.repo))
-        self.addCleanup(self.controller.close)
+        self.controller = self.window()
 
     def git(self, *args):
         finished = subprocess.run([git_integration.git_program(), *args], cwd=str(self.repo),
