@@ -11,11 +11,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .engine import (atomic_json, chat_sessions, event, load_session, shrink_warning,
+from .engine import (atomic_json, chat_sessions, event, load_session, record_stage, shrink_warning,
                      unexpected_notice)
 from .errors import AgentError, PolicyError
 from .labels import INTERRUPTED_STATES
 from .redaction import redact
+from . import core
 from . import runner
 
 MAX_FIX_ROUNDS = 3
@@ -170,6 +171,21 @@ STATE_FOR_RUN = {"passed": "CHECKS_PASSED", "failed": "VERIFICATION_FAILED",
                  "unavailable": "VERIFICATION_BLOCKED"}
 
 
+def stage_after_run(session: dict, run: dict) -> str:
+    """Where the workflow stands once a command run is in, decided by the lifecycle and not here.
+
+    The run is the verifying step's evidence, so it is handed to `core` as a verification result: a passing
+    one closes the loop and a failing one puts the task back on the model. This function's whole job is to
+    translate that verdict into the stage a window draws, which is why neither window is left to decide it —
+    two windows reading the same run and disagreeing about where they are is the same bug that made the fix
+    budget live in one place.
+    """
+    state = core.AgentState(task=core.Task(description=str(session.get("task") or "")),
+                            status=core.AgentStatus.VERIFYING)
+    core.AgentCore(session.get("root") or ".").record_verification(state, verification_from_run(run))
+    return core.stage_of(state.status)
+
+
 def record_run(session_path: Path, result: dict) -> dict:
     """Persist a slimmed run summary on the session; the full log stays out of the store."""
     session = load_session(session_path)
@@ -182,6 +198,8 @@ def record_run(session_path: Path, result: dict) -> dict:
     session.setdefault("runs", []).append(slim)
     session["state"] = STATE_FOR_RUN[result["status"]]
     event(session, "run", **{key: slim[key] for key in ("recipe", "status", "exit_code", "seconds")})
+    record_stage(session, "build_test")
+    record_stage(session, stage_after_run(session, slim))
     atomic_json(session_path, session)
     return session
 
@@ -591,6 +609,19 @@ def verification_from_run(run: dict) -> Any:
     )
 
 
+def advance_verification(core: Any, state: Any, run: dict) -> Any:
+    """Hand a command run that somebody already executed to the lifecycle, and take back the verdict.
+
+    `execute_verification` runs the recipe itself, and by the time a window has a result worth recording
+    it has run the project's build once — calling the runner-bound function from there would run it
+    again, in front of the person who already waited. This is the half that decides VERIFYING to DONE or
+    FIXING, which is the difference between offering a fix round and finishing the task.
+    """
+    verif = verification_from_run(run)
+    core.record_verification(state, verif)
+    return verif
+
+
 def execute_verification(
     core: Any,
     state: Any,
@@ -618,9 +649,7 @@ def execute_verification(
         sandbox=sandbox,
         cancelled=cancelled,
     )
-    verif = verification_from_run(run_dict)
-    core.record_verification(state, verif)
-    return verif
+    return advance_verification(core, state, run_dict)
 
 
 def handle_fix_evaluation(

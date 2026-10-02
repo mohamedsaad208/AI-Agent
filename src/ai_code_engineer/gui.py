@@ -24,7 +24,7 @@ from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
                      catalog_status_line, friendly_error, impact_lines, is_arabic, policy_line,
-                     run_warning, state_label, status_text)
+                     run_warning, stage_line, state_label, status_text)
 from .labels import note as shared_note      # `note` is a local variable in two methods here
 from .providers import make_provider
 from .redaction import redact
@@ -237,6 +237,9 @@ class AgentWindow:
         self.cloud_ok = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready — choose your project and describe the change")
         self.state_label = tk.StringVar(value="No task open")
+        # How far along the run is, which is not the same sentence as what happened to it — the state above
+        # decides which buttons work, this one answers the question a person watching asks.
+        self.stage_text = tk.StringVar(value="")
         self.artifact = tk.StringVar(value="No proposal yet")
         self.artifact_detail = tk.StringVar(value="Choose a project to turn a request into reviewed file changes.")
         self.recipe = tk.StringVar()
@@ -1176,6 +1179,10 @@ class AgentWindow:
         self.headline = ttk.Label(parent, textvariable=self.state_label,
                                   font=("Segoe UI", 13, "bold"), anchor="w")
         self.headline.pack(fill="x", pady=(0, 8))
+        self.stage_row = ttk.Label(parent, textvariable=self.stage_text, style="Muted.TLabel", anchor="w")
+        self.stage_row.pack(fill="x", pady=(0, 8))
+        self.stage_text.trace_add("write", lambda *_: self.stage_row.configure(
+            anchor="e" if is_arabic(self.stage_text.get()) else "w"))
         # Tk 8.6 has no bidi engine — measured on this machine: a label takes `justify` and `anchor`
         # but no `-direction` — so alignment is the honest ceiling for the fallback window. The
         # headline follows the language of the sentence that is currently in it.
@@ -2209,6 +2216,9 @@ class AgentWindow:
 
     def clear_review(self):
         self.state_label.set("No proposal yet")
+        # An empty stage row is the honest answer here: there is no run to place, and a sentence saying
+        # "step 1 of 8" over a chat with no project attached would be invented.
+        self.stage_text.set("")
         self.artifact.set("No proposal yet")
         self.run_info.set("No command has run yet.")
         self.artifact_detail.set("This chat has no project attached, so nothing is proposed."
@@ -2223,6 +2233,7 @@ class AgentWindow:
         session = load_session(path)
         self.session, self.session_path = session, path
         self.state_label.set(state_label(session["state"], arabic=self.arabic))
+        self.stage_text.set(stage_line(session.get("stage"), arabic=self.arabic))
         changes = session.get("changes", [])
         self.artifact.set(state_label(session["state"], arabic=self.arabic))
         self.artifact_detail.set(

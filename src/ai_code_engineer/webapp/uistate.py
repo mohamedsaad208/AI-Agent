@@ -15,6 +15,9 @@ import difflib
 import re
 from pathlib import Path
 
+from .. import core
+from ..labels import stage_label, stage_line
+
 # Names a reader recognises, taken from the lines that actually changed. Three patterns because the
 # languages the agent is pointed at differ in how they open a definition, not because each needs its
 # own summary.
@@ -92,3 +95,19 @@ def file_view(change: dict | None) -> dict:
     return {"diff": diff_lines(change["before"] or "", change["after"] or "", change["path"]),
             "before": (change["before"] or "").splitlines(),
             "after": (change["after"] or "").splitlines()}
+
+
+def stage_block(current: str, *, arabic: bool = False) -> dict:
+    """Where the run stands, as the strip draws it: the ordered stages, which ones it reached, one line.
+
+    Both controllers build it here because the scripted preview is the window a design gets reviewed in,
+    and a strip that exists in one of them and not the other is reviewed as nothing. The order comes from
+    `core.STAGES`, so what a person sees is the lifecycle's own sequence rather than a copy of it that can
+    fall behind.
+    """
+    codes = list(core.STAGES)
+    where = codes.index(current) + 1 if current in codes else 0
+    return {"current": current, "total": len(codes),
+            "steps": [{"code": code, "label": stage_label(code, arabic=arabic),
+                       "reached": bool(where) and codes.index(code) < where} for code in codes],
+            "line": stage_line(current, arabic=arabic)}

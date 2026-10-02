@@ -64,6 +64,30 @@ STATES_AR = {
     "PARTIAL_APPLY": "تم التطبيق جزئيًا — راجع قبل المتابعة",
     "APPLYING": "انقطع التطبيق — راجع المهمة",
 }
+# How far along the run is, which is a different question from what happened to it: the table above is the
+# outcome and decides which buttons work, this one is the position in the workflow and decides what a person
+# watching a long job reads. `core.STAGES` owns the codes and the order; this is only the wording.
+STAGES = {
+    "understand": "Understanding the task",
+    "plan": "Planning the change",
+    "implement": "Writing the change",
+    "impact": "Checking what it touches",
+    "review": "Waiting for your review",
+    "approve": "Applying what you approved",
+    "build_test": "Building and testing",
+    "verify": "Verifying the result",
+}
+STAGES_AR = {
+    "understand": "أفهم المهمة",
+    "plan": "أخطط للتغيير",
+    "implement": "أكتب التغيير",
+    "impact": "أفحص ما يلمسه التغيير",
+    "review": "في انتظار مراجعتك",
+    "approve": "أنفّذ ما وافقت عليه",
+    "build_test": "البناء والاختبار",
+    "verify": "التحقق من النتيجة",
+}
+
 # States whose files exist on disk and can still be checked, run against, or rolled back.
 MUTABLE_STATES = {"APPLIED_UNVERIFIED", "VERIFICATION_BLOCKED", "VERIFICATION_FAILED", "CHECKS_PASSED"}
 # A task whose files are on disk without a passing command run. Starting the next task
@@ -90,6 +114,33 @@ def state_label(value: str | None, *, arabic: bool = False) -> str:
     if arabic:
         return STATES_AR.get(value, value)
     return STATES.get(value, value)
+
+
+def stage_label(value: str | None, *, arabic: bool = False) -> str:
+    """The line a window draws for how far along the run is.
+
+    A code with no wording falls back to the code rather than to an invented sentence, and a run that has
+    not recorded one says so — a blank strip reads as "finished" to everybody who sees it.
+    """
+    if not value:
+        return "Nothing recorded yet" if not arabic else "لم يُسجَّل شيء بعد"
+    table = STAGES_AR if arabic else STAGES
+    return table.get(value, value)
+
+
+def stage_line(value: str | None, *, arabic: bool = False) -> str:
+    """The whole sentence: which step this is, and how many there are.
+
+    The count is part of the sentence rather than a decoration beside it because "Writing the change" alone
+    does not tell a person whether four steps are left or none. A code the table does not know — an older
+    record, a stage renamed in a later release — answers with the plain label instead of a step number that
+    would be wrong.
+    """
+    codes = list(STAGES)
+    if not value or value not in codes:
+        return stage_label(value, arabic=arabic)
+    return note("stage_line", arabic=arabic, number=codes.index(value) + 1, total=len(codes),
+                where=stage_label(value, arabic=arabic))
 
 
 # --------------------------- the write, in the language it was asked for ---------------------------
@@ -612,6 +663,8 @@ NOTE_TEMPLATES = {
                    "--action {action} --verdict allow|ask|deny",
                    "للإجابة بشكل مختلف من هنا، شغّل:  agent policy --repo \"{folder}\" "
                    "--action {action} --verdict allow|ask|deny"),
+    "stage_line": ("{where} — step {number} of {total}",
+                   "{where} — الخطوة {number} من {total}"),
     "policy_heading": ("What this folder answers without asking:",
                        "ما يجيبه هذا المجلد من غير سؤال:"),
     "policy_allow_note": ("{count} of {total} action classes are answered by this folder's own rule",

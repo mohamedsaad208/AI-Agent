@@ -965,6 +965,17 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 }
 .busybar.busy::after { opacity: 1 }
 .hidden { display: none !important }
+
+/* The workflow strip sits under the activity line instead of replacing it: that one says what is happening
+   this second, this one says how far along the run is and shows the eight names behind the sentence so the
+   position can be checked rather than felt. */
+.stagestrip {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 5px 16px 7px;
+  font-size: 11.5px; color: var(--faint); flex: none; border-top: 1px solid var(--line-soft);
+}
+.stage-line { max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stage-mark { width: 14px; height: 4px; border-radius: 2px; background: var(--line); flex: none; }
+.stage-mark.on { background: var(--accent); }
 #mode-seg { display: inline-flex; align-items: center; gap: 2px; background: var(--seg); padding: 2px; border-radius: var(--r-m); }
 #mode-seg button { padding: 4px 10px; font-size: 12px; font-weight: 500; border-radius: calc(var(--r-m) - 2px); color: var(--faint); background: transparent; border: 0; cursor: pointer; transition: all var(--t-fast); }
 #mode-seg button:hover { color: var(--ink); }

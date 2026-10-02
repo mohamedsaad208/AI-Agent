@@ -13,7 +13,7 @@ import tempfile
 import threading
 import uuid
 
-from .engine import atomic_json, event, load_session
+from .engine import atomic_json, event, load_session, record_stage
 from .errors import PolicyError
 from . import runner
 from .workspace import Workspace, digest
@@ -214,5 +214,6 @@ def verify(path: Path, recipe: str | None = None, image: str | None = None) -> d
         result["status"], "VERIFICATION_BLOCKED")
     session["verification"] = result
     event(session, "verification", status=result["status"])
+    record_stage(session, "verify")
     atomic_json(path, session)
     return result

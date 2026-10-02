@@ -417,6 +417,25 @@ class DesktopTests(unittest.TestCase):
         self.ui.state_label.set(labels.STATES["WAITING_APPROVAL"])
         self.assertEqual(str(self.ui.headline.cget("anchor")), "w")
 
+    def test_the_stage_line_moves_to_the_side_the_sentence_is_written_on(self):
+        """The row under the headline is a second sentence in the same window, so it gets the same
+        alignment rule rather than an English-left Arabic line."""
+        self.ui.stage_text.set(labels.stage_line("build_test", arabic=True))
+        self.assertEqual(str(self.ui.stage_row.cget("anchor")), "e")
+        self.ui.stage_text.set(labels.stage_line("build_test"))
+        self.assertEqual(str(self.ui.stage_row.cget("anchor")), "w")
+
+    def test_the_stage_line_says_where_the_run_stands_after_a_passing_command(self):
+        """The window draws the position the record states — not one it inferred from the button it
+        pressed, which is how two windows would end up disagreeing about the same run."""
+        self.applied_draft()
+        self.make_runnable()
+        with patch("ai_code_engineer.gui.runner.run", return_value=self.run_result("passed")):
+            self.ui.run_tests(False)
+            self.wait_for_job()
+        self.assertEqual(self.ui.session["stage"], "verify")
+        self.assertEqual(self.ui.stage_text.get(), labels.stage_line("verify"))
+
     def test_new_task_is_disclosed_while_an_earlier_one_is_unverified(self):
         """Sequencing: task 2 must not silently stack on task 1's unchecked files."""
         self.applied_draft()

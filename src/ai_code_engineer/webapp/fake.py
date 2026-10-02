@@ -164,6 +164,10 @@ class FakeController:
     def __init__(self) -> None:
         self.prefs = {"style": "claude", "theme": "light", "collapsed": False}
         self.state = "WAITING_APPROVAL"
+        # The scripted window opens on a proposal, so it opens mid-workflow: the strip is drawn from this
+        # field exactly as the real window draws it from the session record, and every scripted action below
+        # moves it the way the real verb would.
+        self.stage = "review"
         self.view = "task"
         self.busy = False
         self.cancellable = False
@@ -411,6 +415,9 @@ class FakeController:
                                 for name in policy.ACTIONS],
                        "note": labels.note("policy_allow_note",
                                            count=len(self.policy_over), total=len(policy.ACTIONS))},
+            # The same block the real window builds, from the same table order — the strip is a design and
+            # designs get reviewed here.
+            "stage": uistate.stage_block(self.stage),
             # The loop's budget, from the same constant the real controller reads it from: a field the
             # preview never sends is a field the window is never drawn with.
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
@@ -688,6 +695,7 @@ class FakeController:
             if self.reading_only:
                 return self._refuse(intent.no_write("Roll back"))
             self.state = "ROLLED_BACK"
+            self.stage = "review"
             self._note(emit, "rolled_back", "Task changes rolled back.")
             self.git_restore_offer = {"commit": "9f3c21a", "paths": len(FILES)}
         elif type == "git_restore":
@@ -723,6 +731,7 @@ class FakeController:
             self._note(emit, "git_branch", text)
         elif type == "verify":
             self.state = "VERIFICATION_BLOCKED"
+            self.stage = "verify"
             self._note(emit, "verify", "Syntax checks finished. Project tests have not run.")
         elif type == "stop":
             self.busy = self.cancellable = False
@@ -854,6 +863,7 @@ class FakeController:
             if self.reading_only:
                 return self._refuse(intent.no_proposal())
             self.state = "WAITING_APPROVAL"
+            self.stage = "review"
             emit({"kind": "toast", "text": "Proposing %s — review the diff, then Apply"
                   % str(payload.get("path", "that file"))})
         elif type == "setup_check":
@@ -996,6 +1006,7 @@ class FakeController:
             self.pending = None
             self.busy = self.cancellable = False
             self.state = "WAITING_APPROVAL"
+            self.stage = "review"
             reply = {"role": "assistant", "author": "AI Code Engineer", "time": _clock(),
                      "text": "Here is the smallest change that satisfies step 2. Three files, and the "
                              "existing `create()` path is untouched.\n\n"
@@ -1047,6 +1058,7 @@ class FakeController:
                                        "confirm": "Apply"}, emit)
         if answer.get("ok"):
             self.state = "APPLIED_UNVERIFIED"
+            self.stage = "approve"
             self._note(emit, "apply", "Applied 3 file(s).")
             emit({"kind": "toast", "text": "Changes applied. You can run the project command now."})
 
@@ -1094,6 +1106,7 @@ class FakeController:
             self._note(emit, "run", "mvn -B test → exit 0 · 41.2s · 14 tests, 0 failures")
             self.runs += 1
             self.state = "CHECKS_PASSED"
+            self.stage = "verify"
             if self.step == 2:
                 self.step = 3
                 emit({"kind": "toast", "text": "Plan step 2/5 verified. Starting step 3: Login and issue a JWT"})

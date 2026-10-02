@@ -977,6 +977,8 @@ class AgentController:
             "sandbox": self.sandbox_info(),
             # Which action classes this folder answers for, so the ask on screen has a row behind it.
             "policy": self.policy_block(),
+            # And where the run itself stands, read off the session rather than off a window's memory.
+            "stage": self.stage_block(),
             "memory": {"info": self._memory_info()},
             "settings": {"project": self.repo, "plan": self.plan_file, "chained": self.chained,
                          "auto_apply": self.auto_apply, "bound": bool(self.branch.get("bound")),
@@ -1254,6 +1256,15 @@ class AgentController:
                 "note": shared_note("policy_allow_note", arabic=self.arabic,
                                     count=sum(1 for row in rows if row["declared"]),
                                     total=len(rows))}
+
+    def stage_block(self) -> dict:
+        """How far along this run is, in the order the lifecycle defines.
+
+        It is read from the session record rather than from anything the window remembers, so a page that
+        connects halfway through shows the position the run itself states, and a task reopened from history
+        says where it stopped instead of pretending it never moved.
+        """
+        return uistate.stage_block(str((self.session or {}).get("stage") or ""), arabic=self.arabic)
 
     def set_policy(self, payload: dict) -> dict:
         """Answer one action class for this folder, or take the answer back.

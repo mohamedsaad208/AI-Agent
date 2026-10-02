@@ -60,6 +60,61 @@ ALLOWED_TRANSITIONS: dict[AgentStatus, set[AgentStatus]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# The workflow axis: where a run stands, which is not the same question as what happened to it.
+#
+# `AgentStatus` above is the lifecycle this module drives, and `labels.STATES` is the outcome a session
+# file records (`APPLIED_UNVERIFIED`, `CHECKS_PASSED`) — the one buttons are enabled from. Neither answers
+# "how far along is this", which is what a person watching a long task asks. The two vocabularies share
+# exactly one string, `WAITING_APPROVAL`, and disagree about everything else, so the stage is a third axis
+# stored on the session as `stage`, and this table is the only place that says which move counts as one.
+STAGES = ("understand", "plan", "implement", "impact", "review", "approve", "build_test", "verify")
+
+# Every row written out, including the odd ones, so a stage added later cannot inherit an answer by
+# accident: `review` may go to `verify` because a static check runs before anybody approves; `build_test`
+# and `verify` may go back to `review` because a roll put the proposal back on the table; `approve` may
+# return there for the same reason after the files went back.
+#
+# The empty key is a session that never recorded one, and it accepts any stage: a run built from an attached
+# plan file opens at `review` without passing through the four steps before it, and saying otherwise would
+# make the record lie about a thing that simply already happened.
+STAGE_MOVES: dict[str, set[str]] = {
+    "": set(STAGES),
+    "understand": {"plan"},
+    "plan": {"implement", "review", "build_test", "verify"},
+    "implement": {"impact", "review", "plan"},
+    "impact": {"review", "implement"},
+    "review": {"approve", "implement", "build_test", "verify"},
+    "approve": {"build_test", "implement", "review"},
+    "build_test": {"verify", "implement", "review"},
+    "verify": {"build_test", "implement", "review"},
+}
+
+
+def stage_allowed(current: str, target: str) -> bool:
+    """Whether a run may say it moved from one stage to the other.
+
+    An unrecognised current stage answers False, the way `policy.decide` does: a record that cannot be read
+    is not evidence that anything is permitted, and a stage nobody recognises is better left unstated than
+    renamed by a guess.
+    """
+    return str(target or "") in STAGE_MOVES.get(str(current or ""), set())
+
+
+def stage_of(status: AgentStatus) -> str:
+    """The workflow stage a lifecycle status stands in, for the one path that has both."""
+    return {
+        AgentStatus.ANALYZING: "understand",
+        AgentStatus.PLANNING: "plan",
+        AgentStatus.WAITING_APPROVAL: "review",
+        AgentStatus.EXECUTING: "approve",
+        AgentStatus.VERIFYING: "build_test",
+        AgentStatus.FIXING: "implement",
+        AgentStatus.DONE: "verify",
+        AgentStatus.FAILED: "review",
+    }[status]
+
+
 @dataclass
 class Task:
     description: str
