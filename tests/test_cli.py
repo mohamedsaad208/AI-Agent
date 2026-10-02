@@ -717,8 +717,11 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
         code, text = self.run_command(["policy", "--repo", str(self.root)])
         self.assertEqual(code, 0, text)
         for name in sorted(policy.TABLE):
-            self.assertIn(name + " = ", text)
-        self.assertIn("0 of 8", text, "a listing that cannot say how much it overrode is a table with no shape")
+            if name in policy.MANAGED_ACTIONS:
+                self.assertIn(name + " — ", text)
+            else:
+                self.assertIn(name + " = ", text)
+        self.assertIn("0 of 3", text, "a listing that cannot say how much it overrode is a table with no shape")
 
     def test_a_row_set_here_is_the_row_the_same_terminal_obeys(self):
         """One store, two entry points: the row this command writes is the row `apply` reads back, with no
@@ -744,7 +747,7 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
         code, text = self.run_command(["policy", "--repo", str(self.root), "--off"])
         self.assertEqual(code, 0, text)
         self.assertIn(policy.WRITE_THAT_RUNS + " = ask", text)
-        self.assertIn("0 of 8", text)
+        self.assertIn("0 of 3", text)
 
     def test_lifting_one_class_leaves_the_others_declared(self):
         self.run_command(["policy", "--repo", str(self.root), "--action", policy.NETWORK, "--verdict", "deny"])
@@ -754,12 +757,15 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
                                        "--action", policy.WRITE_THAT_RUNS])
         self.assertEqual(code, 0, text)
         self.assertIn("network = deny", text)
-        self.assertIn("1 of 8", text)
+        self.assertIn("1 of 3", text)
 
     def test_a_class_that_does_not_exist_is_a_usage_error_not_a_default(self):
         code, _text = self.usage_error(["policy", "--repo", str(self.root),
                                         "--action", "teleport", "--verdict", "allow"])
         self.assertEqual(code, 2)
+        code, _text = self.usage_error(["policy", "--repo", str(self.root),
+                                        "--action", policy.READ, "--verdict", "deny"])
+        self.assertEqual(code, 2, "a class without an enforcement point cannot be configured")
 
     def test_a_verdict_without_a_class_names_the_flag_it_wants(self):
         code, text = self.run_command(["policy", "--repo", str(self.root), "--verdict", "allow"])
@@ -789,7 +795,10 @@ class TheRunFileAtTheTerminal(unittest.TestCase):
         self.assertEqual(code, 0, text)
         self.assertTrue(any(0x0600 <= ord(char) <= 0x06ff for char in text), text)
         for name in sorted(policy.TABLE):
-            self.assertIn(name + " = ", text)
+            if name in policy.MANAGED_ACTIONS:
+                self.assertIn(name + " — ", text)
+            else:
+                self.assertIn(name + " = ", text)
 
 
 if __name__ == "__main__":

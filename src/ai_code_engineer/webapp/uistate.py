@@ -110,4 +110,4 @@ def stage_block(current: str, *, arabic: bool = False) -> dict:
     return {"current": current, "total": len(codes),
             "steps": [{"code": code, "label": stage_label(code, arabic=arabic),
                        "reached": bool(where) and codes.index(code) < where} for code in codes],
-            "line": stage_line(current, arabic=arabic)}
+            "line": stage_line(current, arabic=arabic, stage_order=core.STAGES)}

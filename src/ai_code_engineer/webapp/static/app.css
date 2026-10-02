@@ -1130,6 +1130,7 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 .policy-row .p-ver { padding: 1px 6px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); }
 .policy-row .p-ver.set { border-color: var(--accent); }
 .policy-row .p-btns { display: flex; gap: 4px; }
+.policy-row .p-managed { flex: 1; min-width: 220px; color: var(--faint); }
 
 .fix-card {
   background: var(--bad-bg); color: var(--bad-ink); border: 1px solid var(--bad-line);

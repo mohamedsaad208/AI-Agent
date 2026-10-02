@@ -202,10 +202,11 @@ function renderRail() {
       ${DATA.fixRounds && DATA.fixRounds.spent ? `<div class="meta" style="margin-top:7px"><span>Fix round ${Number(DATA.fixRounds.spent) || 0} of ${Number(DATA.fixRounds.of) || 0}</span></div>` : ''}
       ${(pl.rows || []).length ? `<details class="policy-card"><summary dir="auto">${esc(pl.heading || '')}</summary>
         ${pl.rows.map(r => `<div class="policy-row" dir="auto"><span class="p-act">${esc(r.action)}</span>
-          <span class="p-ver${r.declared ? ' set' : ''}">${esc((pl.words || {})[r.verdict] || r.verdict)}</span>
+          ${r.editable ? `<span class="p-ver${r.declared ? ' set' : ''}">${esc((pl.words || {})[r.verdict] || r.verdict)}</span>
           <span class="p-btns">${['allow', 'ask', 'deny'].map(v =>
             `<button class="line-btn p-set" data-a="${esc(r.action)}" data-v="${v}" ${r.verdict === v ? 'disabled' : ''}>${esc((pl.words || {})[v] || v)}</button>`).join('')}
-            ${r.declared ? `<button class="line-btn p-clear" data-a="${esc(r.action)}" title="reset">↺</button>` : ''}</span>
+            ${r.declared ? `<button class="line-btn p-clear" data-a="${esc(r.action)}" title="reset">↺</button>` : ''}</span>`
+            : `<span class="p-managed">${esc(r.managed || '')}</span>`}
         </div>`).join('')}
         <div class="meta" dir="auto">${esc(pl.note || '')}</div>
         <div class="meta" dir="auto">${esc(pl.lift || '')}</div></details>` : ''}

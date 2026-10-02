@@ -1,19 +1,18 @@
-"""What kind of action a thing is, and who asked for it.
+"""What kind of action a thing is, and where a network request is aimed.
 
 Four places already refuse things, each with its own idea of why: `workspace.py` gates a path,
 `runner.py` gates a command name, `config.py` gates a provider URL, `git_integration.py` simply has no
 push in it. None of them knows the word for the *class* of the action, so nothing in the tool can answer
 the question the operator asks — "will you ask me before you do that?" — without reading four modules.
 
-Three things are decided here and nothing else. The first is that a proposed change to `.ai_project.json`
+Two things are decided here and nothing else. The first is that a proposed change to `.ai_project.json`
 is not the same kind of act as a proposed change to a DTO, because the tool reads that file back as the
 command to run (`service_runner.py` calls it `CONFIG_FILE`); a write that changes what will execute later
-is its own class. The second is that the same class has a different answer depending on who asked: a
-person pressing a button and a model mid-task are not the same requester, and "unauthorised network" is
-only a meaningful phrase once that distinction is in the table. The third is where a request target
-actually is — because a scheme check answers what a string looks like, and the one button that sends a
-request (`run_api_test`) was trusting it, so `address_class` answers the destination question in codes,
-next to the table that decides what to do about them.
+is its own class. The second is where a request target actually is — because a scheme check answers what
+a string looks like, and the one button that sends a request (`run_api_test`) was trusting it, so
+`address_class` answers the destination question in codes, next to the table that decides what to do about
+them. Every current command and network entry point is operator-triggered; task-originated policy belongs
+at a task-originated execution boundary if one is added later.
 
 The table is code, the verdicts are codes, and the sentences are not here — a reason is a `labels` key
 like every other thing the tool says. Overrides are remembered by `permissions.py`, which is the file
@@ -28,9 +27,6 @@ from urllib.parse import urlsplit
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 VERDICTS = (ALLOW, ASK, DENY)
 
-OPERATOR, TASK = "operator", "task"
-ORIGINS = (OPERATOR, TASK)
-
 READ = "read"
 WRITE = "write"
 WRITE_THAT_RUNS = "write_that_runs"
@@ -41,6 +37,11 @@ GIT_LOCAL = "git_local"
 NETWORK = "network"
 
 ACTIONS = (READ, WRITE, WRITE_THAT_RUNS, DELETE, EXECUTE_RECIPE, EXECUTE_CUSTOM, GIT_LOCAL, NETWORK)
+# Only these classes currently have a decision point that reads the folder's policy. The other
+# classes remain in TABLE as vocabulary for safeguards implemented elsewhere, but must not be
+# presented as overrides that a folder can set without changing behavior.
+CONFIGURABLE_ACTIONS = (WRITE_THAT_RUNS, EXECUTE_CUSTOM, NETWORK)
+MANAGED_ACTIONS = (READ, WRITE, DELETE, EXECUTE_RECIPE, GIT_LOCAL)
 
 # Files this tool itself reads back as instructions, or that a build it starts will execute. A write to
 # any of them is the one write class worth stopping for: the change is not the harm, the *later run* is.
@@ -53,17 +54,17 @@ RUNS_LATER = frozenset({
     "tox.ini", "setup.cfg", "makefile", "dockerfile", "docker-compose.yml", "compose.yaml",
 })
 
-# (who asked) -> what the table answers. A row is written out in full for both origins so that adding a
-# class cannot silently inherit an answer for one of them.
-TABLE: dict[str, dict[str, str]] = {
-    READ: {OPERATOR: ALLOW, TASK: ALLOW},
-    WRITE: {OPERATOR: ALLOW, TASK: ALLOW},
-    WRITE_THAT_RUNS: {OPERATOR: ASK, TASK: ASK},
-    DELETE: {OPERATOR: ASK, TASK: ASK},
-    EXECUTE_RECIPE: {OPERATOR: ALLOW, TASK: ALLOW},
-    EXECUTE_CUSTOM: {OPERATOR: ASK, TASK: DENY},
-    GIT_LOCAL: {OPERATOR: ALLOW, TASK: ALLOW},
-    NETWORK: {OPERATOR: ASK, TASK: DENY},
+# The default answer for each action class. Actor-specific answers are intentionally absent until an
+# action can actually be initiated by more than the operator and has a distinct enforcement boundary.
+TABLE: dict[str, str] = {
+    READ: ALLOW,
+    WRITE: ALLOW,
+    WRITE_THAT_RUNS: ASK,
+    DELETE: ASK,
+    EXECUTE_RECIPE: ALLOW,
+    EXECUTE_CUSTOM: ASK,
+    GIT_LOCAL: ALLOW,
+    NETWORK: ASK,
 }
 
 
@@ -78,18 +79,18 @@ def write_action(path: str) -> str:
     return WRITE_THAT_RUNS if name in RUNS_LATER else WRITE
 
 
-def decide(action: str, origin: str = OPERATOR, override: str = "") -> str:
-    """The verdict for one action class, as asked by one requester, unless the folder overrode it.
+def decide(action: str, override: str = "") -> str:
+    """The default verdict for one action class, unless the folder overrode it.
 
-    Anything this table does not name answers DENY: an unknown class, an unknown origin, and an override
-    whose value is not a verdict each say "the rule is not legible, so it does not permit". A permission
-    store that falls open is a store that grants what it cannot read.
+    An unknown class or an override whose value is not a verdict answers DENY: a permission store that
+    falls open is a store that grants what it cannot read. Actor-specific policies belong at an actual
+    actor-aware execution boundary; current command and network entry points are operator actions.
     """
-    row = TABLE.get(str(action or ""))
-    if row is None:
-        return DENY
-    verdict = row.get(str(origin or ""))
+    verdict = TABLE.get(str(action or ""))
     if verdict is None:
+        return DENY
+    # A folder may answer an ASK differently, but a stored override can never open a hard DENY.
+    if verdict == DENY:
         return DENY
     value = str(override or "").strip().lower()
     if not value:
@@ -168,4 +169,3 @@ def address_of(url: str) -> tuple[str, str]:
     except ValueError:
         host = ""
     return host, address_class(host)
-

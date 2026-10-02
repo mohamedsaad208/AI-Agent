@@ -69,8 +69,8 @@ def parser() -> argparse.ArgumentParser:
                           help="Read or set what one folder answers without asking, for every surface")
     rule.add_argument("--repo", type=Path,
                       help="The folder whose rows are read or written; with no folder, list every declared row")
-    rule.add_argument("--action", choices=sorted(policy.TABLE), metavar="CLASS",
-                      help="One of: " + ", ".join(sorted(policy.TABLE)))
+    rule.add_argument("--action", choices=sorted(policy.CONFIGURABLE_ACTIONS), metavar="CLASS",
+                      help="One of: " + ", ".join(sorted(policy.CONFIGURABLE_ACTIONS)))
     rule.add_argument("--verdict", choices=sorted(policy.VERDICTS),
                       help="allow, ask or deny — an override loosens a question, never opens a refusal")
     rule.add_argument("--off", action="store_true",
@@ -230,8 +230,12 @@ def _policy_table(where, folder: str, arabic: bool) -> None:
             bits = [part for part in (intent.source(own[name].get("by", ""), arabic=arabic),
                                       own[name].get("at", "")) if part]
             tail = "  (" + " · ".join(bits) + ")"
-        safe_print(f"  {name} = {words[permissions.verdict(where, folder, name)]}" + tail)
-    safe_print(shared_note("policy_allow_note", arabic=arabic, count=len(own), total=len(policy.TABLE)))
+        if name in policy.MANAGED_ACTIONS:
+            safe_print(f"  {name} — {shared_note('policy_managed_' + name, arabic=arabic)}")
+        else:
+            safe_print(f"  {name} = {words[permissions.verdict(where, folder, name)]}" + tail)
+    safe_print(shared_note("policy_allow_note", arabic=arabic,
+                           count=len(own), total=len(policy.CONFIGURABLE_ACTIONS)))
 
 
 def run_policy(args) -> int:
@@ -273,8 +277,8 @@ def run_policy(args) -> int:
         return 0
 
     if not args.action or not args.verdict:
-        raise AgentError("A policy row names both a class and a verdict: --action and --verdict. "
-                         "`agent policy --repo PATH` alone prints the eight classes as they answer now.")
+        raise AgentError("A policy row names both a configurable class and a verdict: --action and --verdict. "
+                         "`agent policy --repo PATH` alone prints all classes and their safeguards.")
 
     if not permissions.declare(where, folder, args.action, args.verdict, by=permissions.TERMINAL):
         raise AgentError("Nothing was written: this folder has no record key of its own.")

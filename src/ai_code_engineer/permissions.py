@@ -50,16 +50,16 @@ def _kept(value) -> str:
 
 
 def _clean(actions) -> dict:
-    """Only classes the table knows, and only verdicts the table can answer with.
+    """Only classes with a live policy decision point, and only readable verdicts.
 
-    A row naming `sudo` or `read_file` is dropped rather than kept as a rule for a class that does not
-    exist: an override nobody can name is an override nobody can audit.
+    Legacy rows for classes now handled by a stronger, separate safeguard are ignored here. Keeping them
+    out of the effective override set makes old settings harmless without treating them as applied rules.
     """
     rows: dict = {}
     if isinstance(actions, dict):
         for name, value in actions.items():
             key = str(name or "")
-            if key in policy.TABLE:
+            if key in policy.CONFIGURABLE_ACTIONS:
                 rows[key] = _kept(value)
     return rows
 
@@ -116,30 +116,26 @@ def overrides(app_dir, folder) -> dict:
     return dict(_rows(app_dir).get(key, {}).get("actions") or {})
 
 
-def verdict(app_dir, folder, action: str, origin: str = policy.OPERATOR) -> str:
+def verdict(app_dir, folder, action: str) -> str:
     """The answer for this folder: its own declaration when it made one, the table otherwise.
 
-    An override loosens an ASK; it cannot open a DENY. The two DENY rows in the table are the line this
-    release exists to draw — a model mid-task does not reach the network or a shell command the recipe
-    list does not name — and a click that was about not being interrupted on the operator's own button
-    must not quietly become a grant to the model. Whoever wants that grant can ask for it in words; it
-    is not what "stop asking me about this folder" means.
+    An override changes the table's answer for a class that has a live decision point. The table does not
+    claim actor-specific restrictions: shell commands and network requests currently enter through
+    operator-triggered controls, and any future task-originated action needs its own checked boundary.
     """
     name = str(action or "")
-    if policy.TABLE.get(name, {}).get(origin) == policy.DENY:
-        return policy.DENY
-    return policy.decide(name, origin, overrides(app_dir, folder).get(name, ""))
+    return policy.decide(name, overrides(app_dir, folder).get(name, ""))
 
 
 def declare(app_dir, folder, action: str, value: str, by: str = "") -> dict:
     """Record one verdict for one class in one folder, and return the row that was written.
 
-    An action the table does not know is refused rather than stored: a rule for a class that does not
-    exist is a rule nobody will ever consult, and it survives every audit of this file as noise.
+    An action without a policy decision point is refused rather than stored as an override nobody will
+    ever consult. Its safeguard is described by the interface instead.
     """
     key = folder_key(folder)
     name = str(action or "")
-    if not key or name not in policy.TABLE:
+    if not key or name not in policy.CONFIGURABLE_ACTIONS:
         return {}
     rows = dict(_rows(app_dir))
     row = dict(rows.get(key) or {})
@@ -161,7 +157,7 @@ def forget(app_dir, folder, action: str = "") -> None:
     name = str(action or "")
     if not name:
         rows.pop(key)
-    elif name in rows[key].get("actions", {}):
+    elif name in policy.CONFIGURABLE_ACTIONS and name in rows[key].get("actions", {}):
         actions = dict(rows[key]["actions"])
         actions.pop(name, None)
         rows[key] = {**rows[key], "actions": actions}

@@ -1203,19 +1203,17 @@ class AgentController:
         return modes.refusal(self.app_dir, self.repo, what, arabic=self.arabic,
                              badge=self.composer)
 
-    def policy_check(self, action: str, origin: str = "", **fields) -> tuple[str, str]:
+    def policy_check(self, action: str, **fields) -> tuple[str, str]:
         """What this folder answers for one action class, and the sentence that says so.
 
         Read from the file rather than from anything this window remembers, for the reason `modes.py`
-        records: a rule the other window wrote a minute ago is a rule this one obeys. `origin` names
-        who is asking — a person at a button, or a model mid-task — and the answer differs for exactly
-        the two classes that can reach a shell or a socket.
+        records: a rule the other window wrote a minute ago is a rule this one obeys. These entry points
+        are operator actions; actor-specific policy should be added with an actual task-originated route.
         """
-        verdict = permissions.verdict(self.app_dir, self.repo or "", action,
-                                      origin or policy.OPERATOR)
+        verdict = permissions.verdict(self.app_dir, self.repo or "", action)
         return verdict, policy_line(self.arabic, action, verdict, **fields)
 
-    def policy_confirm(self, action: str, origin: str = "", **fields) -> str:
+    def policy_confirm(self, action: str, **fields) -> str:
         """The sentence that stopped this action, or "" when it may go ahead.
 
         ALLOW answers "" without a dialog — a tool that interrupts for what it permits has trained the
@@ -1225,7 +1223,7 @@ class AgentController:
         the words rather than a flag is what lets a command handler answer with the reason it did not
         run, in the same field its own failure uses.
         """
-        verdict, line = self.policy_check(action, origin, **fields)
+        verdict, line = self.policy_check(action, **fields)
         if verdict == policy.ALLOW:
             return ""
         if verdict == policy.DENY or not line:
@@ -1269,15 +1267,20 @@ class AgentController:
             return {}
         declared = permissions.overrides(self.app_dir, self.repo)
         rows = [{"action": name,
-                 "verdict": permissions.verdict(self.app_dir, self.repo, name),
-                 "declared": name in declared} for name in policy.ACTIONS]
+                 "verdict": (permissions.verdict(self.app_dir, self.repo, name)
+                             if name in policy.CONFIGURABLE_ACTIONS else ""),
+                 "declared": name in declared,
+                 "editable": name in policy.CONFIGURABLE_ACTIONS,
+                 "managed": (shared_note("policy_managed_" + name, arabic=self.arabic)
+                             if name in policy.MANAGED_ACTIONS else "")}
+                for name in policy.ACTIONS]
         return {"heading": shared_note("policy_heading", arabic=self.arabic),
                 "lift": shared_note("policy_lift", arabic=self.arabic),
                 "words": policy_verdicts(self.arabic),
                 "rows": rows,
                 "note": shared_note("policy_allow_note", arabic=self.arabic,
                                     count=sum(1 for row in rows if row["declared"]),
-                                    total=len(rows))}
+                                    total=len(policy.CONFIGURABLE_ACTIONS))}
 
     def stage_block(self) -> dict:
         """How far along this run is, in the order the lifecycle defines.
@@ -1299,8 +1302,8 @@ class AgentController:
         if not self.repo or not Path(self.repo).is_dir():
             raise PolicyError("No project folder selected.")
         action = str(payload.get("action") or "")
-        if action not in policy.ACTIONS:
-            raise PolicyError("Unknown action class: " + action[:40])
+        if action not in policy.CONFIGURABLE_ACTIONS:
+            raise PolicyError("This action is governed by its own safeguard: " + action[:40])
         verdict = str(payload.get("verdict") or "")
         if verdict in policy.VERDICTS:
             permissions.declare(self.app_dir, self.repo, action, verdict, by=permissions.WEB)

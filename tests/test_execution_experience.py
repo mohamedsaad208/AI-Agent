@@ -369,7 +369,7 @@ class TestPolicyAtTheButton(unittest.TestCase):
 
     def test_an_action_the_table_does_not_know_is_not_a_row(self):
         with self.assertRaises(PolicyError):
-            self.c.set_policy({"action": "sudo", "verdict": policy.ALLOW})
+            self.c.set_policy({"action": policy.READ, "verdict": policy.ALLOW})
         self.assertEqual(permissions.overrides(self.app_dir, self.repo), {})
 
 

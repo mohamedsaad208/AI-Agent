@@ -16,7 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from .catalog import LIVE, models_for
 from .chat import create_chat, context_block, load_chat, respond, title_for
-from . import config, overrides
+from . import config, core, overrides
 from .config import Settings
 from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      load_session, plan,
@@ -2244,7 +2244,8 @@ class AgentWindow:
         session = load_session(path)
         self.session, self.session_path = session, path
         self.state_label.set(state_label(session["state"], arabic=self.arabic))
-        self.stage_text.set(stage_line(session.get("stage"), arabic=self.arabic))
+        self.stage_text.set(stage_line(session.get("stage"), arabic=self.arabic,
+                                        stage_order=core.STAGES))
         changes = session.get("changes", [])
         self.artifact.set(state_label(session["state"], arabic=self.arabic))
         self.artifact_detail.set(

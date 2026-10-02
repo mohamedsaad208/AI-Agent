@@ -460,11 +460,15 @@ class FakeController:
                        "lift": labels.note("policy_lift"),
                        "words": labels.policy_verdicts(False),
                        "rows": [{"action": name, "declared": name in self.policy_over,
-                                 "verdict": self.policy_over.get(
-                                     name, policy.TABLE[name][policy.OPERATOR])}
+                                 "editable": name in policy.CONFIGURABLE_ACTIONS,
+                                 "managed": (labels.note("policy_managed_" + name)
+                                             if name in policy.MANAGED_ACTIONS else ""),
+                                 "verdict": (policy.decide(name, self.policy_over.get(name, ""))
+                                             if name in policy.CONFIGURABLE_ACTIONS else "")}
                                 for name in policy.ACTIONS],
                        "note": labels.note("policy_allow_note",
-                                           count=len(self.policy_over), total=len(policy.ACTIONS))},
+                                           count=len(self.policy_over),
+                                           total=len(policy.CONFIGURABLE_ACTIONS))},
             # The same block the real window builds, from the same table order — the strip is a design and
             # designs get reviewed here.
             "stage": uistate.stage_block(self.stage),
@@ -838,7 +842,7 @@ class FakeController:
             # reviewing the thing it exists to show.
             name = str(payload.get("action") or "")
             verdict = str(payload.get("verdict") or "")
-            if name in policy.ACTIONS:
+            if name in policy.CONFIGURABLE_ACTIONS:
                 if verdict in policy.VERDICTS:
                     self.policy_over[name] = verdict
                 else:
@@ -969,7 +973,8 @@ class FakeController:
             url = str(payload.get("url") or "")
             if url:
                 host, kind = policy.address_of(url)
-                if kind in policy.LIMITED and self.policy_over.get(policy.NETWORK) != policy.ALLOW:
+                if kind in policy.LIMITED and policy.decide(
+                        policy.NETWORK, self.policy_over.get(policy.NETWORK, "")) != policy.ALLOW:
                     raise PolicyError(labels.note(
                         "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited",
                         host=host, kind=labels.address_words(False)[kind]))

@@ -128,7 +128,8 @@ def stage_label(value: str | None, *, arabic: bool = False) -> str:
     return table.get(value, value)
 
 
-def stage_line(value: str | None, *, arabic: bool = False) -> str:
+def stage_line(value: str | None, *, arabic: bool = False,
+               stage_order: tuple[str, ...] | None = None) -> str:
     """The whole sentence: which step this is, and how many there are.
 
     The count is part of the sentence rather than a decoration beside it because "Writing the change" alone
@@ -136,7 +137,8 @@ def stage_line(value: str | None, *, arabic: bool = False) -> str:
     record, a stage renamed in a later release — answers with the plain label instead of a step number that
     would be wrong.
     """
-    codes = list(STAGES)
+    # Callers that own the lifecycle pass its ordered codes; STAGES is only the wording map.
+    codes = list(stage_order) if stage_order is not None else list(STAGES)
     if not value or value not in codes:
         return stage_label(value, arabic=arabic)
     return note("stage_line", arabic=arabic, number=codes.index(value) + 1, total=len(codes),
@@ -695,6 +697,16 @@ NOTE_TEMPLATES = {
                        "ما يجيبه هذا المجلد من غير سؤال:"),
     "policy_allow_note": ("{count} of {total} action classes are answered by this folder's own rule",
                           "{count} من {total} من أنواع الأفعال تُجيبها قاعدة هذا المجلد نفسها"),
+    "policy_managed_read": ("File access is governed by the project path rules.",
+                             "الوصول للملفات تحكمه قواعد المسارات داخل المشروع."),
+    "policy_managed_write": ("Writes use the proposal review and Auto-Apply safeguards.",
+                              "الكتابة تخضع لمراجعة المقترح وقواعد التطبيق التلقائي."),
+    "policy_managed_delete": ("Every file deletion requires review, including with Auto-Apply.",
+                              "كل حذف لملف يتطلب مراجعة، حتى مع التطبيق التلقائي."),
+    "policy_managed_execute_recipe": ("Recipes use the built-in allowlist and run only when you start them.",
+                                       "الوصفات تخضع للقائمة المسموح بها ولا تعمل إلا عند تشغيلك لها."),
+    "policy_managed_git_local": ("Local Git actions use their own checks; this tool has no push action.",
+                                  "عمليات Git المحلية لها فحوصها؛ ولا توجد في الأداة عملية دفع للمستودع."),
 }
 
 # `apply_rerun_warning` is the only one with no second-language twin in the other window: Tk has no

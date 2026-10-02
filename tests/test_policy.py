@@ -1,17 +1,17 @@
 """The policy table and the folder rules that override it.
 
-Two questions are answered here and nowhere else in the tool: what *kind* of action a thing is, and who
-asked for it. Before this, four modules refused things with four different ideas of why, and no one could
+One question is answered here and nowhere else in the tool: what *kind* of action a thing is. Before this,
+four modules refused things with four different ideas of why, and no one could
 say whether a proposed write to `.ai_project.json` — the file the runtime reads back as the command to
 run — was an ordinary edit.
 
-Five rules these tests hold. A class the table does not name is refused, and so is an origin it does not
-name, and so is an override whose words it cannot read: a permission store that falls open is a store
+Five rules these tests hold. A class the table does not name is refused, and so is an override whose words
+it cannot read: a permission store that falls open is a store
 that grants what it cannot parse. A write that changes what will run is its own class, matched by the
 last path component however the caller spelled it. An override is remembered per folder in a file that
 is *outside* every approved folder, because a proposal that can edit the rules it is being checked
-against is not checked against anything. An override may loosen an ask and may never open a deny the
-table gives to a model. And nothing in either module imports a window.
+against is not checked against anything. An unreadable override never grants permission. And nothing in
+either module imports a window.
 """
 import json
 from pathlib import Path
@@ -26,10 +26,9 @@ from ai_code_engineer.workspace import Workspace
 
 
 class TableTests(unittest.TestCase):
-    def test_every_class_answers_for_both_requesters(self):
+    def test_every_class_has_a_valid_default_answer(self):
         for action in policy.ACTIONS:
-            for origin in policy.ORIGINS:
-                self.assertIn(policy.TABLE[action][origin], policy.VERDICTS, action + " " + origin)
+            self.assertIn(policy.TABLE[action], policy.VERDICTS, action)
 
     def test_the_table_names_exactly_the_classes_it_documents(self):
         self.assertEqual(sorted(policy.TABLE), sorted(policy.ACTIONS))
@@ -39,30 +38,20 @@ class TableTests(unittest.TestCase):
         self.assertEqual(policy.decide(""), policy.DENY)
         self.assertEqual(policy.decide(None), policy.DENY)
 
-    def test_a_requester_nobody_defined_is_refused(self):
-        self.assertEqual(policy.decide(policy.EXECUTE_CUSTOM, "cron"), policy.DENY)
-        self.assertEqual(policy.decide(policy.EXECUTE_CUSTOM, ""), policy.DENY)
+    def test_the_custom_command_and_network_actions_ask_by_default(self):
+        self.assertEqual(policy.decide(policy.EXECUTE_CUSTOM), policy.ASK)
+        self.assertEqual(policy.decide(policy.NETWORK), policy.ASK)
 
-    def test_a_model_asking_for_a_shell_command_is_refused_where_a_person_is_asked(self):
-        self.assertEqual(policy.decide(policy.EXECUTE_CUSTOM, policy.OPERATOR), policy.ASK)
-        self.assertEqual(policy.decide(policy.EXECUTE_CUSTOM, policy.TASK), policy.DENY)
-
-    def test_a_model_asking_to_reach_the_network_is_refused(self):
-        self.assertEqual(policy.decide(policy.NETWORK, policy.OPERATOR), policy.ASK)
-        self.assertEqual(policy.decide(policy.NETWORK, policy.TASK), policy.DENY)
-
-    def test_the_quiet_classes_are_quiet_for_everyone(self):
+    def test_the_quiet_classes_are_quiet_by_default(self):
         for action in (policy.READ, policy.WRITE, policy.EXECUTE_RECIPE, policy.GIT_LOCAL):
-            for origin in policy.ORIGINS:
-                self.assertEqual(policy.decide(action, origin), policy.ALLOW, action + " " + origin)
+            self.assertEqual(policy.decide(action), policy.ALLOW, action)
 
-    def test_a_write_that_changes_what_runs_is_asked_for_whichever_hand_proposed_it(self):
-        for origin in policy.ORIGINS:
-            self.assertEqual(policy.decide(policy.WRITE_THAT_RUNS, origin), policy.ASK)
+    def test_a_write_that_changes_what_runs_is_asked_by_default(self):
+        self.assertEqual(policy.decide(policy.WRITE_THAT_RUNS), policy.ASK)
 
     def test_an_unreadable_override_is_a_refusal_not_a_permission(self):
-        self.assertEqual(policy.decide(policy.READ, override="maybe"), policy.DENY)
-        self.assertEqual(policy.decide(policy.READ, override="ALLOW"), policy.ALLOW,
+        self.assertEqual(policy.decide(policy.WRITE_THAT_RUNS, override="maybe"), policy.DENY)
+        self.assertEqual(policy.decide(policy.WRITE_THAT_RUNS, override="ALLOW"), policy.ALLOW,
                          "the table's own words are case-insensitive; a stranger's are not")
 
     def test_an_override_only_replaces_the_answer_for_a_class_that_exists(self):
@@ -213,36 +202,34 @@ class StoreTests(unittest.TestCase):
         permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.ALLOW)
         self.assertEqual(permissions.verdict(self.app, self.other, policy.EXECUTE_CUSTOM), policy.ASK)
 
-    def test_a_loosened_ask_does_not_loosen_the_denies_the_table_gives_a_model(self):
+    def test_a_folder_answer_changes_an_ask_for_all_current_entry_points(self):
         permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.ALLOW)
-        self.assertEqual(permissions.verdict(self.app, self.root, policy.EXECUTE_CUSTOM,
-                                            policy.TASK), policy.DENY,
-                         "a lifted ask is about the operator's own button, not the model's")
+        self.assertEqual(permissions.verdict(self.app, self.root, policy.EXECUTE_CUSTOM), policy.ALLOW)
 
     def test_a_declared_deny_is_honoured_for_the_operator_too(self):
         permissions.declare(self.app, self.root, policy.WRITE_THAT_RUNS, policy.DENY)
         self.assertEqual(permissions.verdict(self.app, self.root, policy.WRITE_THAT_RUNS), policy.DENY)
 
     def test_a_hand_written_verdict_the_table_cannot_read_refuses_everything_it_names(self):
-        permissions.declare(self.app, self.root, policy.DELETE, policy.ALLOW)
+        permissions.declare(self.app, self.root, policy.NETWORK, policy.ALLOW)
         file = permissions.path(self.app)
         stored = json.loads(file.read_text(encoding="utf-8"))
         key = permissions.folder_key(self.root)
-        stored["permissions"][key]["actions"][policy.DELETE] = "perhaps"
+        stored["permissions"][key]["actions"][policy.NETWORK] = "perhaps"
         file.write_text(json.dumps(stored), encoding="utf-8")
-        self.assertEqual(permissions.overrides(self.app, self.root)[policy.DELETE], policy.DENY)
+        self.assertEqual(permissions.overrides(self.app, self.root)[policy.NETWORK], policy.DENY)
 
     def test_a_rule_naming_a_class_that_does_not_exist_is_dropped_not_stored(self):
         self.assertEqual(permissions.declare(self.app, self.root, "sudo", policy.ALLOW), {})
         self.assertEqual(permissions.overrides(self.app, self.root), {})
 
     def test_a_row_written_by_hand_with_unknown_classes_keeps_only_the_ones_that_exist(self):
-        permissions.declare(self.app, self.root, policy.DELETE, policy.ALLOW)
+        permissions.declare(self.app, self.root, policy.NETWORK, policy.ALLOW)
         file = permissions.path(self.app)
         stored = json.loads(file.read_text(encoding="utf-8"))
         stored["permissions"][permissions.folder_key(self.root)]["actions"]["read_fil"] = "allow"
         file.write_text(json.dumps(stored), encoding="utf-8")
-        self.assertEqual(sorted(permissions.overrides(self.app, self.root)), [policy.DELETE])
+        self.assertEqual(sorted(permissions.overrides(self.app, self.root)), [policy.NETWORK])
 
     def test_an_unreadable_file_declares_nothing_rather_than_permitting_everything(self):
         permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.ALLOW)
@@ -251,9 +238,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(permissions.verdict(self.app, self.root, policy.EXECUTE_CUSTOM), policy.ASK)
 
     def test_forgetting_one_class_leaves_the_others_declared(self):
-        permissions.declare(self.app, self.root, policy.DELETE, policy.DENY)
+        permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.DENY)
         permissions.declare(self.app, self.root, policy.NETWORK, policy.ALLOW)
-        permissions.forget(self.app, self.root, policy.DELETE)
+        permissions.forget(self.app, self.root, policy.EXECUTE_CUSTOM)
         self.assertEqual(permissions.overrides(self.app, self.root), {policy.NETWORK: policy.ALLOW})
 
     def test_forgetting_the_folder_returns_it_to_the_table(self):
