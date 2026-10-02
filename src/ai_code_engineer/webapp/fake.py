@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, modes, overrides, permissions, policy, repair, runner, setup
+from .. import config, git_integration, intent, labels, modes, overrides, permissions, planbook, policy, repair, runner, setup
 from ..errors import PolicyError
 from .controller import PROJECT_ICONS as ICONS
 from . import uistate
@@ -357,6 +357,62 @@ class FakeController:
         """The same question the real controller asks every write and every run gate."""
         return intent.read_only(self.composer)
 
+    # The scripted plan's own rows and criteria. Statuses are not written here — they follow `self.step`,
+    # so the preview shows one ledger moving rather than five frozen cards.
+    PLAN_STEPS = [(1, "Project foundation", [1]), (2, "Register a user", [1, 2]),
+                  (3, "Login and issue a JWT", [2]), (4, "Protect the routes", [3]),
+                  (5, "Refresh-token rotation", [])]
+    PLAN_CRITERIA = ["A password is stored hashed, never in plain text",
+                     "Logging in with the right password returns a token",
+                     "An expired token is refused by every protected route",
+                     "Refreshing swaps the pair and invalidates the old one"]
+
+    def plan_view(self) -> dict:
+        """The plan card, built the way the real one is: a scripted ledger through `planbook`.
+
+        The statuses follow `self.step` and the verdicts come from the same function the shipped window
+        calls, so the preview cannot drift into drawing a card the real one will not show — and every answer
+        a criterion verdict can give is reachable here without running a build. Step 2 is scripted as closed
+        by a click rather than a command run, which is the difference a verification engine exists to keep.
+        """
+        rows = []
+        for number, (ident, title, accepts) in enumerate(self.PLAN_STEPS, start=1):
+            status = ("verified" if number < self.step else
+                      "in_progress" if number == self.step else "pending")
+            row = {"id": ident, "title": title, "body": title, "status": status,
+                   "session_id": "scripted%02d" % ident if status == "verified" else None,
+                   "verified_at": "2026-10-01 09:1%d" % number if status == "verified" else None,
+                   "accepts": accepts, "sub_goal": None}
+            if number == 2 and status == "verified":
+                row["unproven"] = "the operator said so"
+            rows.append(row)
+        book = {"schema": 2, "root": "", "plan_path": "plan.md", "plan_sha256": "0" * 64,
+                "goal": "Ship the login flow behind a guard",
+                "criteria": list(self.PLAN_CRITERIA), "sub_goals": [], "steps": rows}
+        verdicts = planbook.criterion_verdicts(book)
+        tally = planbook.verdict_tally(verdicts)
+        reasons = {"clicked": labels.note("verdict_clicked"),
+                   "not_run": labels.note("verdict_not_run"),
+                   "uncovered": labels.note("plan_uncovered")}
+        return {"name": "plan.md", "step": self.step, "total": len(rows),
+                "verified": len([row for row in rows if row["status"] == "verified"]),
+                "goal": book["goal"], "criteria": list(self.PLAN_CRITERIA),
+                "uncovered": planbook.uncovered_criteria(book), "sub_goal": "",
+                "strings": {"goal": labels.note("plan_goal"), "criteria": labels.note("plan_criteria"),
+                            "uncovered": labels.note("plan_uncovered"),
+                            "unproven": labels.note("plan_unproven")},
+                "verdicts": [{"number": item["number"], "text": item["text"], "verdict": item["verdict"],
+                              "word": labels.note("verdict_" + item["verdict"]),
+                              "why": reasons.get(item["why"], item["detail"]),
+                              "steps": item["steps"], "at": item["at"]} for item in verdicts],
+                "verdictNote": labels.note("plan_verdicts_line", proved=tally["verified"],
+                                           total=tally["total"]),
+                "note": "Send works on step %d" % self.step,
+                "steps": [{"id": row["id"], "title": row["title"], "status": row["status"],
+                           "current": row["status"] == "in_progress", "accepts": row["accepts"],
+                           "unproven": str(row.get("unproven") or ""), "sub_goal": ""}
+                          for row in rows]}
+
     def snapshot(self) -> dict:
         return {
             "prefs": self.prefs, "busy": self.busy, "cancellable": self.cancellable, "pending": self.pending,
@@ -385,13 +441,7 @@ class FakeController:
                         "text": labels.applied_note(arabic=False, count=len(FILES))}
                        if self.auto_apply and self.state in labels.MUTABLE_STATES
                        else {"count": 0, "text": ""}),
-            "plan": {"name": "plan.md", "step": self.step, "total": 5, "verified": self.step - 1,
-                     "note": "Send works on step %d" % self.step,
-                     "steps": [{"id": 1, "title": "Project foundation", "status": "verified", "current": False},
-                               {"id": 2, "title": "Register a user", "status": "in_progress", "current": self.step == 2},
-                               {"id": 3, "title": "Login and issue a JWT", "status": "pending", "current": self.step == 3},
-                               {"id": 4, "title": "Protect the routes", "status": "pending", "current": self.step == 4},
-                               {"id": 5, "title": "Refresh-token rotation", "status": "pending", "current": self.step == 5}]},
+            "plan": self.plan_view(),
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
                          "models": self.visible_models(), "metrics": dict(self.metrics)},
             "connection": self.connection_info(),

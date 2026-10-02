@@ -579,7 +579,14 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
   font-size: 10.5px; background: var(--chip); color: var(--faint); border-radius: 99px;
   padding: 1px 6px; flex: none;
 }
-.plan-criterion.uncovered b { background: var(--bad-bg); color: var(--bad-ink); }
+/* A criterion's answer is a word, not a colour: the chip carries the verdict the ledger computed, in the
+   language the task was asked in. The three tints are a second channel for the same word, never the only
+   one — "unproven" and "failed" must not be distinguishable by hue alone. */
+.crit-v { font-size: 10.5px; border-radius: 99px; padding: 1px 7px; flex: none; white-space: nowrap; }
+.crit-v.v-verified { background: var(--ok-bg); color: var(--ok-ink); }
+.crit-v.v-failed { background: var(--bad-bg); color: var(--bad-ink); }
+.crit-v.v-unproven { background: var(--warn-bg); color: var(--warn-ink); }
+.plan-verdict-note { margin-top: 5px; font-size: 11.5px; }
 .task-item .task-crit { font-size: 11px; flex: none; }
 .task-item .task-unproven {
   width: 16px; height: 16px; border-radius: 99px; display: grid; place-items: center;

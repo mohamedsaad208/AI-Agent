@@ -99,20 +99,28 @@ function renderRail() {
         const strings = DATA.plan.strings || {};
         const goal = el('div', 'plan-goal');
         goal.appendChild(el('div', 't', '🎯 ' + esc(strings.goal || 'Goal') + ': ' + esc(DATA.plan.goal)));
-        const crit = DATA.plan.criteria || [];
+        const crit = DATA.plan.verdicts || [];
         if (crit.length) {
           goal.appendChild(el('div', 't quiet', esc(strings.criteria || 'Acceptance criteria')));
           const shown = el('div', 'plan-criteria');
-          crit.forEach((text, index) => {
-            const number = index + 1;
-            const holders = steps.filter(step => (step.accepts || []).indexOf(number) >= 0).map(step => step.id);
-            const line = el('div', 'plan-criterion' + (holders.length ? '' : ' uncovered'));
-            line.innerHTML = `<b>${number}</b> ${esc(text)}`
-              + (holders.length ? ` <span class="quiet">· steps ${holders.join(', ')}</span>`
-                                : ` <span class="quiet">· ${esc(strings.uncovered || '')}</span>`);
+          crit.forEach((row) => {
+            const line = el('div', 'plan-criterion ' + esc(row.verdict));
+            // The words are the server's, in the language the task was asked in, and the row opens with a
+            // criterion number — a weak character that cannot decide a paragraph direction. Without this an
+            // Arabic criterion sits in an LTR line and its punctuation ends up on the wrong side.
+            line.dir = 'auto';
+            line.innerHTML = `<b>${esc(String(row.number))}</b> ${esc(row.text)}`
+              + ` <span class="crit-v v-${esc(row.verdict)}">${esc(row.word)}</span>`
+              + (row.steps.length ? ` <span class="quiet">· steps ${esc(row.steps.join(', '))}</span>` : '')
+              + (row.why ? ` <span class="quiet">· ${esc(row.why)}</span>` : '');
             shown.appendChild(line);
           });
           goal.appendChild(shown);
+          if (DATA.plan.verdictNote) {
+            const note = el('div', 'quiet plan-verdict-note', esc(DATA.plan.verdictNote));
+            note.dir = 'auto';
+            goal.appendChild(note);
+          }
         }
         p.appendChild(goal);
       }

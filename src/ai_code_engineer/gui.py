@@ -1676,6 +1676,11 @@ class AgentWindow:
                     + ": " + str(len(planbook.criteria_of(book)))
         if self.chained.get() and row is not None:
             line += " — Send works on it."
+        tally = planbook.verdict_tally(planbook.criterion_verdicts(book))
+        if tally["total"]:
+            # Computed from the ledger's own rows, not from what the last proposal claimed.
+            line += " · " + shared_note("plan_verdicts_line", arabic=self.arabic,
+                                        proved=tally["verified"], total=tally["total"])
         self.plan_status.set(line)
 
     def ledger_for(self, session: dict) -> tuple[Path, dict] | None:

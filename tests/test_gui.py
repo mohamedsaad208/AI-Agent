@@ -532,6 +532,8 @@ Validate the token.
         self.assertEqual(book["criteria"], ["The endpoint answers", "The tests still pass"])
         self.ui.refresh_plan_status()
         self.assertIn("The plan's steps run behind one documented endpoint", self.ui.plan_status.get())
+        self.assertIn("0 of 2 acceptance criteria are proved by a command run", self.ui.plan_status.get(),
+                      "a plan whose steps have never run says so about its criteria too")
         sent = model.calls[-1][1]["content"]
         self.assertIn("Acceptance criteria this step must leave true", sent)
         self.assertIn("The endpoint answers", sent)

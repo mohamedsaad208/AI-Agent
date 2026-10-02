@@ -558,6 +558,16 @@ NOTE_TEMPLATES = {
     "plan_criteria": ("Acceptance criteria", "معايير القبول"),
     "plan_uncovered": ("no step answers this yet", "لا خطوة تجيب على هذا بعد"),
     "plan_unproven": ("marked done without a command run", "مُعلَّم كمنتهي بدون تشغيل أمر"),
+    # The three words a computed criterion verdict can answer with, and the two reasons the middle one
+    # gives. They are here rather than in the client because the client cannot know which language the task
+    # was asked in, and the words are the verdict — a colour alone would leave "unproven" meaning anything.
+    "verdict_verified": ("proved", "مثبتة"),
+    "verdict_failed": ("failed", "فاشلة"),
+    "verdict_unproven": ("not proved", "غير مثبتة"),
+    "verdict_clicked": ("closed by a click, not by a run", "أُغلقت بنقرة لا بتشغيل أمر"),
+    "verdict_not_run": ("no command run has answered it yet", "لم يُجب عنها أي أمر بعد"),
+    "plan_verdicts_line": ("{proved} of {total} acceptance criteria are proved by a command run",
+                           "{proved} من {total} من معايير القبول مثبتة بتشغيل أمر"),
     # A task that stopped mid-turn is a fact the operator has to decide about, so it is said and never
     # acted on: nothing here resumes a run by itself, which is the rule the request queue already lives
     # by (`restored: True` and a press of the play button).

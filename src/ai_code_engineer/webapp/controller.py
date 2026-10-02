@@ -3770,12 +3770,26 @@ class AgentController:
         book = self.ledger
         row = planbook.current(book)
         verified = len(planbook.done_titles(book))
+        verdicts = planbook.criterion_verdicts(book)
+        tally = planbook.verdict_tally(verdicts)
+        reasons = {"clicked": shared_note("verdict_clicked", arabic=self.arabic),
+                   "not_run": shared_note("verdict_not_run", arabic=self.arabic),
+                   "uncovered": shared_note("plan_uncovered", arabic=self.arabic)}
         return {"name": Path(book["plan_path"]).name, "step": row["id"] if row else len(book["steps"]),
                 "total": len(book["steps"]), "verified": verified,
                 "goal": planbook.goal_line(book),
                 "criteria": planbook.criteria_of(book),
                 "uncovered": planbook.uncovered_criteria(book),
                 "sub_goal": planbook.sub_goal_of(book, row),
+                # One verdict per criterion, computed from the ledger's own rows: which step answers it and
+                # what a command run said there. The word is in the payload because the client cannot know
+                # which language the task was asked in.
+                "verdicts": [{"number": item["number"], "text": item["text"], "verdict": item["verdict"],
+                              "word": shared_note("verdict_" + item["verdict"], arabic=self.arabic),
+                              "why": reasons.get(item["why"], item["detail"]),
+                              "steps": item["steps"], "at": item["at"]} for item in verdicts],
+                "verdictNote": shared_note("plan_verdicts_line", arabic=self.arabic,
+                                           proved=tally["verified"], total=tally["total"]),
                 "strings": {"goal": shared_note("plan_goal", arabic=self.arabic),
                             "criteria": shared_note("plan_criteria", arabic=self.arabic),
                             "uncovered": shared_note("plan_uncovered", arabic=self.arabic),

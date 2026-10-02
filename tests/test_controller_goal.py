@@ -155,6 +155,47 @@ class GoalTreeRunTests(ControllerCase):
         self.assertEqual(plan["uncovered"], [2])
         self.assertEqual(plan["steps"][1]["accepts"], [])
 
+    def test_a_new_plan_reads_every_criterion_as_not_run_yet(self):
+        """The verdicts arrive with the tree: a plan that has only just been authored has no proof, and
+        the window has to say which kind of "no" it is holding."""
+        from ai_code_engineer import labels
+        self.attach()
+        self.controller.start_plan("Scaffold the login work")
+        self.controller.join()
+        plan = self.controller.snapshot()["plan"]
+        rows = {row["number"]: row for row in plan["verdicts"]}
+        self.assertEqual(sorted(rows), [1, 2])
+        self.assertEqual({row["verdict"] for row in rows.values()}, {"unproven"})
+        self.assertEqual({row["why"] for row in rows.values()}, {labels.note("verdict_not_run")})
+        self.assertEqual(plan["verdictNote"], labels.note("plan_verdicts_line", proved=0, total=2))
+
+    def test_a_step_closed_by_a_click_leaves_its_criterion_unproven_in_the_snapshot(self):
+        """Item #12's claim, tested at the window: the ledger row says `verified` because that is the only
+        status a click may write, and the verdict beside it still says no command run said so."""
+        from ai_code_engineer import labels
+        self.attach()
+        self.controller.start_plan("Scaffold the login work")
+        self.controller.join()
+        self.controller.complete_step(1)
+        self.assertEqual(self.ledger()["steps"][0]["status"], "verified")
+        plan = self.controller.snapshot()["plan"]
+        rows = {row["number"]: row for row in plan["verdicts"]}
+        self.assertEqual(rows[1]["verdict"], "unproven")
+        self.assertEqual(rows[1]["why"], labels.note("verdict_clicked"))
+        self.assertEqual(plan["verdictNote"], labels.note("plan_verdicts_line", proved=0, total=2))
+
+    def test_the_scripted_preview_sends_the_rows_the_window_sends(self):
+        """One client template draws both windows, so a key the preview forgets is a hole no design
+        review in it would ever show."""
+        from ai_code_engineer.webapp.fake import FakeController
+        self.attach()
+        self.controller.start_plan("Scaffold the login work")
+        self.controller.join()
+        real, fake = self.controller.snapshot()["plan"], FakeController().snapshot()["plan"]
+        self.assertEqual(set(real["verdicts"][0]), set(fake["verdicts"][0]))
+        self.assertEqual({row["verdict"] for row in fake["verdicts"]} - set(planbook.VERDICTS), set())
+        self.assertIn("verdictNote", fake)
+
 
 class VerifyButtonProofTests(unittest.TestCase):
     """The button closes a step on recorded proof, or records that it had none."""
