@@ -282,6 +282,9 @@ def record_run(session_path: Path, result: dict) -> dict:
     slim = {key: value for key, value in result.items() if key not in {"output", "tail", "failures"}}
     slim["failures"] = [redact(str(row)) for row in result.get("failures", [])][:FAILURES_KEPT]
     slim["tail"] = redact((result.get("tail") or "")[-TAIL_KEPT:])
+    # Parsed once, at the only moment the full output is in hand: later rounds and the report read
+    # these facts instead of re-running the regexes over an already-shrunk tail.
+    slim["extract"] = extract(slim)
     session.setdefault("runs", []).append(slim)
     session["state"] = STATE_FOR_RUN[result["status"]]
     event(session, "run", **{key: slim[key] for key in ("recipe", "status", "exit_code", "seconds")})
@@ -326,7 +329,10 @@ def fix_needed(session: dict) -> bool:
 
 def fix_task(run: dict) -> str:
     label = str(run.get("label") or run.get("recipe") or "the command")
-    return (f"The {label} command failed{where_it_ran(run)}. Read the affected files, then propose "
+    return (f"The {label} command failed{where_it_ran(run)}. Read: the evidence block separates what the "
+            "output proves from what is still a hypothesis: if it leaves the cause unconfirmed, "
+            "spend this turn reading the file the failure points at or running a check that "
+            "distinguishes the candidates, and only propose once the cause is observed. Propose "
             "the smallest change that makes it pass. Keep existing behavior and public APIs; do not "
             "delete tests or weaken assertions to pass; do not add dependencies.")
 
@@ -390,6 +396,109 @@ def is_frame(line: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in FRAME_PATTERNS)
 
 
+# ---------------------------------------------------------------- the facts inside a log
+#
+# `evidence()` can name a category and quote lines, but the model still has to re-derive "which test,
+# which file, which line" from the quote every round, and a small local model is the one reader that
+# does that badly. `extract()` derives it once, from the same text the tools themselves printed:
+# failing test ids, error locations, the exception's own name, and a few stack frames kept on purpose
+# (`relevant()` drops frames, which is right for keyword lines and wrong for a trace that ends at the
+# caller the fix belongs in). Everything here is parsed observation: it quotes the log and adds no
+# interpretation, which is what lets the prompt separate "observed" from "hypothesis" honestly.
+
+TEST_ID = re.compile(r"^\s*(?:FAILED|ERROR)?\s*(\S+\.py::\S+|[\w.]+Test[\w.]*(?:\.\w+)?|[\w./-]+\.[A-Za-z_][\w]*\s*\()\s*(?:-|\u2715|\u2717|x)\s*(.{0,160})", re.I)
+PYTEST_FAILED = re.compile(r"^\s*(?:FAILED|ERROR)\s+(\S+(?:::\S+)+)\s*(?:-\s*(.{0,160}))?")
+JEST_FAILED = re.compile(r"^\s*(?:[\u2715\u2717x\u00d7]|●)\s+(.{3,160})")
+JAVA_LOC = re.compile(r"([\w$./\\-]+\.(?:java|kt|kts|scala)):(\d+)(?::\d+)?\s*[:\s]\s*(error|warning)?\s*:?\s*(.{0,160})", re.I)
+CPP_LOC = re.compile(r"([\w$./\\-]+\.(?:cpp|cc|c|h|hpp)):(\d+)(?::\d+)?[:\s]*(error|warning|note)\s*:?\s*(.{0,160})", re.I)
+PY_LOC = re.compile(r'File "([^"]+)", line (\d+)(?:, in (.+))?')
+PY_EXC = re.compile(r"^(?:[\w.]+\.)?([A-Z]\w*(?:Error|Exception|Exit))\s*:\s*(.{0,160})")
+TS_LOC = re.compile(r"([\w./\\-]+\.(?:ts|tsx|js|jsx))[(\s:](\d+)[,:\s]*\d*\)?:\s*(error|warning)\s*(\w+)?:?\s*(.{0,160})", re.I)
+GO_LOC = re.compile(r"([\w./\\-]+\.go):(\d+)(?::\d+)?:\s*(.+?)\s*(?:\(exit status|\.go:?$)", re.I)
+RUST_ARROW = re.compile(r"--> \s*([\w./\\-]+\.rs):(\d+)")
+GRADLE_LOC = re.compile(r"([\w./\\-]+\.(?:kt|java|gradle|kts)) \((?:line )?(\d+)(?:,\s*\d+)?\)")
+FRAME_ONE = re.compile(r"^\s*(?:at\s+[\w.$<>\[\]-]+\([^)]*\)|File \"[^\"]+\", line \d+.*)")
+
+EXTRACT_CAPS = {"failed_tests": 10, "error_sites": 8, "frames": 6, "exceptions": 4}
+
+
+def extract(run: dict) -> dict:
+    """The named facts a failure log carries: tests, places, exception names, frames.
+
+    Reads only what the command printed. Absence is left absent: no invented file, no guessed line —
+    a caller reads `unknowns` from which keys came back empty.
+    """
+    text_lines = [str(row) for row in (run.get("failures") or [])]
+    text_lines += str(run.get("tail") or "").splitlines()
+    out: dict = {"failed_tests": [], "error_sites": [], "exceptions": [], "frames": []}
+    for raw_line in text_lines:
+        line = raw_line.rstrip()
+        flat = line.strip()
+        if not flat:
+            continue
+        hit = PYTEST_FAILED.match(flat) or TEST_ID.match(flat)
+        if hit:
+            ident = str(hit.group(1))[:200]
+            reason = (hit.group(2) or "").strip()[:160]
+            entry = ident + (" — " + reason if reason else "")
+            if entry not in out["failed_tests"] and len(out["failed_tests"]) < EXTRACT_CAPS["failed_tests"]:
+                out["failed_tests"].append(redact(entry))
+            continue
+        hit = JEST_FAILED.match(flat)
+        if hit and len(out["failed_tests"]) < EXTRACT_CAPS["failed_tests"]:
+            entry = hit.group(1).strip()[:200]
+            if entry not in out["failed_tests"]:
+                out["failed_tests"].append(redact(entry))
+            continue
+        for pattern in (JAVA_LOC, CPP_LOC, TS_LOC, GO_LOC, GRADLE_LOC):
+            hit = pattern.search(flat)
+            if hit:
+                path, line_no = hit.group(1).replace("\\", "/"), hit.group(2)
+                message = " ".join(part for part in hit.groups()[2:] if part and not part.isdigit())[:160]
+                entry = f"{path}:{line_no}" + (f" — {message}" if message else "")
+                if (entry not in out["error_sites"]
+                        and len(out["error_sites"]) < EXTRACT_CAPS["error_sites"]):
+                    out["error_sites"].append(redact(entry))
+                break
+        else:
+            hit = PY_LOC.search(flat)
+            if hit and len(out["error_sites"]) < EXTRACT_CAPS["error_sites"]:
+                entry = f"{hit.group(1).replace(chr(92), '/')}:{hit.group(2)}" \
+                        + (f" — in {hit.group(3)}" if hit.group(3) else "")
+                if entry not in out["error_sites"]:
+                    out["error_sites"].append(redact(entry))
+            hit2 = PY_EXC.match(flat)
+            if hit2 and len(out["exceptions"]) < EXTRACT_CAPS["exceptions"]:
+                entry = hit2.group(1) + ": " + hit2.group(2).strip()[:140]
+                if entry not in out["exceptions"]:
+                    out["exceptions"].append(redact(entry))
+            elif RUST_ARROW.search(flat) and len(out["error_sites"]) < EXTRACT_CAPS["error_sites"]:
+                mark = RUST_ARROW.search(flat)
+                entry = f"{mark.group(1)}:{mark.group(2)}"
+                if entry not in out["error_sites"]:
+                    out["error_sites"].append(redact(entry))
+        if (FRAME_ONE.match(flat) or is_frame(flat)) and len(out["frames"]) < EXTRACT_CAPS["frames"]:
+            if flat[:200] not in out["frames"]:
+                out["frames"].append(redact(flat[:200]))
+    return {key: value for key, value in out.items() if value}
+
+
+def unknowns_after_extract(facts: dict) -> list[str]:
+    """What the log does NOT establish, in the words the prompt needs to keep honest.
+
+    The loop's worst failure mode is a fix proposed against a cause that was never shown: naming the
+    gap is what turns 'no file is identified' into an instruction to gather evidence first.
+    """
+    gaps = []
+    if not facts.get("error_sites"):
+        gaps.append("no file and line of the cause is established by this output")
+    if not facts.get("failed_tests"):
+        gaps.append("the failing test or task is not named by this output")
+    if not facts.get("exceptions"):
+        gaps.append("the exception or error type is not stated in its own words")
+    return gaps
+
+
 def relevant(run: dict, category: str, limit: int = 4000) -> str:
     """The lines of the tail that speak about this kind of failure, in the order they were printed.
 
@@ -440,17 +549,42 @@ def classify(run: dict) -> str:
 
 
 def evidence(run: dict) -> str:
-    """Untrusted build/test output for the next turn, capped for small context budgets."""
+    """Untrusted build/test output for the next turn, capped for small context budgets.
+
+    Split into what the command *said* and what remains unestablished, because a repair turn that
+    reads its category guess as a diagnosis proposes against the guess. The structured facts come
+    from `extract()`; the raw lines follow so nothing parsed is taken on trust without its source.
+    """
     category = classify(run)
     folder = runner.run_folder(run)
-    lines = ["Command: " + str(run.get("command", ""))]
+    facts = run.get("extract") or extract(run)
+    lines = ["Observed — quoted directly from the command's own output, not conclusions:"]
+    lines.append("Command: " + str(run.get("command", "")))
     if folder:
         lines.append("Folder: " + folder + " of the opened project")
     lines += ["Exit code: " + str(run.get("exit_code")),
               "Status: " + str(run.get("status", ""))]
+    if facts.get("failed_tests"):
+        lines.append("Failing tests named by the output:")
+        lines.extend("  " + row for row in facts["failed_tests"])
+    if facts.get("error_sites"):
+        lines.append("Places the output points at (file:line):")
+        lines.extend("  " + row for row in facts["error_sites"])
+    if facts.get("exceptions"):
+        lines.append("Error types in the output's own words:")
+        lines.extend("  " + row for row in facts["exceptions"])
+    if facts.get("frames"):
+        lines.append("Top stack frames:")
+        lines.extend("  " + row for row in facts["frames"])
     if category:
-        lines.append("What this looks like: " + category)
-    if run.get("failures"):
+        lines.append("Hypothesis — What this looks like: " + category
+                     + "; a classification of the shape, not proof of the cause.")
+    gaps = unknowns_after_extract(facts)
+    if gaps:
+        lines.append("Not established: " + "; ".join(gaps)
+                     + ". Until the cause is confirmed by a file you read or a check you ran, "
+                       "gather that evidence instead of proposing a change.")
+    if run.get("failures") and not facts.get("failed_tests"):
         lines.append("Reported problems:")
         lines.extend("  " + str(row)[:300] for row in run["failures"][:FAILURES_KEPT])
     picked = relevant(run, category)

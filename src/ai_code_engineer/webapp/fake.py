@@ -243,6 +243,9 @@ class FakeController:
         self.auto_fix = False
         self.tab = "diff"
         self.pending: str | None = None
+        self.fast_model = "qwen2.5-coder:1.5b"
+        self.strong_model = "qwen2.5-coder:7b"
+        self.semantic_model_dir = "models"
         # The activity strip draws from this, so the preview needs a live-looking line of its own.
         self.status_line = "Turn 3/12: asking qwen2.5-coder:1.5b..."
         # The rows the Overrides section shows, held in memory: a preview that wrote to this machine's
@@ -480,7 +483,10 @@ class FakeController:
                          "timeout": self.timeout, "model_info": self._model_info(),
                          "memory": self.memory,
                          "memory_info": self.memory_info,
-                         "consent": self.consent},
+                         "consent": self.consent,
+                         "fast_model": self.fast_model,
+                         "strong_model": self.strong_model,
+                         "semantic_model_dir": self.semantic_model_dir},
             "draft": self.draft,
             "queue": {"items": self.queue, "held": self.queue_held, "elsewhere": 1,
                       "chat": "c-1", "kind": "chat",
@@ -873,6 +879,12 @@ class FakeController:
             self.set_target(str(payload.get("value") or ""))
         elif type == "set_filter":
             self.model_filter = str(payload.get("value", ""))
+        elif type == "set_fast_model":
+            self.fast_model = str(payload.get("value") or "")
+        elif type == "set_strong_model":
+            self.strong_model = str(payload.get("value") or "")
+        elif type == "set_semantic_model_dir":
+            self.semantic_model_dir = str(payload.get("value") or "")
         elif type == "set_model":
             self.model = str(payload.get("value", ""))
             self.selections[self.mode] = self.model
@@ -899,6 +911,8 @@ class FakeController:
             emit({"kind": "toast",
                   "text": "%d models listed for %s in this preview — the real window asks the "
                           "provider." % (len(self.visible_models()), self.mode)})
+        elif type == "test_connection":
+            return {"ok": True, "model": self.model, "reply": "Ping test OK (simulated in preview).", "duration": 0.05}
         elif type == "set_draft":
             self.draft = str(payload.get("text", ""))
         elif type == "set_key":

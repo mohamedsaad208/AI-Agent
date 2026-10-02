@@ -12,6 +12,9 @@ from . import ignore, runner, symbols
 from .errors import MissingFileError, PolicyError
 
 MAX_FILE_BYTES = 128 * 1024
+# The read cache is a turn's worth of relief, not a second copy of the project in memory:
+# 2 MB of decoded text is dozens of typical source files, and the oldest entries go first.
+READ_CACHE_CHARS = 2_000_000
 TEXT_SUFFIXES = {".py", ".java", ".kt", ".kts", ".xml", ".gradle", ".md", ".txt",
                  ".json", ".yaml", ".yml", ".toml", ".properties", ".sql", ".js",
                  ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".css", ".html",
@@ -106,6 +109,14 @@ class Workspace:
         # walk has run, which is the honest answer to "what did you not show me".
         self.skipped_generated = 0
         self.skipped_ignored = 0
+        # Short-lived reuse of the decoded bytes of a read. It is invalidated by this instance's own
+        # writes, and it re-checks mtime and size before answering, so a file changed outside the tool
+        # is re-read on the next call rather than served stale. The hashes that gate every write still
+        # come from the bytes on disk; this only stops a 40-file `search_code` from paying the disk
+        # forty times inside one turn when the tree has not moved. The directory walk is never cached:
+        # a stale file list would hide a file an outside editor just created.
+        self._read_cache: dict[str, tuple[int, int, dict]] = {}
+        self._read_chars = 0
 
     def path(self, relative: str, *, writable: bool = False) -> Path:
         if not isinstance(relative, str) or not relative or len(relative) > 400:
@@ -160,6 +171,9 @@ class Workspace:
             raise PolicyError("Path is not a regular file: " + relative)
         if info.st_size > MAX_FILE_BYTES:
             raise PolicyError(f"File exceeds the {MAX_FILE_BYTES // 1024} KiB read limit: " + relative)
+        cached = self._read_cache.get(relative)
+        if cached and cached[0] == info.st_mtime_ns and cached[1] == info.st_size:
+            return dict(cached[2])
         raw = path.read_bytes()
         if len(raw) > MAX_FILE_BYTES or b"\x00" in raw:
             raise PolicyError("File is too large or binary.")
@@ -173,7 +187,13 @@ class Workspace:
             raise PolicyError(
                 f"File '{relative}' is not valid UTF-8 (invalid byte 0x{raw[exc.start]:02x} at "
                 f"offset {exc.start}). Convert it to UTF-8, or keep it out of the task.") from exc
-        return {"path": relative, "sha256": digest(raw), "content": content}
+        result = {"path": relative, "sha256": digest(raw), "content": content}
+        while self._read_cache and self._read_chars > READ_CACHE_CHARS:
+            self._read_cache.pop(next(iter(self._read_cache)))
+            self._read_chars = sum(len(row[2]["content"]) for row in self._read_cache.values())
+        self._read_cache[relative] = (info.st_mtime_ns, info.st_size, result)
+        self._read_chars += len(content)
+        return dict(result)
 
     def files(self, limit: int = 2000) -> list[str]:
         """Every path this tool is willing to look at, in one walk.
@@ -368,7 +388,25 @@ class Workspace:
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+        self._forget(relative)
         return digest(raw)
+
+    def _forget(self, relative: str) -> None:
+        """Drop every per-instance cache entry a write or delete just made untrue.
+
+        The read cache holds bytes that no longer exist after a write; the shared `INDEX_CACHE` row
+        and the semantic vectors do too, but those are keyed outside this instance, so `ws.write`
+        also clears the parse row for this path. A stale entry here is a correctness bug,
+        not just a slower one, because the next turn would propose against content that is gone.
+        """
+        self._read_cache.pop(relative, None)
+        self._read_chars = sum(len(row[2]["content"]) for row in self._read_cache.values())
+        INDEX_CACHE.pop((self._cache_key, relative), None)
+        try:
+            from . import semantic
+            semantic.forget(str(self.root), relative)
+        except Exception:   # noqa: BLE001 — the write already happened; cache hygiene cannot undo it
+            pass
 
     def remove(self, relative: str, expected: str | None) -> None:
         """Delete one file a proposal named, under the same guards `write` runs.
@@ -386,3 +424,4 @@ class Workspace:
         if self.read(relative)["sha256"] != expected:
             raise PolicyError("Concurrent edit detected; removal cancelled.")
         path.unlink()
+        self._forget(relative)

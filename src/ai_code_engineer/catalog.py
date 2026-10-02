@@ -103,7 +103,8 @@ def openai_models(base: str, api_key: str | None = None, *, cloud: bool = True) 
         name = item.get("id") or item.get("name") if isinstance(item, dict) else item
         if not isinstance(name, str) or not name.strip():
             continue
-        found[name] = {"id": name, "name": name, "cloud": cloud,
+        clean_name = name[7:] if name.startswith("models/") else name
+        found[clean_name] = {"id": clean_name, "name": clean_name, "cloud": cloud,
                        "free": False,
                        "description": "Listed by this provider's /models endpoint. Pricing is not "
                                       "reported there — check the service."}

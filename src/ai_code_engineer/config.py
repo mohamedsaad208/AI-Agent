@@ -38,8 +38,10 @@ REQUEST_TIMEOUT_HIGH = 900
 # qwen2.5-coder:1.5b was the fastest model that produced valid, correct proposals.
 DEFAULT_MODEL = "qwen2.5-coder:1.5b"
 RECOMMENDED = {
-    "qwen2.5-coder:1.5b": "recommended here — valid proposals in ~25s, good default for iterating",
+    "qwen2.5-coder:1.5b": "fastest recommended choice here — valid proposals in ~25s; good for quick planning and iteration",
     "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
+    "gemini-2.0-flash": "Google Gemini (Google AI Studio) — generous free tier, fast response, excellent for coding",
+    "llama-3.3-70b-versatile": "Groq — ultra-fast LPU inference (300+ tok/s) with flagship open-weights reasoning",
 }
 
 
@@ -91,12 +93,16 @@ KINDS = (
     Kind("openai", "OpenAI", "https://api.openai.com/v1", "openai", True, True, "OPENAI_API_KEY",
          verified=("gpt-4o-mini", "gpt-4o"), url_env="OPENAI_BASE_URL"),
     Kind("groq", "Groq", "https://api.groq.com/openai/v1", "openai", True, True, "GROQ_API_KEY",
-         verified=("llama-3.3-70b-versatile", "llama-3.1-8b-instant"), url_env="GROQ_BASE_URL"),
+         verified=("llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen-qwq-32b", "deepseek-r1-distill-llama-70b"),
+         url_env="GROQ_BASE_URL"),
     Kind("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "openai", True, True,
          "DEEPSEEK_API_KEY", verified=("deepseek-chat", "deepseek-reasoner"),
          url_env="DEEPSEEK_BASE_URL"),
     Kind("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "openai", True, True,
          "OPENROUTER_API_KEY", routing=True, free_only=True, url_env="OPENROUTER_BASE_URL"),
+    Kind("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "openai", True, True,
+         "GEMINI_API_KEY", verified=("gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"),
+         url_env="GEMINI_BASE_URL"),
     # A user-typed base URL. The shape is OpenAI-compatible; the trust is decided by the host, so
     # loopback is local and anything else is treated exactly like a cloud row.
     Kind("generic", "Custom endpoint", "", "openai", False, False, "", url_env="AGENT_ENDPOINT"),
@@ -104,6 +110,7 @@ KINDS = (
 BY_KEY = {kind.key: kind for kind in KINDS}
 OLLAMA = BY_KEY["ollama"]
 OPENROUTER = BY_KEY["openrouter"]
+GEMINI = BY_KEY["gemini"]
 GENERIC = BY_KEY["generic"]
 DEFAULT_KIND = OLLAMA
 
@@ -279,6 +286,16 @@ class Settings:
     # The *name* of the variable that holds a key, never a key. A profile that carried a value would
     # put a credential in a file that is meant to be committed.
     api_key_env: str = ""
+    # Two optional local models for the fast/strong split (see `providers.py` and the loop). Empty
+    # means "not chosen": the loop keeps using `model` for every request, so a profile written before
+    # this field existed behaves exactly as it did. When both are set, small mechanical turns go to the
+    # fast model and planning/diagnosis turns go to the strong one — all still the same local endpoint.
+    fast_model: str = ""
+    strong_model: str = ""
+    # Optional folder of local FastEmbed model files for semantic retrieval. Empty, a missing folder,
+    # or an uninstalled FastEmbed all mean the same thing: retrieval is lexical, exactly as before.
+    # Nothing here downloads a model; the operator places the files and points this at them.
+    semantic_model_dir: str = ""
 
 
 def apply_overrides(settings: Settings, app_dir=None, *, keep=()) -> Settings:
@@ -331,7 +348,8 @@ def load_settings(path: Path | None, app_dir=None) -> Settings:
         limits = data.get("limits", {})
         if not isinstance(model, dict) or not isinstance(limits, dict):
             raise AgentError("Configuration model and limits must be TOML tables.")
-        if set(model) - {"provider", "name", "endpoint", "api_key_env"} or set(limits) - {
+        if set(model) - {"provider", "name", "endpoint", "api_key_env",
+                         "fast_model", "strong_model", "semantic_model_dir"} or set(limits) - {
             "max_turns", "timeout_seconds", "context_chars", "output_tokens"
         }:
             raise AgentError("Unknown configuration field.")
@@ -339,6 +357,9 @@ def load_settings(path: Path | None, app_dir=None) -> Settings:
             provider=model.get("provider", "ollama"),
             model=model.get("name", DEFAULT_MODEL),
             api_key_env=model.get("api_key_env", ""),
+            fast_model=model.get("fast_model", ""),
+            strong_model=model.get("strong_model", ""),
+            semantic_model_dir=model.get("semantic_model_dir", ""),
             **limits,
         )
         # The endpoint is resolved against the provider this same file names, through the one function
@@ -371,6 +392,9 @@ def validate(settings: Settings) -> None:
     if not isinstance(settings.api_key_env, str) or (
             settings.api_key_env and not ENV_NAME.fullmatch(settings.api_key_env)):
         raise AgentError("api_key_env must name an environment variable, not hold a key.")
+    for name in ("fast_model", "strong_model", "semantic_model_dir"):
+        if not isinstance(getattr(settings, name), str):
+            raise AgentError(f"{name} must be a string.")
     check_endpoint(kind, settings.endpoint)
     for name, (low, high) in LIMITS.items():
         value = getattr(settings, name)

@@ -22,13 +22,14 @@
 
 <br/>
 
-**AI Code Engineer** is an enterprise-grade autonomous software engineering agent equipped with deep architectural repo-scanning, a deterministic typed state machine, an autonomous build/test/fix repair loop, enterprise-grade zero-trust guardrails, and native bilingual (English & Arabic RTL) support. It runs 100% offline with local Ollama models or seamlessly connects to cloud providers (OpenRouter, OpenAI, Groq, DeepSeek).
+**AI Code Engineer** is an enterprise-grade autonomous software engineering agent equipped with deep architectural repo-scanning, a deterministic typed state machine, an autonomous build/test/fix repair loop, enterprise-grade zero-trust guardrails, and native bilingual (English & Arabic RTL) support. It runs 100% offline with local Ollama models or seamlessly connects to cloud providers (**Google Gemini**, OpenRouter, OpenAI, Groq, DeepSeek).
 
 <br/>
 
 [Key Highlights](#-key-highlights) •
 [Quick Start](#-quick-start) •
 [Core Architectural Pillars](#-core-architectural-pillars) •
+[Offline Extras & Planning](#-offline-extras) •
 [Platform Guide](#-platform-guide) •
 [Three Modes & Limits](#-three-modes-and-the-limits-that-go-with-them) •
 [Try These First](#-try-these-first) •
@@ -45,13 +46,15 @@
 | Capability | What It Delivers |
 | :--- | :--- |
 | ☕ **13-Layer Spring Boot & Polyglot Scanner** | Deeply inspects enterprise codebases across 13 distinct architectural layers (Controllers, Services, Repositories, Entities, DTOs, Mappers, Security, Configs, Exceptions, Events, Clients, Utils, Tests) with 200+ recognized annotations and inter-class dependency graph resolution. |
+| 📋 **Structured Planning & Requirement Grounding** | Validates proposed task steps against real repository symbols, tests, and build facts (`--plan-file`). Rejects hallucinated targets before any code is generated. |
 | ⚙️ **Deterministic State Machine (`AgentCore`)** | Replaces unconstrained agent loops with a formally bounded, typed Finite State Machine (`PENDING` ➔ `PLANNING` ➔ `REVIEWING` ➔ `EXECUTING` ➔ `VERIFYING` ➔ `FIXING` ➔ `DONE` / `FAILED`), ensuring full auditability and rollback safety. |
 | 🔁 **Self-Healing Build / Test / Fix Loop** | Detects real build toolchains (`Maven`, `Gradle`, `pytest`, `unittest`, `npm`, `cargo`, `go test`), executes tests, parses JUnit XML & terminal failure traces, and autonomously repairs code (bounded to a strict 3-round safety ceiling). |
+| 🧠 **Dual-Model Routing & Local Semantic Search** | Routes cheap gathering turns to lightweight models while reserving strong models for planning/repair. Includes offline local vector embeddings via preloaded FastEmbed BGE-small. |
 | 🛑 **Instant Task Cancellation** | True real-time task cancellation across Web and Desktop GUI: terminates running process trees cleanly (`kill_tree`) via `taskkill /F /T` on Windows or `kill -9` on Unix, interrupts streaming LLM inference, and safely resets agent readiness. |
 | 🔒 **Zero-Trust Security & Enterprise-Grade Guardrails** | Strict filesystem sandbox prevents path-traversal attacks (`..`), symlink escapes, and system device access (`CON`, `NUL`). Automated live regex redactor strips secrets, API keys, PEM private keys, JWTs, and database credentials before model exposure. |
 | 🌿 **Non-Destructive Git Checkpoints & Targeted Restore** | Every applied diff commits to a local checkpoint commit (`--no-verify`, skips hooks). If subsequent changes block rollback, Targeted Single-File Git Restore safely restores modified files to the exact pre-task commit without rewriting git history. |
 | 🌐 **Native Bilingual Engine & Arabic RTL** | Full first-class Arabic and English dual support. Dynamic Right-to-Left (RTL) interface in the WebApp, automatic language detection (`is_arabic`), and fully localized diagnostic reports and `--arabic` CLI flags. |
-| ⚡ **100% Offline & Multi-Provider Cloud** | Full privacy-first execution with local **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Seamlessly switch to cloud models via **OpenRouter**, **OpenAI**, **Groq**, or custom OpenAI-compatible endpoints. |
+| ⚡ **100% Offline & Multi-Provider Cloud** | Full privacy-first execution with local **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Seamlessly switch to cloud models via **Google Gemini** (`gemini-3.8-flash`), **OpenRouter**, **OpenAI**, **Groq**, or custom OpenAI-compatible endpoints. |
 
 ---
 
@@ -195,6 +198,36 @@ whose code or configuration you do not trust.
 
 ---
 
+# 🧠 Offline Extras, Google Gemini & Structured Planning
+
+The latest updates introduce several architectural improvements for speed, reasoning, planning quality, and cloud flexibility:
+
+**Structured Planning & Requirement Grounding (`planning.py`).**
+The planning engine now validates proposed tasks against real repository facts. When providing a structured plan via `--plan-file` or the WebApp composer, the agent checks symbol references, test surfaces, and requirement coverage before proposing diffs. This eliminates hallucinations of nonexistent classes or endpoints.
+
+**Google Gemini Provider Integration (`profiles/gemini.toml`).**
+Native Google Gemini support is integrated directly via Google AI Studio's OpenAI-compatible endpoint. Features include:
+- Automatic prefix stripping (`models/gemini-...` ➔ `gemini-...`).
+- Preset profile configured at `profiles/gemini.toml`.
+- Preflight cURL generation and diagnostic testing (`agent.py curl --provider gemini --model gemini-3.8-flash --run`).
+- Key auto-resolution from `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+
+**Preloaded Local FastEmbed Semantic Search.**
+Local embedding models (`fastembed_bge_small`) are pre-bundled in the `models/` folder for 100% offline semantic retrieval. `symbols.rank` pairs lexical search with vector embeddings cached in `.agent-semantic.json`, ensuring high-precision symbol discovery without network roundtrips.
+
+**Structured Task State & Anti-Loop Streaming Guards.**
+The orchestration engine maintains continuity across turns using typed task state (`taskstate.py`). Binding operator constraints are preserved across long-context trimming, while streaming safeguards monitor repetitive token output to prevent generation loops.
+
+**Dual-Model Fast / Strong Routing.**
+Profiles can specify distinct `fast_model` and `strong_model` definitions (e.g. lightweight models for mechanical `read_file` or `search_code` operations, reserving stronger reasoning models for diff synthesis, architectural decisions, and repair).
+
+**Optional Local Evals.**
+Deterministic eval test suites (`tests/test_improvement_evals.py`) and promptfoo configurations (`tools/eval/promptfooconfig.yaml`) ensure regressions are detected before changes reach production.
+
+[FastEmbed]: https://github.com/qdrant/fastembed
+
+---
+
 # 💻 Platform Guide
 
 | Platform | GUI WebApp Launcher | Interactive CLI Launcher | Direct Terminal Command |
@@ -238,6 +271,12 @@ python agent.py read-only --repo examples/demo_repo --off
 
 # Plan and propose code changes using local Ollama
 python agent.py plan "Fix add in calculator.py so it adds two numbers" --repo examples/demo_repo --config profiles/local.toml
+
+# Plan with a structured Markdown plan file
+python agent.py plan "Implement auth service features" --repo path/to/project --plan-file plan.md --config profiles/gemini.toml --allow-cloud
+
+# Test provider reachability via cURL tool (Google Gemini or Ollama)
+python agent.py curl --provider gemini --model gemini-3.8-flash --prompt "Ping" --run
 
 # Review proposed diff
 python agent.py review "<session_id>"
@@ -318,7 +357,12 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 │         Model Providers         │                             │       Workspace & Security        │
 │  - Ollama (Local CPU/GPU)       │                             │  - Path Traversal Guard (..)      │
 │  - OpenRouter / DeepSeek        │                             │  - Zero-Trust Secret Redactor     │
-│  - OpenAI / Groq / Custom HTTP  │                             │  - SHA-256 Hash-Locked Diffs      │
++─────────────────────────────────+                             +───────────────────────────────────+
+│         Model Providers         │                             │       Workspace & Security        │
+│  - Ollama (Local CPU/GPU)       │                             │  - Path Traversal Guard (..)      │
+│  - Google Gemini (AI Studio)    │                             │  - Zero-Trust Secret Redactor     │
+│  - OpenRouter / DeepSeek        │                             │  - SHA-256 Hash-Locked Diffs      │
+│  - OpenAI / Groq / Custom HTTP  │                             │  - Task State Continuity Guards   │
 +─────────────────────────────────+                             +───────────────────────────────────+
                                                                                   │
                                                                                   ▼
@@ -338,6 +382,9 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 | Path | Purpose |
 | :--- | :--- |
 | `src/ai_code_engineer/core.py` | **AgentCore State Machine:** Typed dataclasses (`Task`, `Plan`, `Action`, `AgentState`, `VerificationResult`) and deterministic transition engine. |
+| `src/ai_code_engineer/planning.py` | **Structured Planning & Requirement Grounding:** Validates task proposals against real symbols, tests, and build facts. |
+| `src/ai_code_engineer/taskstate.py` | **Task State Continuity:** Bounded session continuity ledger, user binding constraints, and streaming anti-loop guards. |
+| `src/ai_code_engineer/semantic.py` | **Local Offline Semantic Search:** FastEmbed vector retrieval and `.agent-semantic.json` embedding cache. |
 | `src/ai_code_engineer/repo_scanner.py` | **Architectural Repository Scanner:** 13-layer parser, 200+ annotation detectors, dependency graph extractor, `project-index.json`, and `index_boost`. |
 | `src/ai_code_engineer/repair.py` | **Autonomous Repair Loop:** `execute_verification`, `verification_from_run`, `handle_fix_evaluation`, and bounded 3-round repair logic. |
 | `src/ai_code_engineer/engine.py` | **Core Orchestration Loop:** Planning, diff creation, architecture-boosted context selection, and session persistence. |
@@ -346,9 +393,10 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 | `src/ai_code_engineer/redaction.py` | **Zero-Trust Secret Redaction:** Real-time scrubbing of API keys, PEM private keys, JWT tokens, and connection strings. |
 | `src/ai_code_engineer/webapp/` | **Desktop WebApp:** Loopback server (`server.py`), state controller (`controller.py`), project manager (`projects.py`), and modern CSS/JS client. |
 | `src/ai_code_engineer/gui.py` | **Native Desktop Tk GUI:** Lightweight Python Tkinter desktop client sharing the same engine and sentences. |
+| `models/` | **Preloaded Offline Embedding Models:** Local FastEmbed BGE-small ONNX models and tokenizer configs. |
 | `tests/` | **1,740+ Automated Tests:** Extensive unit and integration test coverage across all features, state machine transitions, scanner layers, and repair loops. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | **System Launchers:** CLI entry point, desktop window entry, and interactive terminal menu. |
-| `profiles/` | **Model Profiles:** TOML configuration presets for local Ollama and cloud providers. |
+| `profiles/` | **Model Profiles:** TOML configuration presets for local Ollama, Google Gemini (`gemini.toml`), and cloud providers. |
 | `assets/` | **Brand Assets:** Vector banner with official logo (`banner.svg`), logo assets (`logo.png`), and UI demo animations. |
 
 ---

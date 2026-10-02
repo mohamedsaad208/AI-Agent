@@ -18,6 +18,7 @@
 # Session JSON, chat history and streamed logs - controller.py self.runs / self.chats.
 .agent-runs/
 .agent-chats/
+.agent-semantic.json
 
 # Plan-step ledgers and project notes - controller.py self.plans / self.memory_dir. Deliberately
 # outside the approved folder so the model cannot rewrite what gates or instructs it.

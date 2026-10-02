@@ -20,7 +20,9 @@ from . import labels
 from . import memory as memory_module
 from . import prompts
 from . import refusals
+from . import semantic
 from . import symbols
+from . import taskstate
 from .providers import ModelProvider, metrics_of
 from .redaction import redact
 from .workspace import Workspace, digest
@@ -246,6 +248,12 @@ MAX_TASK_CHARS = 4000
 # plausible files in front of a model, and a sixth costs budget for a guess. The real limit stays the
 # budget, not this number.
 MAX_CONTEXT_FILES = 5
+
+# The actions that are fetching, not deciding: a turn whose previous step was one of these only needs
+# a well-shaped next envelope, which is the task the optional fast local model is chosen for. Reading
+# the shortlist is not planning; proposing and recovering from a refusal are, and those stay strong.
+GATHER_ACTIONS = frozenset({"list_files", "read_file", "search_code", "find_symbol",
+                            "find_references"})
 
 # How many of those five slots a *partial* file may take. A budget too small for a whole file used to
 # mean the model never saw that file at all; an excerpt gives it the declarations around the symbol the
@@ -720,7 +728,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
          plan_step: int | None = None, memory: str | None = None, step=None,
          on_token=None, goal: str = "", criteria: list[str] | None = None,
          accepts: list[int] | None = None, resume_run: str | None = None,
-         fix_round: int = 0) -> Path:
+         fix_round: int = 0, fast_provider=None, strong_provider=None) -> Path:
     """Run the tool loop until the model proposes a change.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
@@ -729,6 +737,11 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     and can open the stored event behind them later. The CLI and the Tk window pass neither and keep
     the single stream they always had. `on_token`, when given, hears the model's own writing as it
     arrives — a display consumer only, since the reply the loop acts on is the assembled one.
+
+    `fast_provider` and `strong_provider` are the optional local fast/strong pair: mechanical
+    gathering turns go to the fast model and the first turn plus any turn that has to recover
+    from a refusal goes to the strong one. Both default to None, which keeps every request on
+    `provider` — the pre-split behaviour, and the fallback whenever the profile names no extras.
 
     extra_context carries untrusted evidence captured by the runtime (a build or test
     log) so a repair turn can see the failure without widening the task text limit.
@@ -782,6 +795,11 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         path = runs.resolve() / run_id / "session.json"
         session = {"schema": 1, "id": run_id, "root": str(ws.root), "task": task,
                    "state": "DISCOVERING", "created": now(), "events": [], "model": provider.model}
+    # The continuity record lives on the session, not in the history: trimming a turn must never
+    # take with it the constraints and decisions that turn established.
+    if not isinstance(session.get("task_state"), dict):
+        session["task_state"] = taskstate.new_state(session.get("task") or task)
+    state = session["task_state"]
     record_stage(session, "understand")
     run_dir = path.parent
     acquire_run_lock(run_dir)
@@ -913,11 +931,26 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         if _proj_index is not None
         else symbols.rank(rows, seed, limit=MAX_CONTEXT_FILES)
     )
+    # The optional semantic layer (see `semantic.py`): meaning-close files the lexical ranker missed,
+    # merged into the same five-file budget. It adds nothing and costs nothing unless the operator
+    # installed FastEmbed and pointed it at a local model folder; otherwise this is a no-op and the
+    # ranked list is exactly the one the loop has always used.
+    try:
+        if semantic.available(settings):
+            _seen_paths = {entry["path"] for entry in _rank_entries}
+            for _hit in semantic.rank(settings, ws.root, seed, rows,
+                                      limit=MAX_CONTEXT_FILES - len(_rank_entries)):
+                if _hit["path"] not in _seen_paths:
+                    _rank_entries.append(_hit)
+                    _seen_paths.add(_hit["path"])
+    except Exception:   # noqa: BLE001 — an optional index must never break retrieval
+        pass
+    injected = 0
     for entry in _rank_entries:
         name = entry["path"]
         if reference and name == reference["path"]:
             continue
-        if len(observed) >= MAX_CONTEXT_FILES:
+        if len(observed) + injected >= MAX_CONTEXT_FILES:
             break
         try:
             item = ws.read(name)
@@ -928,8 +961,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # The file is larger than what the budget has left. Skipping it used to be the entire
             # answer, which is the failure a small local model pays for: it proposes against a file it
             # has never seen a line of, in a project whose map said the file was right there. An
-            # excerpt of the block around the ranked symbol is sent instead — and it is *not* a read,
-            # because `observed` keeps whole files only, so a proposal still has to open this one.
+            # excerpt of the block around the ranked symbol is sent instead — and like the whole-file
+            # snapshot below, it is not a read: a proposal still has to open this one.
             if excerpts >= MAX_EXCERPTS:
                 continue
             text, line, more = symbols.snippet(item["content"],
@@ -957,7 +990,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
             continue
         remaining -= len(encoded)
-        observed[name] = item["sha256"]
+        # A snapshot the run chose is not a file the model opened. `observed` is the list a proposal is
+        # honoured against, so counting injected content here let a model replace a file it never asked
+        # for — and on a resumed run it re-authorized exactly the files the re-verify loop had just
+        # dropped for having changed on disk. The snapshot still carries the current bytes, and the
+        # auto-read path still charges the run one turn to open the file properly.
+        injected += 1
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
         reason = chosen_reason(entry)
         event(session, "context_file", path=name, sha256=item["sha256"], why=reason,
@@ -978,6 +1016,21 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     budget_seconds = max(1200, settings.timeout_seconds * 3)
     started = time.monotonic() - float(resumed.get("elapsed") or 0)
     start_turn = int(resumed.get("turn") or 0)
+    # Everything the prompt says that does not change between turns, frozen once the retrieval
+    # snapshots have been appended. The task state rides at the end and is rewritten each turn:
+    # a record that went stale after turn one would just re-create the drift it exists to fix.
+    base_template = base[1]["content"]
+    state_budget = min(3000, max(600, settings.context_chars // 8))
+    # The state block rides inside the base, so it can never be the thing that pushes `base + history`
+    # past the window it shares — that is the drift it exists to prevent, and a raised "Initial context
+    # exceeds" at the smallest legal budget is that bug made fatal. `taskstate.block` spends its whole
+    # 283-character header the moment it writes anything, so a room smaller than that buys no block: the
+    # honest answer is none, and the task still fits. Otherwise the block is capped to the room left.
+    room = settings.context_chars - len(base[0]["content"]) - len(base_template)
+    if room < 300:
+        state_budget = 0
+    else:
+        state_budget = min(state_budget, room)
     try:
         for turn in range(start_turn, settings.max_turns):
             if cancelled is not None and cancelled():
@@ -988,26 +1041,42 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             elapsed = time.monotonic() - started
             if elapsed > budget_seconds:
                 raise AgentError("Task time budget exhausted.")
+            taskstate.note_files(state, observed)
+            base[1]["content"] = (base_template + "\n"
+                                  + taskstate.block(state, state_budget)).rstrip()
             while history and sum(len(m["content"]) for m in base + history) > settings.context_chars:
+                for dropped in history[:2]:
+                    taskstate.fold_turn(state, dropped)
                 history = history[2:]
             if sum(len(m["content"]) for m in base + history) > settings.context_chars:
                 raise AgentError("Initial context exceeds the " + str(settings.context_chars)
                                  + "-character budget; narrow the task or raise `context_chars`.")
-            progress(f"Turn {turn + 1}/{settings.max_turns}: asking {provider.model}...")
+            # The fast/strong split, only when the caller built both: plain gathering after the
+            # first turn runs on the fast model; planning (the first turn), recovery from a
+            # rejection, and repair rounds stay on the strong one. Nothing configured → today's
+            # behaviour, one model for everything.
+            active = provider
+            if (turn > start_turn and not last_error and name in GATHER_ACTIONS
+                    and fast_provider is not None):
+                active = fast_provider
+            elif ((turn == start_turn or last_error or int(session.get("fix_round") or 0) > 0)
+                  and strong_provider is not None):
+                active = strong_provider
+            progress(f"Turn {turn + 1}/{settings.max_turns}: asking {active.model}...")
             gen_kwargs = {}
-            if on_token is not None and getattr(provider, "supports_stream", False):
+            if on_token is not None and getattr(active, "supports_stream", False):
                 gen_kwargs["on_token"] = on_token
             try:
-                raw = provider.generate(base + history, cancelled=cancelled, **gen_kwargs)
+                raw = active.generate(base + history, cancelled=cancelled, **gen_kwargs)
             except TypeError:
-                raw = provider.generate(base + history, **gen_kwargs)
+                raw = active.generate(base + history, **gen_kwargs)
             # A reasoning model answered twice and only one of the two is the action. The thought is
             # shown, capped and redacted, as its own collapsible row — never folded into the envelope and
             # never sent back as history, because the next turn does not need to re-read the deliberation.
-            thought = str(getattr(provider, "reasoning", "") or "")
+            thought = str(getattr(active, "reasoning", "") or "")
             if thought:
                 announce("model_reasoning", count=len(thought), detail=thought)
-            counted = metrics_of(provider)
+            counted = metrics_of(active)
             if counted:
                 # Summed over the task's turns, because the number worth having is what one task cost.
                 # A provider that reports nothing writes no key at all: an audit that finds `metrics`
@@ -1026,9 +1095,16 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                                  + (": every copy was refused with " + last_error[:150] if last_error else "")
                                  + "; try another model or a narrower task.")
             last_error = ""
-            session["model"] = provider.model
+            session["model"] = active.model
+            state_delta, name = None, ""
             try:
                 action = parse_action(raw)
+                # The optional continuity envelope: taken out before validation so the strict
+                # per-action field checks never see it, and a malformed one is ignored rather
+                # than charged — the state aids continuity, it is not part of the contract.
+                state_delta = action.pop("state", None) if isinstance(action, dict) else None
+                if isinstance(state_delta, dict):
+                    taskstate.merge(state, state_delta)
                 name = action.get("action")
                 if name == "list_files" and set(action) == {"action"}:
                     names = ws.files(limit=301)
@@ -1160,6 +1236,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                     announce("propose", count=len(changes),
                              names=[change["path"] for change in changes])
                     record_stage(session, "review")
+                    state["status"] = "proposal waiting for approval"
                     # Saved after the announcement, not before: `announce` appends the proposal's own
                     # step row to this record, and a task reopened from history must not lose the one
                     # row that says what was offered.
@@ -1221,6 +1298,9 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 # back to after a long run, and it explains nothing.
                 event(session, "rejected_action", reason=redact(result["error"])[:180])
             # Never execute tool commands or persist raw prompts/model output in events.
+            if not (isinstance(state_delta, dict) and state_delta.get("status")):
+                state["status"] = (str(name)[:80] if name else
+                                   "rejected: " + last_error[:80])
             history.extend([{"role": "assistant", "content": raw[:100000]},
                             {"role": "user", "content": "Tool observation (untrusted): " + json.dumps(result)}])
             atomic_json(path, session)

@@ -11,7 +11,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from .config import (Kind, OLLAMA, OPENROUTER, Settings, check_endpoint, kind_for, needs_consent,
                      validate)
-from .errors import Cancelled, PolicyError, ProviderError, ProviderUnavailable
+from .errors import AgentError, Cancelled, PolicyError, ProviderError, ProviderUnavailable
 from .redaction import redact
 
 
@@ -50,22 +50,30 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
         headers["Authorization"] = "Bearer " + key
     request = Request(url, data=json.dumps(payload).encode() if payload is not None else None,
                       headers=headers)
-    try:
-        with _opener().open(request, timeout=timeout) as response:
-            raw = response.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            raise ProviderError("Provider response exceeds size limit.")
-        result = json.loads(raw)
-        if not isinstance(result, dict):
-            raise ProviderError("Provider returned an invalid response.")
-        return result
-    except HTTPError as exc:
-        raise _refuse(exc) from None
-    except (URLError, TimeoutError, OSError):
-        raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
-                       "longer request timeout for a reply this large.") from None
-    except (ValueError, UnicodeError):
-        raise ProviderError("Provider returned invalid JSON.") from None
+    for attempt in range(3):
+        try:
+            with _opener().open(request, timeout=timeout) as response:
+                raw = response.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ProviderError("Provider response exceeds size limit.")
+            result = json.loads(raw)
+            if not isinstance(result, dict):
+                raise ProviderError("Provider returned an invalid response.")
+            return result
+        except HTTPError as exc:
+            if exc.code in (429, 503) and attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            raise _refuse(exc) from None
+        except (URLError, TimeoutError, OSError):
+            # One ask, one answer: this read owns no retry of its own. `request_probe_with_retry` is
+            # the only place allowed to ask a second time, and a retry buried here multiplied with
+            # it — a probe promised twice became six requests, and a caller that set its own timeout
+            # waited three of them before it was told the model had not answered.
+            raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
+                           "longer request timeout for a reply this large.") from None
+        except (ValueError, UnicodeError):
+            raise ProviderError("Provider returned invalid JSON.") from None
 
 
 # A cold Ollama daemon answers nothing for a few seconds while it loads, which is the one failure a
@@ -153,9 +161,27 @@ def openai_chunk(line: bytes) -> dict | None:
             "completion_tokens": usage.get("completion_tokens")}
 
 
+def _detect_repetition_loop(chunks: list[str]) -> bool:
+    """Detect degenerate repetition loops in model output and stop the stream."""
+    total = sum(len(c) for c in chunks)
+    if total < 180:
+        return False
+    tail = "".join(chunks[-120:])[-600:]
+    for window in range(35, 180):
+        if len(tail) >= window * 3:
+            chunk1 = tail[-window:]
+            if " " not in chunk1:
+                continue
+            chunk2 = tail[-2*window:-window]
+            chunk3 = tail[-3*window:-2*window]
+            if chunk1 == chunk2 == chunk3:
+                return True
+    return False
+
+
 def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int = 120,
                 on_token=None, chunk=ollama_chunk, max_bytes: int = MAX_STREAM_BYTES,
-                cancelled=None) -> dict:
+                cancelled=None, deadline_seconds: float | None = None) -> dict:
     """Read a streamed reply in pieces, saying each one as it lands, and return the whole of it.
 
     The text is assembled here rather than trusted from the client's copy: the caller has to parse an
@@ -168,11 +194,34 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
     request = Request(url, data=json.dumps(payload).encode(), headers=headers)
     content, thought, size, model, finish = [], [], 0, "", None
     seen: dict = {}
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds else None
     try:
         with _opener().open(request, timeout=timeout) as response:
-            for line in response:
+            while True:
                 if cancelled is not None and cancelled():
                     raise Cancelled("Streaming cancelled.")
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProviderError(
+                            f"Planning exceeded its {int(deadline_seconds)}-second limit; "
+                            "the partial response is incomplete.")
+                    # urllib's timeout is an idle-read timeout. Update the underlying socket before
+                    # every line so a server that keeps sending small chunks cannot extend the total
+                    # planning deadline indefinitely.
+                    try:
+                        response.fp.raw._sock.settimeout(min(timeout, remaining))
+                    except AttributeError:
+                        pass
+                if hasattr(response, "readline"):
+                    line = response.readline()
+                else:
+                    try:
+                        line = next(response)
+                    except StopIteration:
+                        break
+                if not line:
+                    break
                 size += len(line)
                 if size > max_bytes:
                     raise ProviderError("Provider response exceeds size limit.")
@@ -192,12 +241,19 @@ def read_stream(url: str, payload: dict, *, key: str | None = None, timeout: int
                     content.append(part["content"])
                     if on_token is not None:
                         on_token(part["content"])
+                    if max_bytes == MAX_STREAM_BYTES and _detect_repetition_loop(content):
+                        finish = "stop"
+                        break
                 thought.append(part["thinking"])
                 if part.get("done"):
                     break
     except HTTPError as exc:
         raise _refuse(exc) from None
     except (URLError, TimeoutError, OSError):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProviderError(
+                f"Planning exceeded its {int(deadline_seconds)}-second limit; "
+                "the partial response is incomplete.") from None
         raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
                        "longer request timeout for a reply this large.") from None
     except ValueError:
@@ -270,7 +326,7 @@ class ModelProvider(Protocol):
     supports_stream: bool
 
     def generate(self, messages: list[dict], json_mode: bool = True,
-                 on_token=None, cancelled=None) -> str: ...
+                 on_token=None, cancelled=None, deadline_seconds: float | None = None) -> str: ...
 
 
 # A reasoning model answers twice: once in a field nobody asked for and once in `content`. The names
@@ -321,7 +377,7 @@ class OllamaProvider:
         self.supports_thinking = "thinking" in (info.get("capabilities") or [])
 
     def generate(self, messages: list[dict], json_mode: bool = True, on_token=None,
-                 cancelled=None) -> str:
+                 cancelled=None, deadline_seconds: float | None = None) -> str:
         if cancelled is not None and cancelled():
             raise Cancelled("Operation cancelled.")
         self.reasoning = ""
@@ -332,11 +388,11 @@ class OllamaProvider:
             # Asked for piece by piece only when somebody is listening. A turn that parses an envelope
             # gains nothing from a stream, and an SSE reader is one more way for a reply to go wrong.
             "stream": on_token is not None,
-            # temperature 0 is greedy decoding, and a weak model that is poor at Arabic
-            # tokenisation can sit on one token forever; 1.1 is the smallest penalty that
-            # breaks the loop without bending the distribution on English or code.
-            "options": {"temperature": 0, "num_predict": self.settings.output_tokens,
-                        "repeat_penalty": 1.1,
+            # temperature 0 is greedy decoding for json envelopes; 0.2 gives creative variety for prose
+            # without repetition loops. repeat_penalty 1.18 and repeat_last_n 128 break token loops.
+            "options": {"temperature": 0 if json_mode else 0.2, "num_predict": self.settings.output_tokens,
+                        "repeat_penalty": 1.18,
+                        "repeat_last_n": 128,
                         "num_ctx": context_window(prompt_chars, self.settings.output_tokens)},
         }
         if json_mode:
@@ -358,7 +414,8 @@ class OllamaProvider:
         else:
             streamed = read_stream(self.endpoint + "/api/chat", payload,
                                    timeout=self.settings.timeout_seconds, on_token=on_token,
-                                   chunk=ollama_chunk, cancelled=cancelled)
+                                   chunk=ollama_chunk, cancelled=cancelled,
+                                   deadline_seconds=deadline_seconds)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             truncated = streamed["finish"] == "length"
             self.metrics = counts(streamed)
@@ -373,9 +430,9 @@ class OllamaProvider:
 class OpenAICompatibleProvider:
     """Every provider that answers ``POST {base}/chat/completions`` with the OpenAI shape.
 
-    That is OpenAI, Groq, DeepSeek, OpenRouter, LM Studio, vLLM and any custom base a user types:
-    one body, one response, a different URL and a different key. Anthropic and Gemini are *not* in
-    this class — different auth header, different body, different response — and are not offered.
+    That is OpenAI, Groq, DeepSeek, OpenRouter, Google Gemini (via AI Studio /v1beta/openai),
+    LM Studio, vLLM and any custom base a user types: one body, one response, a different URL and a different key.
+    Anthropic is not in this class — different auth header and body — and is not offered.
     The three things that really are OpenRouter-only (the upstream routing block, the echoed
     upstream model, the free/paid rule) hang off ``Kind`` flags rather than a subclass.
     """
@@ -394,20 +451,26 @@ class OpenAICompatibleProvider:
         self.endpoint = check_endpoint(self.kind, settings.endpoint)
         env_name = settings.api_key_env or self.kind.key_env
         self.key = api_key or (os.environ.get(env_name) if env_name else "")
+        if not self.key and self.kind.key == "gemini":
+            self.key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
         # A custom endpoint may or may not want a key — that is the user's server to decide — so only
         # the rows that are known to require one refuse without it.
         if self.kind.needs_key and not self.key:
-            raise ProviderError(f"Set {env_name or 'an API key'} in your environment (never in a file).")
+            err_var = "GEMINI_API_KEY or GOOGLE_API_KEY" if self.kind.key == "gemini" else (env_name or "an API key")
+            raise ProviderError(f"Set {err_var} in your environment (never in a file).")
 
     def generate(self, messages: list[dict], json_mode: bool = True, on_token=None,
-                 cancelled=None) -> str:
+                 cancelled=None, deadline_seconds: float | None = None) -> str:
         if cancelled is not None and cancelled():
             raise Cancelled("Operation cancelled.")
         self.reasoning = ""
         body = {
             "model": self.settings.model, "messages": messages, "stream": on_token is not None,
-            "temperature": 0, "max_tokens": self.settings.output_tokens,
+            "temperature": 0 if json_mode else 0.2, "max_tokens": self.settings.output_tokens,
         }
+        if not json_mode:
+            body["frequency_penalty"] = 0.2
+            body["presence_penalty"] = 0.1
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         if self.kind.routing:
@@ -429,14 +492,17 @@ class OpenAICompatibleProvider:
         else:
             streamed = read_stream(self.endpoint + "/chat/completions", body, key=self.key or None,
                                    timeout=self.settings.timeout_seconds, on_token=on_token,
-                                   chunk=openai_chunk, cancelled=cancelled)
+                                   chunk=openai_chunk, cancelled=cancelled,
+                                   deadline_seconds=deadline_seconds)
             value, thought = streamed["content"], {"thinking": streamed["thinking"]}
             finish, echoed = streamed["finish"], streamed["model"]
             self.metrics = counts(streamed)
         self.reasoning = read_reasoning(thought)
         # Proposals must be complete; chat tolerates a missing finish_reason.
-        if not (finish == "stop" or (not json_mode and finish is None)):
-            raise ProviderError("Model did not finish normally; output discarded.")
+        # Google Gemini via OpenAI endpoint marks json action envelopes with function_call_filter
+        if not (finish == "stop" or (not json_mode and finish is None) or
+                (isinstance(finish, str) and "function_call_filter" in finish)):
+            raise ProviderError(f"Model did not finish normally (finish={finish!r}); output discarded.")
         if self.kind.routing and echoed:
             self.model = echoed
         if not isinstance(value, str) or not value:
@@ -461,3 +527,29 @@ def make_provider(settings: Settings, *, allow_cloud: bool, data_class: str,
             not allow_cloud or data_class not in {"public", "synthetic"}):
         raise PolicyError("Cloud requires --allow-cloud and --data-class public or synthetic.")
     return OpenAICompatibleProvider(settings, api_key=api_key, allow_paid=allow_paid, kind=kind)
+
+
+def build_alternates(settings: Settings, *, allow_cloud: bool, data_class: str,
+                     api_key: str | None = None, allow_paid: bool = False) -> dict:
+    """The optional fast/strong pair for one profile, keyed "fast" and "strong".
+
+    A profile that names neither extra — every profile written before the fields existed, and every
+    profile whose author wants one model — gets an empty dict, which is how both windows keep passing
+    `fast_provider=None, strong_provider=None` and the loop keeps asking `model` for every turn.
+    A named alternate that cannot be built (not installed, wrong endpoint) is *dropped*, not raised:
+    the configured default model must still answer. Same endpoint, same consent gates, same
+    no-fallback rules as the primary — only the name changes.
+    """
+    from dataclasses import replace
+    out = {}
+    for purpose, name in (("fast", getattr(settings, "fast_model", "")),
+                          ("strong", getattr(settings, "strong_model", ""))):
+        if not name or name == settings.model:
+            continue
+        try:
+            out[purpose] = make_provider(replace(settings, model=name), allow_cloud=allow_cloud,
+                                         data_class=data_class, api_key=api_key,
+                                         allow_paid=allow_paid)
+        except (AgentError, PolicyError, ProviderError, ProviderUnavailable):
+            continue
+    return out
