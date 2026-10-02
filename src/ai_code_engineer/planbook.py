@@ -93,6 +93,14 @@ def parse_steps(text: str) -> list[dict]:
                 break
         steps.append({"id": len(steps) + 1, "title": title[:90],
                       "body": text[match.end():end].strip()[:6000]})
+    seen_titles: dict[str, int] = {}
+    for s in steps:
+        t = s["title"]
+        if t in seen_titles:
+            seen_titles[t] += 1
+            s["title"] = f"{t} (Part {seen_titles[t]})"[:90]
+        else:
+            seen_titles[t] = 1
     return steps
 
 
