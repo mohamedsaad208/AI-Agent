@@ -29,6 +29,7 @@
 [Key Highlights](#-key-highlights) •
 [Quick Start](#-quick-start) •
 [Core Architectural Pillars](#-core-architectural-pillars) •
+[Offline Extras](#-offline-extras) •
 [Platform Guide](#-platform-guide) •
 [Three Modes & Limits](#-three-modes-and-the-limits-that-go-with-them) •
 [Try These First](#-try-these-first) •
@@ -192,6 +193,59 @@ Hostnames such as `db.internal` are not resolved during the destination check. S
 to a private service, requests to hostnames require an explicit `network = allow` rule for that folder.
 Private and link-local numeric addresses have the same requirement. Do not use that rule for folders
 whose code or configuration you do not trust.
+
+---
+
+# 🧠 Offline extras
+
+Three additions in this branch change what a local model sees and how fast it answers. Every
+one of them is off by default: an existing profile with no new fields behaves exactly the way
+it did before. None of them reach the network.
+
+**Structured task state.** The loop keeps a small bounded record on the session — the goal, the
+user's binding constraints, decisions made, evidence observed, open questions, files already
+read, and the acceptance checklist. When the history trims a turn to fit the context budget,
+that turn is folded into the record instead of dropped, so a rule the user added at turn three
+is still in the prompt at turn thirty. The state is stored in `session.json` and comes back
+with a resumed run at no extra context cost. The model may update it through an optional
+`state` field on any action; anything it says there is treated as untrusted continuity data
+*except* items under `user_constraints`, which came from the operator and remain binding.
+
+**Observation vs hypothesis in the fix loop.** `repair.py` parses a failing build/test log once
+into named facts — the failing test ids, the `file:line` sites, the exception's own words, a
+few stack frames kept on purpose. The next repair turn receives an evidence block split into
+"Observed — quoted directly", a Hypothesis line naming the category as *a classification, not
+proof of the cause*, and a "Not established" line that says out loud what the log does not
+show. The parsed facts are stored on the run record so a second round reuses them instead of
+re-passing the raw log.
+
+**Optional local semantic search.** `symbols.rank` scores shared *tokens*; a description like
+"the place that issues login tokens" misses a class named `JwtTokenProvider`. A meaning-close
+second ranker fills that gap, but the app's `dependencies = []` is a hard rule and no runtime
+download is ever allowed, so this layer is fully opt-in. Install [FastEmbed] yourself, place
+the model files in a local folder, and point the profile at it (`semantic_model_dir` in the
+model section, or the `AGENT_EMBED_MODEL_DIR` environment variable). If the package is missing,
+the folder is missing, or embedding fails at any point, the layer answers empty and the loop
+continues with the lexical search it always had. Set `AGENT_SEMANTIC=0` to disable the layer
+even when installed. Vectors cache in `.agent-semantic.json` beside the project index, keyed by
+file mtime, so they are computed once per changed file and reused across turns and runs.
+
+**Optional fast / strong model pair.** Every turn of a run defaults to the profile's `model`.
+Two new optional names — `fast_model` and `strong_model` — let the loop hand mechanical
+gathering turns (`read_file`, `search_code`, `find_symbol`, `find_references`, `list_files`) to
+a cheaper local model while keeping the first turn of a task, turns recovering from a rejected
+action, and repair rounds on the stronger one. Both are built through the same consent gates
+as the primary provider, so a cloud alternate still needs the cloud checkbox. An unusable or
+empty alternate is dropped silently; the primary model always remains the fallback. Old
+profiles that never set these fields behave exactly as before.
+
+**Optional local evals.** The deterministic cases for all three of the above live in
+`tests/test_improvement_evals.py` and run in-process with a scripted provider. A further,
+fully-optional promptfoo config lives at `tools/eval/promptfooconfig.yaml` for an operator who
+wants to point a real local Ollama model at the same three properties. Nothing in the app or
+the test suite loads that file; every URL in it points at `127.0.0.1`.
+
+[FastEmbed]: https://github.com/qdrant/fastembed
 
 ---
 

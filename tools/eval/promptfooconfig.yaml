@@ -1,0 +1,82 @@
+# Optional, offline promptfoo eval — dev tooling only.
+#
+# Nothing in `tests/` or in the app loads this file. It exists so an operator with a local
+# Ollama daemon can, at their own pace, watch a small model handle the same three properties
+# the deterministic cases in `tests/test_improvement_evals.py` already prove: constraint
+# retention through a long history, diagnosis of a build/test log, and file selection from a
+# task that names the file.
+#
+# Run it (requires `npm i -g promptfoo` and `ollama serve` on localhost:11434):
+#     npx promptfoo eval -c tools/eval/promptfooconfig.yaml
+#     npx promptfoo view
+#
+# Every URL points at 127.0.0.1; nothing here leaves the machine. Change `LB_MODEL` to a
+# model that is actually pulled. Set OLLAMA_BASE_URL to relocate the daemon.
+#
+# The assertions are text checks the deterministic suite mirrors. They are not proof on their
+# own: they exist so a person can attach a real local model to the same shape of question
+# without needing to install FastEmbed, launch the Web app, or run the loop by hand.
+
+description: Local-first improvement-plan evals (offline, dev-only)
+prompts:
+  - |
+    You are maintaining structured task state on a coding agent. The user's mid-conversation
+    constraint is: "do not rename the public API surface." The task is to fix a login form
+    so it rejects duplicate emails. Return a JSON object with a "state" field whose
+    "constraints" array contains the user's rule verbatim.
+  - |
+    Here is a failing test log. Report the failing test's id, the file and line the log
+    points at, and the exception's own name — quoting the log. Do not guess a cause the
+    log does not show.
+
+    {{log}}
+  - |
+    The task says "Duplicate emails must be rejected in login_forms.py." Which single
+    file in the following repository listing should the agent read first? Reply with only
+    that path.
+
+    {{listing}}
+providers:
+  - id: ollama:qwen2.5-coder:3b
+    label: LB_MODEL
+    config:
+      base_url: http://127.0.0.1:11434
+      apiKey: not-needed
+tests:
+  - description: constraint survives the trim path
+    assert:
+      - type: contains
+        value: "do not rename the public API surface"
+      - type: not-contains
+        value: "http://"
+      - type: not-contains
+        value: "https://"
+  - description: log diagnosis quotes the log rather than inventing a cause
+    vars:
+      log: |
+        FAILED tests/test_auth.py::test_rejects_duplicate_email - AssertionError: expected 409 got 200
+          File "/repo/app/auth.py", line 42, in signup
+            raise ValidationError('Email is already registered')
+        ValidationError: Email is already registered
+    assert:
+      - type: contains
+        value: "test_rejects_duplicate_email"
+      - type: contains
+        value: "auth.py"
+      - type: contains
+        value: "ValidationError"
+      - type: not-contains
+        value: "http://"
+  - description: file selection picks the file the task named
+    vars:
+      listing: |
+        calculator.py
+        login_forms.py
+        notes.txt
+    assert:
+      - type: contains
+        value: "login_forms.py"
+      - type: not-contains
+        value: "calculator.py"
+      - type: not-contains
+        value: "http://"

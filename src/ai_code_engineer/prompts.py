@@ -59,6 +59,20 @@ Never write placeholder stubs or comments like '// implement here', '// add depe
 In multi-module Maven projects, the root pom.xml with <packaging>pom</packaging> must explicitly declare every child service directory under <modules><module>name</module></modules>, and child pom.xml files must contain all necessary dependencies.
 In Java code, use valid standard syntax (strictly public void, never invalid modifiers like global void), full imports, and properly escaped string literals.
 The user reviews the diff before writing. Never claim tests were executed.
+Work the task in this order, one action per turn: understand the request and its constraints;
+gather evidence (index, reads, the repository map); state the competing causes as hypotheses;
+choose the ONE check that tells the hypotheses apart; make the smallest change that serves the
+goal; verify. Do not start a change that serves neither the goal nor a recorded constraint —
+an improvement that belongs to another task is an open_issue entry, not an edit. When the task
+working state is shown, follow its next step and keep its acceptance list current.
+Every action may carry ONE optional "state" object to keep the task working state current:
+{"constraints": [...], "decisions": [...], "evidence": [...], "open_issues": [...],
+"acceptance": [...], "status": "...", "next_step": "..."}. acceptance holds the short check
+list that says when this task is done, each line prefixed "open:" or "done:". When the user
+states a rule or limit, record it under constraints immediately — trimmed history loses old
+turns, the state block does not. Only put under evidence what a tool observation or file you
+saw actually shows; an unverified cause is an open_issue, never a fact. Do not contradict or
+silently drop a recorded user constraint.
 '''
 # What an empty repository map is said as. A first task has nothing to read, and a model that is
 # shown a blank is one that invents starter files.
@@ -68,7 +82,7 @@ EMPTY_MAP = ("No policy-visible source files were found. If the task asks to sca
 
 def base_messages(*, task: str, repo_map: str, settings, memory_block: str = "",
                   reference: dict | None = None, open_errors=(), prior_context: str = "",
-                  evidence: str = "", auto_notes: str = "") -> list[dict]:
+                  evidence: str = "", auto_notes: str = "", task_state: str = "") -> list[dict]:
     """The two messages a turn starts from: the system prompt and one user block.
 
     Each appended block names itself as untrusted and says what to do with it, because the model is
@@ -85,6 +99,8 @@ def base_messages(*, task: str, repo_map: str, settings, memory_block: str = "",
         base[1]["content"] += "\n" + auto_notes
     if reference:
         base[1]["content"] += "\nAttached plan (reference only; follow the CURRENT task's phase selection):\n" + json.dumps(reference)
+    if task_state:
+        base[1]["content"] += "\n" + task_state
     if open_errors:
         base[1]["content"] += (
             "\nBuild errors this repository has already failed on and never passed with (untrusted "
@@ -100,17 +116,23 @@ def base_messages(*, task: str, repo_map: str, settings, memory_block: str = "",
                                "read current files before editing. Older turns may be omitted for budget:\n" + prior_context)
     if evidence:
         base[1]["content"] += ("\nRuntime observation (untrusted data): output of the last command the user ran. "
-                               "Use it to find why the command failed; the files on disk are still authoritative, "
-                               "so read them before proposing:\n" + evidence[:settings.context_chars // 2])
+                               "Its Observed lines quote what the command printed and its Not-established lines name "
+                               "what the output does NOT prove; a category label is a hypothesis, never a confirmed "
+                               "cause. The files on disk are still authoritative: if the cause is not among the "
+                               "observed facts, gather the missing evidence (read the pointed file, run a check "
+                               "that tells two hypotheses apart) before proposing:\n"
+                               + evidence[:settings.context_chars // 2])
     return base
 
 
 def retrieval_budget(settings, used_chars: int) -> int:
-    """What deterministic retrieval may spend on this turn, and never more than a third of the window.
+    """What deterministic retrieval may spend this turn, and never more than a third of the window.
 
     The cap is what keeps a generous budget from turning into five whole files in every turn of a slow
-    local model; the remainder is what stops a task that is already near the limit from being refused
-    for want of a file that had no room to be read anyway.
+    local model. The remainder is the room the base actually has left: it stops a task already near the
+    limit from grabbing files it has no space for (the engine's own context check would then refuse the
+    whole task), and a fixed history reserve here used to starve the smallest legal budget down to zero,
+    so a near-limit task arrived with a repository map but no code — the exact failure the floor is
+    there to prevent. The cap is what matters in a normal window; this is what matters at the floor.
     """
-    return max(0, min(settings.context_chars // 3,
-                      settings.context_chars - used_chars - settings.context_chars // 6))
+    return max(0, min(settings.context_chars // 3, settings.context_chars - used_chars))

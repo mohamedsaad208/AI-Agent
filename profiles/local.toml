@@ -1,10 +1,13 @@
 [model]
 provider = "ollama"
-name = "qwen3:4b"
+name = "qwen2.5-coder:7b"
+fast_model = "qwen2.5-coder:1.5b"
+strong_model = "qwen2.5-coder:7b"
 # The address is the only line here that a different machine may need. It is resolved in one order -
 # this value, then OLLAMA_HOST, then Ollama's own row in the provider table - so a machine running the
 # service on another port can delete this line or set the variable, and no code has to change.
 endpoint = "http://127.0.0.1:11434"
+semantic_model_dir = "models"
 
 [limits]
 max_turns = 12

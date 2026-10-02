@@ -101,6 +101,12 @@ def parser() -> argparse.ArgumentParser:
         if name == "verify":
             command.add_argument("--recipe", choices=sorted(RECIPES))
             command.add_argument("--image", help="Preloaded approved Linux image@sha256:digest")
+    curl_cmd = sub.add_parser("curl", help="Generate or run a cURL command for Google Gemini or another provider")
+    curl_cmd.add_argument("--provider", default="gemini", help="Provider (default: gemini)")
+    curl_cmd.add_argument("--endpoint", default="", help="Custom endpoint URL")
+    curl_cmd.add_argument("--model", default="", help="Model name (e.g. gemini-2.0-flash)")
+    curl_cmd.add_argument("--prompt", default="Hello! Please confirm you are working.", help="Prompt text")
+    curl_cmd.add_argument("--run", action="store_true", help="Execute the request directly")
     sub.add_parser("demo", help="Run deterministic, offline synthetic demo without changing your repository")
     export = sub.add_parser("export-session",
                             help="Write one session's record as JSON or as a readable report")
@@ -111,10 +117,52 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def run_curl(args) -> int:
+    kind = config.kind_for(args.provider) or config.BY_KEY.get("gemini") or config.DEFAULT_KIND
+    endpoint = (args.endpoint or kind.base or "").rstrip("/")
+    model = args.model or (kind.verified[0] if kind.verified else "gemini-2.0-flash")
+    prompt = args.prompt
+
+    key = ""
+    if kind.key == "gemini":
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    elif kind.key_env:
+        key = os.environ.get(kind.key_env) or ""
+
+    key_display = key or f"${kind.key_env or 'API_KEY'}"
+    chat_url = f"{endpoint}/chat/completions"
+    payload = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}, indent=2)
+
+    cmd_str = (
+        f"curl {chat_url} \\\n"
+        f"  -H \"Content-Type: application/json\" \\\n"
+        f"  -H \"Authorization: Bearer {key_display}\" \\\n"
+        f"  -d '{payload}'"
+    )
+    safe_print(cmd_str)
+
+    if args.run:
+        if not key:
+            safe_print(f"\nNote: Key not found in environment for {kind.label}. Set {kind.key_env or 'API key'} to run.")
+            return 1
+        safe_print("\n--- Executing request ---")
+        try:
+            from .providers import request_json
+            body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            res = request_json(chat_url, payload=body, key=key, timeout=30)
+            safe_print(json.dumps(res, indent=2))
+        except Exception as exc:
+            safe_print(f"Error: {exc}")
+            return 1
+    return 0
+
+
 def doctor() -> dict:
     result = {"python": sys.version.split()[0], "runtime_dependencies": "standard library only",
               "docker": bool(shutil.which("docker")),
               "openrouter_key_present": bool(os.environ.get("OPENROUTER_API_KEY")),
+              "gemini_key_present": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
+              "groq_key_present": bool(os.environ.get("GROQ_API_KEY")),
               "local_models": [], "ollama_models": []}
     # The same probe `agent setup` reads, so the two cannot disagree about whether Ollama answered.
     entries, _source, error = setup.reach(config.OLLAMA)
@@ -458,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
             safe_print(review(load_session(path)))
             safe_print("\nSession: " + str(path))
             safe_print("No project files changed. Review this proposal before applying it.")
+        elif args.command == "curl":
+            return run_curl(args)
         elif args.command == "demo":
             result = demo()
             safe_print(json.dumps(result, indent=2))

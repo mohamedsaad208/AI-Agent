@@ -896,6 +896,7 @@ CONTEXT_REASON = {
     "module": ("its folder is named in the task", "مجلده مذكور في المهمة"),
     "names": ("the task names this file", "المهمة تسمي هذا الملف"),
     "route": ("serves {}", "يخدم {}"),
+    "semantic": ("its meaning is close to the task", "معناه قريب من نص المهمة"),
     "used_by": ("used by {}", "يستخدمه {}"),
 }
 

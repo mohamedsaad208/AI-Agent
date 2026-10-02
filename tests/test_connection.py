@@ -444,7 +444,7 @@ class TheReasoningField(unittest.TestCase):
 
 class ConsentAtTheFactory(unittest.TestCase):
     def test_a_cloud_row_refuses_before_any_request(self):
-        for key in ("openai", "groq", "deepseek", "openrouter"):
+        for key in ("openai", "groq", "deepseek", "openrouter", "gemini"):
             row = kind_for(key)
             settings = replace(Settings(), provider=key, model="m", endpoint=row.base)
             with patch("ai_code_engineer.providers.request_json") as request:
@@ -754,6 +754,9 @@ class AStreamedAnswer(unittest.TestCase):
 
             def __iter__(self):
                 return iter(self.lines)
+
+            def readline(self):
+                return self.lines.pop(0) if self.lines else b""
 
         class Opener:
             def __init__(self, lines, opened):

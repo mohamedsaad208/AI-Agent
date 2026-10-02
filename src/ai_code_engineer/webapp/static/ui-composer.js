@@ -29,6 +29,20 @@ function renderComposer() {
   }
   add(el('button', 'pill soft', esc(DATA.provider.mode))).onclick = () => choose('mode', DATA.provider.mode, DATA.provider.modes);
   add(el('button', 'pill mono', esc(shortModel(DATA.provider.model)) + ICON.chev)).onclick = () => choose('model', DATA.provider.model, DATA.provider.models);
+  const curlPill = el('button', 'pill soft mono', 'cURL');
+  curlPill.title = 'Copy current request as cURL command';
+  curlPill.onclick = () => {
+    const promptText = ($('prompt')?.value || '').trim() || 'Hello! Confirm you are working.';
+    const c = DATA.connection || {};
+    const ep = (c.endpoint || c.default_endpoint || '').replace(/\/+$/, '');
+    const mdl = DATA.provider.model || 'gemini-2.0-flash';
+    const k = c.key_present ? '$' + (c.key_env || 'API_KEY') : 'YOUR_API_KEY';
+    const escapedPrompt = JSON.stringify(promptText);
+    const cmd = `curl ${ep}/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${k}" \\\n  -d '{\\n    "model": "${mdl}",\\n    "messages": [{"role": "user", "content": ${escapedPrompt}}]\\n  }'`;
+    navigator.clipboard.writeText(cmd);
+    toast('Copied cURL command for ' + shortModel(mdl));
+  };
+  add(curlPill);
   if (DATA.busy && DATA.cancellable) {
     /* Stop shares the `.send` look but not the `.send` handle: while a task runs it is the first
        button of that class in the bar, so anything that finds the composer's button by class —
@@ -143,7 +157,11 @@ function updatePromptPlaceholder() {
   const branch = DATA.branch || {};
   const change = DATA.composer === 'change', reading = DATA.composer === 'read';
   if (branch.bound) {
-    $('prompt').placeholder = 'Ask about ' + branch.projectName + ' — or ask it for a change you will approve.';
+    $('prompt').placeholder = change
+      ? 'Describe the change for ' + branch.projectName + '. Review the proposal before applying it.'
+      : reading
+        ? 'Ask about ' + branch.projectName + '. I will inspect and explain without writing.'
+        : 'Describe your goal for ' + branch.projectName + '. I will return an ordered plan and write nothing.';
     return;
   }
   const ta = $('prompt');
@@ -158,7 +176,7 @@ function updatePromptPlaceholder() {
     : reading
       ? 'Ask what is wrong here, where it is, and what a fix would touch. Nothing is written.'
       : branch.key ? 'Ask about ' + branch.projectName + ' — it answers in prose and writes nothing.'
-        : 'Ask anything. Choose a project to work on its files.';
+        : 'Ask for a plan, task breakdown, or technical guidance. Choose a project for repository context.';
 }
 
 function submit() {

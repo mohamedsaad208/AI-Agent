@@ -40,7 +40,8 @@ EVERY = "*"
 # file able to swap it is the same failure ``providers.py`` refuses upstream fallbacks for — the model
 # that answered would not be the one that was reviewed.
 TYPES = {"model": str, "endpoint": str, "api_key_env": str, "max_turns": int,
-         "timeout_seconds": int, "context_chars": int, "output_tokens": int}
+         "timeout_seconds": int, "context_chars": int, "output_tokens": int,
+         "fast_model": str, "strong_model": str, "semantic_model_dir": str}
 
 # A row with target `EVERY` states a preference that holds for every provider. An address and a key
 # variable belong to one provider, so a wildcard row for either would silently aim a different vendor's

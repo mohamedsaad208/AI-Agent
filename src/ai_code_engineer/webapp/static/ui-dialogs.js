@@ -268,6 +268,58 @@ function choose(kind, current, options) {
   const close = modal(s);
 }
 
+function parseCurlCommand(text) {
+  if (!text || typeof text !== 'string') return null;
+  const str = text.trim();
+  let key = '';
+  const bearerMatch = str.match(/Authorization:\s*Bearer\s+([^\s'"\\]+)/i);
+  if (bearerMatch) {
+    key = bearerMatch[1];
+  } else {
+    const keyParamMatch = str.match(/[?&]key=([^&\s'"\\]+)/);
+    if (keyParamMatch) key = keyParamMatch[1];
+  }
+  let url = '';
+  const urlMatch = str.match(/https?:\/\/[^\s'"\\]+/i);
+  if (urlMatch) url = urlMatch[0];
+  let model = '';
+  const bodyModelMatch = str.match(/["']model["']\s*:\s*["']([^"']+)["']/);
+  if (bodyModelMatch) {
+    model = bodyModelMatch[1];
+  } else if (url) {
+    const urlModelMatch = url.match(/\/models\/([^:/?]+)/);
+    if (urlModelMatch) model = urlModelMatch[1];
+  }
+  let provider = '';
+  let endpoint = '';
+  if (url.includes('generativelanguage.googleapis.com')) {
+    provider = 'Google Gemini';
+    endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai';
+  } else if (url.includes('api.openai.com')) {
+    provider = 'OpenAI';
+    endpoint = 'https://api.openai.com/v1';
+  } else if (url.includes('api.groq.com')) {
+    provider = 'Groq';
+    endpoint = 'https://api.groq.com/openai/v1';
+  } else if (url.includes('api.deepseek.com')) {
+    provider = 'DeepSeek';
+    endpoint = 'https://api.deepseek.com/v1';
+  } else if (url.includes('openrouter.ai')) {
+    provider = 'OpenRouter';
+    endpoint = 'https://openrouter.ai/api/v1';
+  } else if (url.includes('11434')) {
+    provider = 'Ollama';
+    endpoint = 'http://127.0.0.1:11434';
+  } else if (url.includes('1234')) {
+    provider = 'LM Studio';
+    endpoint = 'http://localhost:1234/v1';
+  } else if (url) {
+    provider = 'Custom endpoint';
+    endpoint = url.replace(/\/chat\/completions.*$/, '').replace(/\/+$/, '');
+  }
+  return { key, url, model, provider, endpoint };
+}
+
 function openSettings(tab) {
   const s = sheet('Settings', ''); s.classList.add('wide');
   const st = DATA.settings;
@@ -286,7 +338,26 @@ function openSettings(tab) {
         <input type="number" id="timeout" min="30" max="900" step="30" value="${esc(st.timeout)}"></div>`,
     models: () => `
       <div class="field"><label>Filter models by name</label><input id="filter" placeholder="qwen"></div>
-      <div class="field"><label>${esc(st.model_info || '')}</label></div>`,
+      <div class="field"><label>${esc(st.model_info || '')}</label></div>
+      <div class="hr" style="margin:14px 0"></div>
+      <div class="field">
+        <label>Dual-Model Routing (اختياري: توزيع الأدوار بين موديلين محليين)</label>
+        <div class="hint">عند الضبط، تُوجَّه المهام الميكانيكية وجمع الملفات للموديل السريع (Fast)، بينما يتولى الموديل القوي (Strong) التخطيط والتشخيص والإصلاح. عند تركهما فارغين، يُستخدم الموديل الرئيسي لكل الأدوار.</div>
+      </div>
+      <div class="field">
+        <label>Fast Model (النموذج السريع — للمهام الميكانيكية)</label>
+        <input id="fast-model" value="${esc(st.fast_model || '')}" placeholder="e.g. qwen2.5-coder:1.5b">
+      </div>
+      <div class="field">
+        <label>Strong Model (النموذج القوي — للتخطيط والإصلاح والتشخيص)</label>
+        <input id="strong-model" value="${esc(st.strong_model || '')}" placeholder="e.g. qwen2.5-coder:14b">
+      </div>
+      <div class="hr" style="margin:14px 0"></div>
+      <div class="field">
+        <label>Local Semantic Code Search (البحث الدلالي المحلي)</label>
+        <div class="hint">مسار مجلد نموذج FastEmbed المحلي (يعمل 100% Offline دون اتصال بالإنترنت). اتركه فارغاً للاعتماد على البحث المعجمي السريع المدمج.</div>
+        <input id="semantic-model-dir" value="${esc(st.semantic_model_dir || '')}" placeholder="e.g. D:\\AI\\models\\bge-small-en-v1.5">
+      </div>`,
     notes: () => {
       const an = DATA.autoNotes || {};
       return `
@@ -343,7 +414,22 @@ function openSettings(tab) {
         <input type="password" id="key" placeholder="${esc(c.key_present ? 'found in the environment; paste to override for this session' : 'paste for this session only')}">
         <div class="hint">${esc(c.needs_key ? 'This provider requires a key.' : 'This provider needs no key.')}</div></div>
       ${c.consent ? `<label class="switch"><input type="checkbox" id="consent" ${st.consent ? 'checked' : ''}>
-        Allow this public / synthetic code to be sent to that address</label>` : ''}`;
+        Allow this public / synthetic code to be sent to that address</label>` : ''}
+      <details class="curl-import-box" style="margin-top:14px;border:1px solid var(--border,#ccc);border-radius:8px;padding:8px 12px;background:var(--bg-card,#fafafa);">
+        <summary style="cursor:pointer;font-weight:600;font-size:13px;">📥 Import & Configure from cURL (Google AI Studio / API snippet)</summary>
+        <div style="margin-top:8px;">
+          <textarea id="curl-input" placeholder="Paste your cURL snippet here (e.g. from Google AI Studio 'Get code')&#10;curl https://generativelanguage.googleapis.com/... -H &quot;Authorization: Bearer ...&quot;" rows="3" style="width:100%;font-family:monospace;font-size:12px;resize:vertical;padding:6px;box-sizing:border-box;border:1px solid var(--border,#ccc);border-radius:4px;"></textarea>
+          <div style="margin-top:6px;display:flex;gap:8px;">
+            <button type="button" class="solid" id="curl-apply-btn" style="font-size:12px;padding:4px 12px;">Apply cURL to Settings</button>
+          </div>
+          <div class="hint" style="margin-top:4px;">Extracts API key, endpoint, model, and selects the matching provider automatically.</div>
+        </div>
+      </details>
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button type="button" class="line-btn" id="copy-curl-btn" style="font-size:12px;padding:4px 12px;">📋 Copy cURL Command</button>
+        <button type="button" class="line-btn" id="test-curl-btn" style="font-size:12px;padding:4px 12px;">⚡ Send cURL Test</button>
+      </div>
+      <div id="curl-test-result" style="margin-top:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;display:none;padding:8px;border-radius:6px;background:var(--bg-subtle,#f5f5f5);border:1px solid var(--border,#ddd);"></div>`;
     },
   };
   function connectionHint(c) {
@@ -359,6 +445,9 @@ function openSettings(tab) {
     body.querySelector('#autoapply')?.addEventListener('change', (e) => send('set_auto_apply', { value: e.target.checked }));
     body.querySelector('#timeout')?.addEventListener('change', (e) => send('set_timeout', { value: +e.target.value }));
     body.querySelector('#filter')?.addEventListener('input', (e) => send('set_filter', { value: e.target.value }));
+    body.querySelector('#fast-model')?.addEventListener('change', (e) => send('set_fast_model', { value: e.target.value.trim() }));
+    body.querySelector('#strong-model')?.addEventListener('change', (e) => send('set_strong_model', { value: e.target.value.trim() }));
+    body.querySelector('#semantic-model-dir')?.addEventListener('change', (e) => send('set_semantic_model_dir', { value: e.target.value.trim() }));
     body.querySelector('#memory')?.addEventListener('change', (e) => send('save_memory', { text: e.target.value }));
     body.querySelector('#auto-notes-toggle')?.addEventListener('change', (e) => send('toggle_auto_notes', { enabled: e.target.checked }));
     body.querySelector('#profile')?.addEventListener('change', (e) => send('set_profile', { value: e.target.value }));
@@ -368,6 +457,67 @@ function openSettings(tab) {
     body.querySelector('#endpoint')?.addEventListener('change', (e) => send('set_endpoint', { value: e.target.value }));
     body.querySelector('#key')?.addEventListener('input', (e) => send('set_key', { value: e.target.value }));
     body.querySelector('#consent')?.addEventListener('change', (e) => send('set_consent', { value: e.target.checked }));
+    body.querySelector('#curl-apply-btn')?.addEventListener('click', () => {
+      const txt = body.querySelector('#curl-input')?.value || '';
+      if (!txt.trim()) { toast('Paste a cURL command first', 'warn'); return; }
+      const parsed = parseCurlCommand(txt);
+      if (!parsed) { toast('Could not parse cURL command', 'bad'); return; }
+      if (parsed.provider) {
+        const modeEl = body.querySelector('#mode');
+        if (modeEl) {
+          const opt = [...modeEl.options].find((o) => o.value.toLowerCase().includes(parsed.provider.toLowerCase()));
+          if (opt) {
+            modeEl.value = opt.value;
+            send('set_mode', { value: opt.value });
+          }
+        }
+      }
+      if (parsed.endpoint) {
+        const epEl = body.querySelector('#endpoint');
+        if (epEl) epEl.value = parsed.endpoint;
+        send('set_endpoint', { value: parsed.endpoint });
+      }
+      if (parsed.key) {
+        const keyEl = body.querySelector('#key');
+        if (keyEl) keyEl.value = parsed.key;
+        send('set_key', { value: parsed.key });
+      }
+      if (parsed.model) {
+        send('set_model', { value: parsed.model });
+      }
+      toast(`Configured from cURL: ${parsed.provider || 'Provider'} (${parsed.model || 'model'})`);
+    });
+    body.querySelector('#copy-curl-btn')?.addEventListener('click', () => {
+      const c = DATA.connection || {};
+      const ep = (c.endpoint || c.default_endpoint || '').replace(/\/+$/, '');
+      const mdl = DATA.provider.model || 'gemini-2.0-flash';
+      const keyVal = body.querySelector('#key')?.value || '';
+      const k = keyVal || (c.key_present ? '$' + (c.key_env || 'API_KEY') : 'YOUR_API_KEY');
+      const cmd = `curl ${ep}/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${k}" \\\n  -d '{\\n    "model": "${mdl}",\\n    "messages": [{"role": "user", "content": "Hello! Confirm you are working."}]\\n  }'`;
+      navigator.clipboard.writeText(cmd);
+      toast('cURL command copied to clipboard');
+    });
+    body.querySelector('#test-curl-btn')?.addEventListener('click', async () => {
+      const resBox = body.querySelector('#curl-test-result');
+      if (resBox) {
+        resBox.style.display = 'block';
+        resBox.textContent = 'Sending ping request...';
+      }
+      try {
+        const res = await api('/api/action', { type: 'test_connection' });
+        const r = res && res.result;
+        if (r && r.ok) {
+          if (resBox) resBox.textContent = `✓ OK (${r.duration}s)\nModel: ${r.model}\nReply: ${r.reply}`;
+          toast('Connection test successful');
+        } else {
+          if (resBox) resBox.textContent = `✗ Failed (${r ? r.duration + 's' : ''})\n${(r && r.error) || 'Unknown error'}`;
+          toast('Connection test failed', 'bad');
+        }
+      } catch (err) {
+        if (resBox) resBox.textContent = `✗ Error: ${err.message || err}`;
+        toast('Connection test failed', 'bad');
+      }
+    });
     body.querySelector('#ov-save')?.addEventListener('click', () => send('set_override', {
       target: body.querySelector('#ov-target').value,
       key: body.querySelector('#ov-key').value,

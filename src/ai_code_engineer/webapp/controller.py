@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 from ..catalog import LIVE, models_for
 from ..chat import (context_block, create_chat, load_chat, project_of, respond,
                     title_for)
+from .. import planning as planning_mode
 from .. import config
 from .. import permissions
 from .. import policy
@@ -400,6 +401,9 @@ class AgentController:
         # to name the image the tool builds that repository inside.
         self.sandbox_on = bool(self._saved_ui.get("sandbox_on"))
         self.sandbox_image = str(self._saved_ui.get("sandbox_image") or "")
+        self.fast_model = str(self._saved_ui.get("fast_model", "qwen2.5-coder:1.5b"))
+        self.strong_model = str(self._saved_ui.get("strong_model", "qwen2.5-coder:7b"))
+        self.semantic_model_dir = str(self._saved_ui.get("semantic_model_dir", "models"))
         saved_auto = self._saved_ui.get("auto_apply")
         if isinstance(saved_auto, dict):
             self._auto_pref = {str(row): bool(flag) for row, flag in saved_auto.items()}
@@ -1065,6 +1069,9 @@ class AgentController:
             "set_target": lambda: self.set_target(str(payload.get("value", ""))),
             "set_chained": lambda: self.set_chained(bool(payload.get("value"))),
             "set_timeout": lambda: self.set_timeout(payload.get("value")),
+            "set_fast_model": lambda: self.set_fast_model(payload.get("value", "")),
+            "set_strong_model": lambda: self.set_strong_model(payload.get("value", "")),
+            "set_semantic_model_dir": lambda: self.set_semantic_model_dir(payload.get("value", "")),
             "set_key": lambda: self.set_key(payload.get("value", "")),
             "set_override": lambda: self.set_override(payload),
             "unset_override": lambda: self.unset_override(payload),
@@ -1077,6 +1084,7 @@ class AgentController:
             "select_file": lambda: setattr(self, "review_file", int(payload.get("index", 0))),
             "select_tab": lambda: setattr(self, "diff_tab", str(payload.get("tab", "diff"))),
             "refresh_models": self.check_setup,
+            "test_connection": lambda: self.test_connection(payload),
             "run_app": lambda: self.run_app_service(payload),
             "stop_app": lambda: self.stop_app_service(payload),
             "restart_app": lambda: self.restart_app_service(payload),
@@ -1695,7 +1703,8 @@ class AgentController:
                                profile=self.profile, profiles=self.available_profiles(),
                                source=self.catalog_source.get(self.mode, ""),
                                key_present=bool(self.key.strip()
-                                                or os.environ.get(kind.key_env or "")))
+                                                or os.environ.get(kind.key_env or "")
+                                                or (kind.key == "gemini" and os.environ.get("GOOGLE_API_KEY"))))
 
     def cloud_choice(self) -> tuple[bool, bool]:
         """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths."""
@@ -1713,11 +1722,34 @@ class AgentController:
         try:
             return config.settings_for(kind, self.endpoint_for(), app_dir=self.app_dir, model=self.model,
                                        api_key_env=kind.key_env,
+                                       fast_model=self.fast_model,
+                                       strong_model=self.strong_model,
+                                       semantic_model_dir=self.semantic_model_dir,
                                        max_turns=8 if cloud else 12,
                                        timeout_seconds=self.timeout_seconds())
         except AgentError as exc:
             self.status = friendly_error(exc)
             return None
+
+    def test_connection(self, payload: dict | None = None) -> dict:
+        """Send a quick ping request to test the current provider / model connection."""
+        kind = self.active_kind()
+        endpoint = self.endpoint_for()
+        model = self.model or (kind.verified[0] if kind.verified else "")
+        start = time.monotonic()
+        try:
+            settings = config.settings_for(kind, endpoint, app_dir=self.app_dir, model=model,
+                                           api_key_env=kind.key_env, max_turns=1,
+                                           timeout_seconds=min(30, self.timeout_seconds()))
+            provider = make_provider(settings, allow_cloud=True, data_class="public",
+                                     api_key=self.key.strip() or None)
+            reply = provider.generate([{"role": "user", "content": "Ping test: confirm connection."}],
+                                      json_mode=False)
+            duration = round(time.monotonic() - start, 2)
+            return {"ok": True, "model": model, "reply": reply.strip()[:200], "duration": duration}
+        except Exception as exc:
+            duration = round(time.monotonic() - start, 2)
+            return {"ok": False, "error": str(exc), "duration": duration}
 
     def set_model(self, value: str) -> None:
         self.model = value
@@ -1740,6 +1772,18 @@ class AgentController:
     def set_timeout(self, value) -> None:
         # Unreadable input falls back to what is already on screen, so the field never jumps.
         self.request_timeout = config.clamp_request_timeout(value, self.request_timeout)
+        self._save_state()
+
+    def set_fast_model(self, value: str) -> None:
+        self.fast_model = value.strip()
+        self._save_state()
+
+    def set_strong_model(self, value: str) -> None:
+        self.strong_model = value.strip()
+        self._save_state()
+
+    def set_semantic_model_dir(self, value: str) -> None:
+        self.semantic_model_dir = value.strip()
         self._save_state()
 
     def set_key(self, value: str) -> None:
@@ -2112,20 +2156,16 @@ class AgentController:
             return
         key = self.key.strip() or None
         self._draft = ""
-        # The position is decided before the message is read. `asks_for_a_change` exists to promote a
-        # chat that turned out to name files, and promoting is exactly what Read-only refuses — so an
-        # imperative here gets the analysis it is allowed, and the row above the answer says why no
-        # diff follows it.
+        # The selected mode is authoritative. In particular, Plan/Chat is prose-only even when the
+        # user says "build" or "create"; only an explicit switch to Change may produce a proposal.
         if self.reading_only():
-            self.start_chat(task, settings, cloud, paid, key, intent.no_proposal(arabic=self.arabic),
+            note = (intent.no_proposal(arabic=self.arabic)
+                    if asks_for_a_change(asked) and not planning_mode.requests_plan(asked) else "")
+            self.start_chat(task, settings, cloud, paid, key, note,
                             asked=asked, quote_of=quote_of)
             return
-        # A bound project answers in prose by default: bound means it may *read* that project,
-        # never that a greeting became a change request. A message that opens with "add" or
-        # "صلح" is a different thing, and it is planned as a change — for this message only,
-        # because remembering the route would turn the next "thanks" into a rejected diff.
-        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked)
-        if not repo or (self.composer == CHAT_COMPOSER and not as_change):
+        if (not repo or self.composer == CHAT_COMPOSER
+                or planning_mode.requests_plan(asked)):
             self.start_chat(task, settings, cloud, paid, key, asked=asked, quote_of=quote_of)
             return
         if plan_file:
@@ -2176,11 +2216,6 @@ class AgentController:
                 self.status = status_text("prior_unverified", arabic=self.arabic)
         self.title = asked.replace("\n", " ")[:45]
         self._add("user", "You", task, quote_of=quote_of)
-        if as_change:
-            self._add("tool", "Tool", "This branch is in Chat mode, so the answer would have been "
-                                      "prose. The message asks for a change, so it is planned as a "
-                                      "proposal instead: review the diff, then Apply to write it. "
-                                      "The next message is Chat again.")
         self.session = self.session_path = None
         notes = self._project_notes()
         if notes:
@@ -2250,6 +2285,7 @@ class AgentController:
 
         # A status set here is overwritten the moment the job starts, so the routing notice
         # rides along as the running line — which is also the entry the log keeps.
+        as_change = self.composer == CHANGE_COMPOSER
         running = ("⚡ Switched to Change mode to propose and write file edits…" if as_change
                    else "Connecting to the model and preparing changes…")
         self.run_job(work, done, running, cancellable=True,
@@ -2483,27 +2519,54 @@ class AgentController:
         if note:
             self.line("tool", "Tool", note)
         repo = self.repo
+        # The web window's Plan button is the prose-only composer. Its mode instruction is explicit,
+        # so even an imperative like "Generate a project" becomes a future plan, never a diff.
+        # Explicit roadmap wording also activates the planner in standalone/read-only conversations.
+        is_plan = self.composer == CHAT_COMPOSER or planning_mode.requests_plan(asked or task)
+        plan_issues: list[str] = []
 
         def work():
-            provider = make_provider(settings, allow_cloud=cloud,
+            if is_plan and repo:
+                self._progress(say(self.arabic,
+                    en="Inspecting project context, then planning (no overall time limit)…",
+                    ar="أفحص سياق المشروع ثم أجهز الخطة (من غير حد زمني إجمالي)…"))
+            chat_settings = replace(
+                settings,
+                output_tokens=min(settings.output_tokens, planning_mode.MAX_PLANNING_TOKENS),
+                # Local models can take several minutes to warm up and draft a complete plan.
+                # Planning has no total deadline; allow the maximum configured idle-read window.
+                timeout_seconds=max(settings.timeout_seconds, config.REQUEST_TIMEOUT_HIGH),
+            ) if is_plan else settings
+            provider = make_provider(chat_settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
             # A stream is offered only to a model that says it can hold one, and the answer it produces
             # is the same one the buffered call returns: what arrives here is for the reader's sake.
             feed = LineFeed(self._token) if getattr(provider, "supports_stream", False) else None
             try:
-                return respond(chat, provider, task, settings, self.chats,
+                reply = respond(chat, provider, task, chat_settings, self.chats,
                                context=self._chat_context(repo),
                                on_token=(feed.feed if feed else None),
-                               cancelled=self.cancel_event.is_set)
+                               cancelled=self.cancel_event.is_set, planning=is_plan)
+                if is_plan:
+                    issues = planning_mode.quality_issues(reply)
+                    plan_issues.extend(issues)
+                return reply
             finally:
                 if feed:
                     feed.close()
 
         def done(reply):
             self._add("assistant", "AI Code Engineer", reply)
+            if is_plan:
+                self._add("tool", "Tool", planning_mode.quality_note(
+                    plan_issues, arabic=is_arabic(asked or task)))
             self.title = title_for(chat)
             self.status = (intent.answered(arabic=self.arabic) if self.reading_only() else
+                           ("Plan may be incomplete; see its quality check above."
+                            if plan_issues else
+                            "Plan response ready. Review its coverage; the structural check cannot prove semantic completeness.")
+                           if is_plan else
                            "Answered. Switch to Change mode when you want reviewed changes to these files."
                            if repo else
                            "Answered. Choose a project when you want reviewed changes to real files.")
@@ -2530,7 +2593,30 @@ class AgentController:
         if not repo or not Path(repo).is_dir():
             return ""
         try:
-            return context_block(Workspace(Path(repo)).repo_map(), self._project_notes())
+            ws = Workspace(Path(repo))
+            repo_map = ws.repo_map()
+            # Build facts are grounded in exact files and kept distinct from the user's target
+            # requirements. This prevents a planning answer from treating a requested pom.xml as
+            # evidence that the file already exists.
+            files, rows = ws.index()
+            facts = []
+            build_names = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+                           "settings.gradle.kts", "package.json", "pyproject.toml", "go.mod",
+                           "cargo.toml"}
+            for row in rows:
+                source = str(row.get("path", "")).replace("\\", "/")
+                if source.rsplit("/", 1)[-1].casefold() not in build_names:
+                    continue
+                facts.append(f"- Build file exists: {source}")
+                for pair in row.get("facts") or []:
+                    if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                        facts.append(f"- {pair[0]}: {pair[1]} (source: {source})")
+            if files:
+                facts.append(f"- Visible repository files: {len(files)} (source: the listed repository map)")
+            if facts:
+                repo_map += "\n\nConfirmed project/build facts (each item cites its source):\n" \
+                    + "\n".join(dict.fromkeys(facts))[:2400]
+            return context_block(repo_map, self._project_notes())
         except (AgentError, OSError):
             return ""
 
@@ -4174,7 +4260,10 @@ class AgentController:
         """The header line: what the next Send would actually do, and with what."""
         if not self.repo:
             return "Standalone chat — no folder attached, nothing to change"
-        parts = [Path(self.repo).name, intent.subtitle(self.composer)]
+        mode_line = (say(self.arabic, en="Plan · reads project; writes nothing",
+                         ar="التخطيط · يقرأ المشروع ولا يكتب ملفات")
+                     if self.composer == CHAT_COMPOSER else intent.subtitle(self.composer))
+        parts = [Path(self.repo).name, mode_line]
         plan_info = self._plan_info()
         if plan_info:
             parts.append(f"step {plan_info['step']} of {plan_info['total']}"
@@ -4196,6 +4285,8 @@ class AgentController:
               "auto_apply": dict(self._auto_pref),
               "endpoints": dict(self.endpoints), "profile": self.profile,
               "request_timeout": self.timeout_seconds(), "plan_chained": bool(self.chained),
+              "fast_model": self.fast_model, "strong_model": self.strong_model,
+              "semantic_model_dir": self.semantic_model_dir,
               "style": self._saved_ui.get("style", "claude"), "theme": self._saved_ui.get("theme", "light"),
               # Written by "Don't show this again". The dict below is rebuilt from named keys, so a
               # preference nobody lists here is erased by the next save of anything else.

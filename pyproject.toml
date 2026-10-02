@@ -9,6 +9,15 @@ description = "A local-first, review-first developer agent for Ollama and OpenRo
 requires-python = ">=3.11"
 dependencies = []
 
+# Optional, opt-in extras. The application runs fully with `dependencies = []`; nothing here is
+# imported unless the operator both installs the package and points a setting or environment
+# variable at local files. `semantic` adds meaning-based retrieval on top of the existing lexical
+# search (`semantic.py`); it is inert without a local FastEmbed model folder, and never downloads
+# a model at run time. `eval` is a development-only tool and is not imported by the app.
+[project.optional-dependencies]
+semantic = ["fastembed>=0.3,<0.5"]
+dev = ["promptfoo"]
+
 [project.scripts]
 agent = "ai_code_engineer.cli:main"
 

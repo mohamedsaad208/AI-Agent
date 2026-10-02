@@ -634,7 +634,7 @@ def _walk_files(root: Path) -> list[str]:
 
         for name in sorted(names):
             relative = prefix + name
-            if relative == INDEX_NAME:
+            if relative in (INDEX_NAME, ".agent-semantic.json"):
                 continue
             suffix = Path(name).suffix.lower()
             if suffix not in _TEXT_SUFFIXES and name.casefold() not in {
