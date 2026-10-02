@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer import intent
+from ai_code_engineer import intent, permissions, policy
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp import server as server_module
 from ai_code_engineer.webapp.controller import AgentController
@@ -780,6 +780,33 @@ class TheWriteCardAndTheChips(unittest.TestCase):
         """dir="auto" reads the first strong character, and a tool row opens with its English
         author label, so an Arabic notice can never resolve to RTL on its own."""
         self.assertIn("ARABIC_RUN.test(m.text) ? 'rtl' : 'auto'", self.flat)
+
+
+class TheFailureThatIsAField(unittest.TestCase):
+    """UI 4.7 / V2 #14: the readiness card used to answer an unreadable `.env` with "nothing missing".
+
+    The server now sends a field that says it could not look, and the card has to have somewhere to put
+    it. `innerHTML` is how `el` fills a node here, so an empty node is the only safe way to reserve a line
+    that may later hold a sentence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.projects = (static / "ui-projects.js").read_text(encoding="utf-8")
+
+    def test_the_line_exists_before_there_is_a_failure_to_show(self):
+        block = self.projects.split("const envSec = ")[1].split("body.appendChild(envSec)")[0]
+        self.assertEqual(block.count("envSec.appendChild"), 4,
+                         "the heading, the two facts, and the one line that may stay empty")
+        self.assertIn("if (env.unreadable) unreadable.textContent = env.unreadable;", block,
+                      "innerHTML would have parsed the server's sentence as markup")
+
+    def test_the_client_builds_no_reason_of_its_own(self):
+        self.assertIn("unreadable.dir = 'auto'", self.projects,
+                      "the sentence is the server's, in the language the folder was read in")
+        for invented in ("could not read", "unreadable .env", "Missing keys: unknown"):
+            self.assertNotIn(invented, self.projects, "the client wrote its own failure: " + invented)
 
 
 class TheCountsOnTheChangeCard(unittest.TestCase):
@@ -1636,6 +1663,22 @@ class SnapshotShapeTests(unittest.TestCase):
             controller._draft = "Fix the add function"
             self.assertEqual(controller.snapshot()["draft"], "Fix the add function")
             controller.close()
+
+    def test_unresolved_internal_hostname_needs_a_folder_rule(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            controller = AgentController(Path(temp) / "app-data")
+            self.addCleanup(controller.close)
+            controller.repo = str(root)
+
+            stopped = controller.address_gate("https://db.internal/admin")
+            self.assertIn("db.internal", stopped)
+            self.assertIn("cannot tell which address", stopped)
+
+            permissions.declare(controller.app_dir, root, policy.NETWORK, policy.ALLOW, by="cli")
+            self.assertEqual(controller.address_gate("https://db.internal/admin"), "")
 
     def test_the_header_line_names_the_folder_step_and_model(self):
         import tempfile

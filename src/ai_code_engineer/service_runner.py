@@ -27,6 +27,8 @@ from typing import Callable, Optional
 
 from . import redaction
 from . import runner
+from . import ignore
+from . import labels
 from .errors import PolicyError
 
 MAX_BUFFER_LINES = 5000
@@ -613,6 +615,27 @@ def infer_project_config(repo: Path) -> dict:
 
 
 # ---------------------------------------------------------------- Project Readiness
+def env_names(path) -> list[str]:
+    """The key *names* in an environment file, and nothing else of it.
+
+    `.env` is precisely the file `ignore.credential` exists to refuse, and this is the one reader in the
+    package that legitimately has to look at one: the readiness report answers which keys a project is
+    *missing*, which is a question about names. So the gate is applied here rather than routed around, the
+    line is cut at its first `=` and never further, and a file that is not named like a secret is refused
+    by the same predicate that refuses it everywhere else — this reader does not get to decide what counts
+    as a secret file.
+    """
+    name = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if not ignore.credential(name):
+        return []
+    keys = []
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        text = line.strip()
+        if text and not text.startswith("#") and "=" in text:
+            keys.append(text.split("=", 1)[0].strip())
+    return keys
+
+
 def check_project_readiness(repo: Path) -> dict:
     """Inspect toolchains, wrappers, configuration files, and environment requirements."""
     repo = Path(repo).resolve()
@@ -657,24 +680,22 @@ def check_project_readiness(repo: Path) -> dict:
             configs_detected.append(marker)
 
     # Env check
-    env_status = {"has_env": False, "has_example": False, "missing_keys": []}
+    env_status = {"has_env": False, "has_example": False, "missing_keys": [], "unreadable": ""}
     has_env = (repo / ".env").is_file()
     has_example = (repo / ".env.example").is_file()
     env_status["has_env"] = has_env
     env_status["has_example"] = has_example
 
     if has_example:
+        # The failure is a field rather than a `pass`: a folder whose files could not be read reported no
+        # missing keys, which is the same answer as a folder that is configured. Names are all that come
+        # back, through `env_names`, because this report is shown, searched and pasted into a prompt.
         try:
-            ex_lines = (repo / ".env.example").read_text(encoding="utf-8", errors="replace").splitlines()
-            ex_keys = [line.split("=")[0].strip() for line in ex_lines if line.strip() and not line.startswith("#") and "=" in line]
-            curr_keys = []
-            if has_env:
-                curr_lines = (repo / ".env").read_text(encoding="utf-8", errors="replace").splitlines()
-                curr_keys = [line.split("=")[0].strip() for line in curr_lines if line.strip() and not line.startswith("#") and "=" in line]
-            missing = [k for k in ex_keys if k not in curr_keys]
-            env_status["missing_keys"] = missing
-        except Exception:
-            pass
+            ex_keys = env_names(repo / ".env.example")
+            curr_keys = env_names(repo / ".env") if has_env else []
+            env_status["missing_keys"] = [key for key in ex_keys if key not in curr_keys]
+        except (OSError, UnicodeError) as exc:
+            env_status["unreadable"] = labels.note("env_names_unreadable", error=str(exc)[:160])
 
     # Remediation recommendations
     recommendations = []

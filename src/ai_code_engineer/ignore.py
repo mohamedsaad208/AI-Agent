@@ -30,6 +30,10 @@ PROTECTED_DIRS = {
     # The signed rows and the key that signs them. The signature is what actually refuses a row a model
     # wrote, but a file the operator set with their own hands is not the model's to rewrite either.
     ".agent-overrides.json", ".agent-overrides.key",
+    # The folder's answers to the policy table, for the same reason: a proposal that can edit the rules
+    # it is being checked against is not being checked against anything. Its real home is beside the
+    # app's own records, outside every approved folder; this entry is the belt.
+    ".agent-permissions.json",
     ".venv", "venv", ".gradle", ".m2",
     ".idea",
 }

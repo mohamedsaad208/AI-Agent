@@ -417,6 +417,10 @@ async function readinessDrawer() {
   if (env.missing_keys && env.missing_keys.length) {
     envSec.appendChild(el('div', 'warn small', 'Missing keys in .env: ' + env.missing_keys.map(k => esc(k)).join(', ')));
   }
+  const unreadable = el('div', 'warn small');
+  unreadable.dir = 'auto';
+  if (env.unreadable) unreadable.textContent = env.unreadable;
+  envSec.appendChild(unreadable);
   body.appendChild(envSec);
 
   if (data.recommendations && data.recommendations.length) {
@@ -583,6 +587,8 @@ function renderHeader() {
   // mid-run has to survive the next push, which is exactly what used to wipe it.
   state.status = DATA.status || '';
   paintStatus();
+  state.stage = DATA.stage || null;
+  paintStage();
   markTabs(state.view);
 }
 
@@ -597,4 +603,25 @@ function paintStatus() {
   bar.dir = ARABIC_RUN.test(line) ? 'rtl' : 'auto';
   bar.classList.toggle('busy', !!state.busy);
   bar.classList.toggle('hidden', !line && !state.busy);
+}
+
+/* The workflow strip: the sentence the server chose for the task's language, then the eight names behind
+   it so the position can be checked rather than felt. It is drawn from the session record, so a reload
+   mid-run puts it back exactly where it was. */
+function paintStage() {
+  const bar = $('stagestrip');
+  const st = state.stage || {};
+  bar.textContent = '';
+  bar.dir = ARABIC_RUN.test(st.line || '') ? 'rtl' : 'auto';
+  const said = document.createElement('span');
+  said.className = 'stage-line';
+  said.textContent = st.line || '';
+  bar.appendChild(said);
+  (st.steps || []).forEach((row) => {
+    const mark = document.createElement('span');
+    mark.className = 'stage-mark' + (row.reached ? ' on' : '');
+    mark.title = row.label;
+    bar.appendChild(mark);
+  });
+  bar.classList.toggle('hidden', !st.current);
 }

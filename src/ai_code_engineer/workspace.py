@@ -114,12 +114,15 @@ class Workspace:
             raise PolicyError("Use a relative path with forward slashes.")
         parts = relative.split("/")
         if PurePosixPath(relative).is_absolute() or any(
-            p in {"", ".", ".."} or p.rstrip(" .") != p for p in parts
+            part in {"", ".", ".."} or part.rstrip(" .") != part for part in parts
         ):
             raise PolicyError("Absolute paths, traversal and ambiguous paths are blocked.")
-        if any(ignore.refused_dir(p) for p in parts):
-            raise PolicyError("Protected path.")
-        if any(re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", p) for p in parts):
+        if any(ignore.refused_dir(part) for part in parts):
+            # Named for the same reason the text gate below is: the path is the thing the model wrote
+            # seconds ago, and a refusal that says only "protected" cannot be compared with the request.
+            raise PolicyError("Protected path: " + relative)
+        if any(re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)
+               for part in parts):
             raise PolicyError("Device paths are blocked.")
         current = self.root
         for part in parts:
@@ -132,8 +135,8 @@ class Workspace:
             raise PolicyError("Path escapes workspace.")
         # The name the model typed and the name NTFS finally opens are not always the
         # same (case, aliases, mount points), so the resolved form is checked too.
-        if any(ignore.refused_dir(p) for p in resolved.relative_to(self.root).parts):
-            raise PolicyError("Protected path.")
+        if any(ignore.refused_dir(part) for part in resolved.relative_to(self.root).parts):
+            raise PolicyError("Protected path: " + relative)
         if (current.suffix.lower() not in TEXT_SUFFIXES
                 and current.name.casefold() not in TEXT_NAMES):
             # The name goes into the sentence because the model wrote it seconds earlier and is
@@ -144,7 +147,7 @@ class Workspace:
         if writable and (current.name.casefold() in AGENT_RULE_FILES or
                          any(p.casefold() in AGENT_CONFIG_DIRS for p in parts) or
                          parts[0].casefold() in ROOT_POLICY_DIRS):
-            raise PolicyError("Instructions and policy files are read-only.")
+            raise PolicyError("Instructions and policy files are read-only: " + relative)
         return current
 
     def read(self, relative: str) -> dict:
@@ -156,7 +159,7 @@ class Workspace:
         if not stat.S_ISREG(info.st_mode):
             raise PolicyError("Path is not a regular file: " + relative)
         if info.st_size > MAX_FILE_BYTES:
-            raise PolicyError("File exceeds the 128 KiB read limit: " + relative)
+            raise PolicyError(f"File exceeds the {MAX_FILE_BYTES // 1024} KiB read limit: " + relative)
         raw = path.read_bytes()
         if len(raw) > MAX_FILE_BYTES or b"\x00" in raw:
             raise PolicyError("File is too large or binary.")

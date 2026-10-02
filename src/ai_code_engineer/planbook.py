@@ -93,6 +93,14 @@ def parse_steps(text: str) -> list[dict]:
                 break
         steps.append({"id": len(steps) + 1, "title": title[:90],
                       "body": text[match.end():end].strip()[:6000]})
+    seen_titles: dict[str, int] = {}
+    for s in steps:
+        t = s["title"]
+        if t in seen_titles:
+            seen_titles[t] += 1
+            s["title"] = f"{t} (Part {seen_titles[t]})"[:90]
+        else:
+            seen_titles[t] = 1
     return steps
 
 
@@ -331,6 +339,62 @@ def uncovered_criteria(book: dict) -> list[int]:
     for row in book.get("steps", []):
         covered.update(number for number in (row.get("accepts") or []) if isinstance(number, int))
     return [number for number in range(1, len(book.get("criteria") or []) + 1) if number not in covered]
+
+
+VERDICTS = ("verified", "failed", "unproven")
+
+
+def criterion_verdicts(book: dict) -> list[dict]:
+    """One verdict per acceptance criterion, read off the ledger the steps already keep.
+
+    A criterion is `verified` only when a step that answers it was closed by `complete`, which refuses every
+    other route: the row then says `verified` and carries no `unproven` mark, and that mark is the whole
+    difference between a command run proving a step and a person pressing a button. `failed` needs a step
+    that ran and did not prove it. Everything else — a step nobody has run yet, a step closed by hand, a
+    criterion no step claims — is `unproven`, and `why` says which of those, because "not yet" and "nobody
+    was asked" are different work to do.
+
+    Computed, never asked: the model that wrote the plan does not grade it, and nothing here opens a session
+    file — the ledger already holds what the last run proved, which is what makes it safe to build per
+    snapshot.
+    """
+    criteria = [str(item) for item in (book.get("criteria") or [])]
+    if not criteria:
+        return []
+    claiming: dict[int, list[dict]] = {}
+    for row in book.get("steps") or []:
+        for number in (row.get("accepts") or []):
+            if isinstance(number, int) and 1 <= number <= len(criteria):
+                claiming.setdefault(number, []).append(row)
+    uncovered = set(uncovered_criteria(book))
+    out: list[dict] = []
+    for number, text in enumerate(criteria, start=1):
+        rows = claiming.get(number) or []
+        proven = [row for row in rows if row.get("status") == "verified" and not row.get("unproven")]
+        failed = [row for row in rows if row.get("status") == "failed"]
+        clicked = [row for row in rows if row.get("status") == "verified" and row.get("unproven")]
+        if proven:
+            verdict, why, shown = "verified", "proved", proven[-1]
+        elif failed:
+            verdict, why, shown = "failed", "run_failed", failed[-1]
+        elif clicked:
+            verdict, why, shown = "unproven", "clicked", clicked[-1]
+        elif rows:
+            verdict, why, shown = "unproven", "not_run", rows[-1]
+        else:
+            verdict, why, shown = "unproven", "uncovered", None
+        out.append({"number": number, "text": text, "verdict": verdict, "why": why,
+                    "steps": [row["id"] for row in rows],
+                    "detail": str((shown or {}).get("failure_reason") or (shown or {}).get("unproven") or ""),
+                    "at": str((shown or {}).get("verified_at") or "") if shown else "",
+                    "uncovered": number in uncovered})
+    return out
+
+
+def verdict_tally(rows: list[dict]) -> dict:
+    """How many criteria a run proved, failed, or has never been shown — the counts, not the sentences."""
+    return {"total": len(rows),
+            **{name: sum(1 for row in rows if row["verdict"] == name) for name in VERDICTS}}
 
 
 def sub_goal_of(book: dict, row: dict | None) -> str:

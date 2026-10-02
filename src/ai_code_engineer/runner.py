@@ -464,6 +464,21 @@ def _failures(text: str) -> list[str]:
     return rows[:40]
 
 
+def _check_maven_pom_modules(folder: Path) -> str | None:
+    pom_file = folder / "pom.xml"
+    if not pom_file.exists():
+        return None
+    try:
+        content = pom_file.read_text(encoding="utf-8", errors="ignore")
+        if "<packaging>pom</packaging>" in content:
+            if "<modules>" not in content or not re.search(r"<module>\s*[^<]+\s*</module>", content):
+                return "Root pom.xml specifies <packaging>pom</packaging> but contains no child <modules>. Submodules were not tested."
+    except Exception:
+        pass
+    return None
+
+
+
 # A console line is something the project can print; a report file is something the test
 # framework wrote after running the tests. Where a machine-readable report exists it is
 # the authority, and only a report fresh enough to belong to this run counts.
@@ -832,6 +847,12 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
         if process is not None and process.returncode is None:
             raise PolicyError(f"Build process {process.pid} could not be stopped. "
                               "It may still be running; stop it before starting another build.")
+    failures = _failures(output)
+    if recipe == "maven-test" and status == "unverified":
+        pom_err = _check_maven_pom_modules(where)
+        if pom_err:
+            status = "failed"
+            failures.append(pom_err)
     return {"recipe": recipe, "label": recipe_entry["label"],
             # Which folder of this project the command actually ran in, recorded rather than implied:
             # a reactor's root and one module of it answer to the same recipe name, and a fix round
@@ -844,7 +865,7 @@ def run(repo: Path, recipe: str, timeout: int = DEFAULT_TIMEOUT,
             "exit_code": exit_code, "seconds": seconds,
             "tests_observed": bool(proof and proof["tests"]) or ran,
             "proof": proof, "truncated": truncated, "timed_out": timed_out,
-            "output": output, "tail": output[-MODEL_OUTPUT_CHARS:], "failures": _failures(output)}
+            "output": output, "tail": output[-MODEL_OUTPUT_CHARS:], "failures": failures}
 
 
 def run_folder(run: dict) -> str:

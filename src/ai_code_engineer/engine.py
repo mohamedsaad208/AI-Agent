@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 
 from .config import Settings
 from .errors import AgentError, Cancelled, MissingFileError, PolicyError
+from . import core
 from . import impact
 from . import labels
 from . import memory as memory_module
@@ -371,6 +372,23 @@ def event(session: dict, kind: str, **values) -> None:
     session["events"].append({"at": now(), "kind": kind, **values})
 
 
+def record_stage(session: dict, code: str) -> str:
+    """Say how far along this run is, when the lifecycle counts the move as one.
+
+    A stage is not a state: `state` records what happened to the task and decides which buttons work, while
+    this answers the question a person watching a long job actually asks — and the two vocabularies share
+    one name and nothing else, which is why they stay apart. A move `core` does not allow writes nothing and
+    returns the stage that stayed: this is an orientation line, and it must never be the reason a command
+    failed.
+    """
+    current = str(session.get("stage") or "")
+    if current == code or not core.stage_allowed(current, code):
+        return current
+    session["stage"] = code
+    event(session, "stage", to=code)
+    return code
+
+
 def _match_lines(text: str, needle: str) -> list[int]:
     """1-based line numbers where `needle` starts, for the "widen it" message."""
     rows, index = [], 0
@@ -689,6 +707,9 @@ def propose_block(ws: Workspace, task: str, name: str, content: str, runs: Path,
     session["proposal_hash"] = proposal_hash(session)
     event(session, "block_chosen", path=changes[0]["path"], from_block=True)
     event(session, "proposal", hash=session["proposal_hash"])
+    # The one path that opens at `review` rather than walking to it: a person chose the block, so the
+    # exploring and the drafting already happened, on their keyboard rather than here.
+    record_stage(session, "review")
     atomic_json(path, session)
     return path
 
@@ -698,7 +719,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
          chat_id: str | None = None, extra_context: str | None = None,
          plan_step: int | None = None, memory: str | None = None, step=None,
          on_token=None, goal: str = "", criteria: list[str] | None = None,
-         accepts: list[int] | None = None, resume_run: str | None = None) -> Path:
+         accepts: list[int] | None = None, resume_run: str | None = None,
+         fix_round: int = 0) -> Path:
     """Run the tool loop until the model proposes a change.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
@@ -760,6 +782,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         path = runs.resolve() / run_id / "session.json"
         session = {"schema": 1, "id": run_id, "root": str(ws.root), "task": task,
                    "state": "DISCOVERING", "created": now(), "events": [], "model": provider.model}
+    record_stage(session, "understand")
     run_dir = path.parent
     acquire_run_lock(run_dir)
     prior_context = ""
@@ -799,11 +822,17 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             session["criteria"] = [str(c)[:200] for c in criteria[:8]]
         if accepts:
             session["accepts"] = [int(a) for a in accepts if isinstance(a, int)]
+    if fix_round:
+        # Charged on the record before the round costs a request: a restart that resumes this session has
+        # to find the number here, or the ceiling it stopped at becomes free again.
+        session["fix_round"] = max(1, int(fix_round))
     if memory and memory.strip():
         if len(memory) > memory_module.MAX_MEMORY:
             raise PolicyError(f"Project notes must stay within {memory_module.MAX_MEMORY} characters.")
         memory_module.record(session, memory)
         event(session, "memory_attached", characters=len(session["memory"]))
+    # The request is read, the folder's map and notes are gathered, and from here the model is asked.
+    record_stage(session, "plan")
     atomic_json(path, session)
     repo_map = ws.repo_map()
     # What this project's earlier tasks left behind is read once per turn from the store outside the
@@ -1117,15 +1146,20 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                                    changes=changes,
                                    state="WAITING_APPROVAL")
                     session["proposal_hash"] = proposal_hash(session)
+                    # The files are written down as a proposal at this instant, which is what `implement`
+                    # means here: nothing has touched the project, and the change exists as an offer.
+                    record_stage(session, "implement")
                     event(session, "proposal", hash=session["proposal_hash"])
                     # Deliberately after the hash: what a proposal breaks elsewhere is an answer about
                     # the repository, not part of what is being approved, and it must never change the
                     # number a person typed to approve it.
                     session["impact"] = impact_for(ws, rows, changes)
+                    record_stage(session, "impact")
                     event(session, "impact", files=len(session["impact"].get("files") or []),
                           unknown=len(session["impact"].get("unknown") or []))
                     announce("propose", count=len(changes),
                              names=[change["path"] for change in changes])
+                    record_stage(session, "review")
                     # Saved after the announcement, not before: `announce` appends the proposal's own
                     # step row to this record, and a task reopened from history must not lose the one
                     # row that says what was offered.
@@ -1404,6 +1438,7 @@ def apply_proposal(path: Path, approved_hash: str) -> dict:
         if actual != change["before_hash"]:
             raise PolicyError("Workspace changed since planning; regenerate the proposal.")
     session["state"] = "APPLYING"
+    record_stage(session, "approve")
     event(session, "approved", hash=approved_hash)
     atomic_json(path, session)
     written: list[str] = []
@@ -1480,6 +1515,8 @@ def rollback(path: Path, approved_hash: str) -> dict:
         atomic_json(path, session)
     session["state"] = "ROLLED_BACK"
     event(session, "rolled_back")
+    # Back to the offer, because the offer is all that is left on disk: the files it described are gone.
+    record_stage(session, "review")
     # The memory of the change is corrected rather than left claiming work that is no longer on disk.
     memory_module.note_task(memory_module.memory_dir_for(path.parent.parent),
                             session["root"], session, status="rolled_back")

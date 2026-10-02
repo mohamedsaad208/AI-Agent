@@ -11,11 +11,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .engine import (atomic_json, chat_sessions, event, load_session, shrink_warning,
+from .engine import (atomic_json, chat_sessions, event, load_session, record_stage, shrink_warning,
                      unexpected_notice)
 from .errors import AgentError, PolicyError
 from .labels import INTERRUPTED_STATES
 from .redaction import redact
+from . import core
+from . import impact
+from . import memory as memory_module
 from . import runner
 
 MAX_FIX_ROUNDS = 3
@@ -170,6 +173,106 @@ STATE_FOR_RUN = {"passed": "CHECKS_PASSED", "failed": "VERIFICATION_FAILED",
                  "unavailable": "VERIFICATION_BLOCKED"}
 
 
+def stage_after_run(session: dict, run: dict) -> str:
+    """Where the workflow stands once a command run is in, decided by the lifecycle and not here.
+
+    The run is the verifying step's evidence, so it is handed to `core` as a verification result: a passing
+    one closes the loop and a failing one puts the task back on the model. This function's whole job is to
+    translate that verdict into the stage a window draws, which is why neither window is left to decide it —
+    two windows reading the same run and disagreeing about where they are is the same bug that made the fix
+    budget live in one place.
+    """
+    state = core.AgentState(task=core.Task(description=str(session.get("task") or "")),
+                            status=core.AgentStatus.VERIFYING)
+    core.AgentCore(session.get("root") or ".").record_verification(state, verification_from_run(run))
+    return core.stage_of(state.status)
+
+
+def round_of(session: dict) -> int:
+    """Which fix round this record says it was.
+
+    The number lives on the session the round produced rather than in whichever window pressed the button,
+    because closing the app used to renew the ceiling: three rounds, restart, and a fourth was free. A
+    record written before the field existed spent none, which is the honest floor — it restores the budget
+    the person already spent, not an unlimited one.
+    """
+    try:
+        return max(0, int(session.get("fix_round") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+CANDIDATE_FILES_SHOWN = 8
+
+
+def fix_candidates(ws, session: dict) -> str:
+    """Which files this round should open, taken from the index instead of invented by the model.
+
+    A small model asked to fix a compile error names files that do not exist, and every one of those costs
+    a turn spent reading nothing. The dependency index already knows which files import the ones this
+    proposal wrote and which test mirrors them by name, so the shortlist is computed here. It says what it
+    left out, because a list that hides its own cut is how a model comes to believe it saw the project.
+    """
+    changes = session.get("changes") or []
+    if not changes:
+        return ""
+    try:
+        _visible, rows = ws.index()
+        paths, others = impact.candidate_files(rows, [str(change.get("path", "")) for change in changes])
+    except (AgentError, PolicyError, OSError, ValueError, TypeError, KeyError):
+        return ""
+    if not paths:
+        return ""
+    shown = paths[:CANDIDATE_FILES_SHOWN]
+    lines = ["Files worth opening for this failure, read from the index — a shortlist, not a claim about "
+             "which one is wrong: " + ", ".join(shown)]
+    if len(paths) > len(shown):
+        lines.append(f"{len(paths) - len(shown)} more ranked candidates exist and are not listed here; "
+                     f"besides the files this task wrote, the index holds {others} files this round opened "
+                     "none of.")
+    return "\n".join(lines)
+
+
+def with_candidates(text: str, ws, session: dict) -> str:
+    """Append the round's shortlist to whatever evidence the window already holds.
+
+    The join lives here so neither window keeps a copy of the rule "a fix turn gets the failure and then
+    the files the index ranks". `evidence` stays a separate call in both windows on purpose: the guard that
+    keeps them asking the same five questions reads it by name.
+    """
+    shortlist = fix_candidates(ws, session)
+    return f"{text}\n\n{shortlist}" if shortlist else text
+
+
+LEDGER_LABEL_CHARS = 40
+LEDGER_FACT_CHARS = 120
+
+
+def settled_rule(session: dict) -> tuple[str, str]:
+    """The rule a passing round leaves behind: which failure it was sent to fix, and what closed it.
+
+    A fix round is the only place that holds both halves — the failing output came in as its evidence, and
+    the change that answered it is its own proposal — so this is where the ledger gets its one line. A
+    project that failed the same way three times is worth a sentence to the next task rather than a fourth
+    reading of the same stack trace, and the store it goes into is the one every later task in the folder
+    already reads.
+    """
+    if round_of(session) <= 0:
+        return "", ""
+    run = last_run(session)
+    if not run or run.get("status") != "passed":
+        return "", ""
+    evidence = str(session.get("evidence") or "")
+    mark = redact(next((line.strip() for line in evidence.splitlines() if line.strip()), ""))
+    if not mark:
+        return "", ""
+    names = ", ".join(str(change.get("path", "")) for change in (session.get("changes") or [])[:2])
+    said = " — ".join(part for part in (str(session.get("summary") or "").strip(),
+                                        "wrote " + names if names else "") if part)
+    return (mark[:LEDGER_LABEL_CHARS],
+            f"closed by fix round {round_of(session)}: {said}"[:LEDGER_FACT_CHARS])
+
+
 def record_run(session_path: Path, result: dict) -> dict:
     """Persist a slimmed run summary on the session; the full log stays out of the store."""
     session = load_session(session_path)
@@ -182,6 +285,14 @@ def record_run(session_path: Path, result: dict) -> dict:
     session.setdefault("runs", []).append(slim)
     session["state"] = STATE_FOR_RUN[result["status"]]
     event(session, "run", **{key: slim[key] for key in ("recipe", "status", "exit_code", "seconds")})
+    record_stage(session, "build_test")
+    record_stage(session, stage_after_run(session, slim))
+    label, fact = settled_rule(session)
+    if label:
+        # The ledger never stops the run that earned it: `record_facts` swallows its own failures, and a
+        # bookkeeping write that could abort a passing build is worse than no ledger at all.
+        memory_module.record_facts(memory_module.memory_dir_for(session_path.parent.parent),
+                                   str(session.get("root") or ""), {label: fact})
     atomic_json(session_path, session)
     return session
 
@@ -591,6 +702,19 @@ def verification_from_run(run: dict) -> Any:
     )
 
 
+def advance_verification(core: Any, state: Any, run: dict) -> Any:
+    """Hand a command run that somebody already executed to the lifecycle, and take back the verdict.
+
+    `execute_verification` runs the recipe itself, and by the time a window has a result worth recording
+    it has run the project's build once — calling the runner-bound function from there would run it
+    again, in front of the person who already waited. This is the half that decides VERIFYING to DONE or
+    FIXING, which is the difference between offering a fix round and finishing the task.
+    """
+    verif = verification_from_run(run)
+    core.record_verification(state, verif)
+    return verif
+
+
 def execute_verification(
     core: Any,
     state: Any,
@@ -618,9 +742,7 @@ def execute_verification(
         sandbox=sandbox,
         cancelled=cancelled,
     )
-    verif = verification_from_run(run_dict)
-    core.record_verification(state, verif)
-    return verif
+    return advance_verification(core, state, run_dict)
 
 
 def handle_fix_evaluation(

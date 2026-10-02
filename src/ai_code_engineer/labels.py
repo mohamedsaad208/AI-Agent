@@ -64,6 +64,30 @@ STATES_AR = {
     "PARTIAL_APPLY": "تم التطبيق جزئيًا — راجع قبل المتابعة",
     "APPLYING": "انقطع التطبيق — راجع المهمة",
 }
+# How far along the run is, which is a different question from what happened to it: the table above is the
+# outcome and decides which buttons work, this one is the position in the workflow and decides what a person
+# watching a long job reads. `core.STAGES` owns the codes and the order; this is only the wording.
+STAGES = {
+    "understand": "Understanding the task",
+    "plan": "Planning the change",
+    "implement": "Writing the change",
+    "impact": "Checking what it touches",
+    "review": "Waiting for your review",
+    "approve": "Applying what you approved",
+    "build_test": "Building and testing",
+    "verify": "Verifying the result",
+}
+STAGES_AR = {
+    "understand": "أفهم المهمة",
+    "plan": "أخطط للتغيير",
+    "implement": "أكتب التغيير",
+    "impact": "أفحص ما يلمسه التغيير",
+    "review": "في انتظار مراجعتك",
+    "approve": "أنفّذ ما وافقت عليه",
+    "build_test": "البناء والاختبار",
+    "verify": "التحقق من النتيجة",
+}
+
 # States whose files exist on disk and can still be checked, run against, or rolled back.
 MUTABLE_STATES = {"APPLIED_UNVERIFIED", "VERIFICATION_BLOCKED", "VERIFICATION_FAILED", "CHECKS_PASSED"}
 # A task whose files are on disk without a passing command run. Starting the next task
@@ -90,6 +114,35 @@ def state_label(value: str | None, *, arabic: bool = False) -> str:
     if arabic:
         return STATES_AR.get(value, value)
     return STATES.get(value, value)
+
+
+def stage_label(value: str | None, *, arabic: bool = False) -> str:
+    """The line a window draws for how far along the run is.
+
+    A code with no wording falls back to the code rather than to an invented sentence, and a run that has
+    not recorded one says so — a blank strip reads as "finished" to everybody who sees it.
+    """
+    if not value:
+        return "Nothing recorded yet" if not arabic else "لم يُسجَّل شيء بعد"
+    table = STAGES_AR if arabic else STAGES
+    return table.get(value, value)
+
+
+def stage_line(value: str | None, *, arabic: bool = False,
+               stage_order: tuple[str, ...] | None = None) -> str:
+    """The whole sentence: which step this is, and how many there are.
+
+    The count is part of the sentence rather than a decoration beside it because "Writing the change" alone
+    does not tell a person whether four steps are left or none. A code the table does not know — an older
+    record, a stage renamed in a later release — answers with the plain label instead of a step number that
+    would be wrong.
+    """
+    # Callers that own the lifecycle pass its ordered codes; STAGES is only the wording map.
+    codes = list(stage_order) if stage_order is not None else list(STAGES)
+    if not value or value not in codes:
+        return stage_label(value, arabic=arabic)
+    return note("stage_line", arabic=arabic, number=codes.index(value) + 1, total=len(codes),
+                where=stage_label(value, arabic=arabic))
 
 
 # --------------------------- the write, in the language it was asked for ---------------------------
@@ -507,6 +560,16 @@ NOTE_TEMPLATES = {
     "plan_criteria": ("Acceptance criteria", "معايير القبول"),
     "plan_uncovered": ("no step answers this yet", "لا خطوة تجيب على هذا بعد"),
     "plan_unproven": ("marked done without a command run", "مُعلَّم كمنتهي بدون تشغيل أمر"),
+    # The three words a computed criterion verdict can answer with, and the two reasons the middle one
+    # gives. They are here rather than in the client because the client cannot know which language the task
+    # was asked in, and the words are the verdict — a colour alone would leave "unproven" meaning anything.
+    "verdict_verified": ("proved", "مثبتة"),
+    "verdict_failed": ("failed", "فاشلة"),
+    "verdict_unproven": ("not proved", "غير مثبتة"),
+    "verdict_clicked": ("closed by a click, not by a run", "أُغلقت بنقرة لا بتشغيل أمر"),
+    "verdict_not_run": ("no command run has answered it yet", "لم يُجب عنها أي أمر بعد"),
+    "plan_verdicts_line": ("{proved} of {total} acceptance criteria are proved by a command run",
+                           "{proved} من {total} من معايير القبول مثبتة بتشغيل أمر"),
     # A task that stopped mid-turn is a fact the operator has to decide about, so it is said and never
     # acted on: nothing here resumes a run by itself, which is the rule the request queue already lives
     # by (`restored: True` and a press of the play button).
@@ -581,6 +644,71 @@ NOTE_TEMPLATES = {
                              "أحد الملفات فقد تعريفات أكثر مما هو مُدرج هنا ({max} لكل نوع)"),
     "impact_unknown_failed": ("the impact check could not run, so nothing was verified about other files",
                               "لم يستطيع فحص الأثر أن يعمل، لذا لم يُتحقق أي شيء بخصوص الملفات الأخرى"),
+    # ---- the policy table (#4). `policy.py` answers with a class and a verdict, `permissions.py`
+    # remembers the folder's own word; these are the sentences an operator reads when one of them
+    # stands between a click and a command.
+    "policy_ask_write_that_runs": ("This change edits {names}, a file this tool reads back as the command "
+                                   "to run. Confirm to write it.",
+                                   "هذا التعديل يغيّر {names}، وهو ملف تقرأ هذه الأداة منه الأمر الذي "
+                                   "تنفّذه. أكّد للكتابة."),
+    "policy_deny_write_that_runs": ("This folder was told never to let a change edit the file its commands "
+                                    "come from ({names}).",
+                                    "هذا المجلد أُمر ألا يعدّل أبدًا الملف الذي تُؤخذ منه أوامره ({names})."),
+    "policy_ask_execute_custom": ("This command is not one of the project's own recipes, so it runs on your "
+                                  "word alone. Confirm to run it once.",
+                                  "هذا الأمر ليس من وصفات المشروع الجاهزة، لذا سينفّذ بناء على كلمتك وحدها. "
+                                  "أكّد لتنفيذه مرة واحدة."),
+    "policy_deny_execute_custom": ("A model asked for a shell command. Commands here come from you, not from "
+                                   "the agent.",
+                                   "أحد النماذج طلب أمر نظام. الأوامر هنا صادرة منك، لا من الوكيل."),
+    "policy_ask_network": ("Send one network request to {host}? Confirm to continue.",
+                            "هل تريد إرسال طلب شبكة واحد إلى {host}؟ أكّد للمتابعة."),
+    "policy_deny_network": ("A model asked to reach an address. This tool sends a network request when you "
+                            "press the button that makes one, and not otherwise.",
+                            "أحد النماذج طلب الوصول إلى عنوان. هذه الأداة ترسل طلب شبكة عندما تضغط الزر الذي "
+                            "يرسله، لا أكثر."),
+    "policy_lift": ("To answer differently for this folder, set its policy row.",
+                    "لتغيير الإجابة لهذا المجلد، اضبط سطر سياسته."),
+    "policy_how": ("To answer it differently from here, run:  agent policy --repo \"{folder}\" "
+                   "--action {action} --verdict allow|ask|deny",
+                   "للإجابة بشكل مختلف من هنا، شغّل:  agent policy --repo \"{folder}\" "
+                   "--action {action} --verdict allow|ask|deny"),
+    # An address class that is not this machine's own costs more than one yes. These are the two shapes of
+    # that refusal, said before any dialog opens: an ask the operator can answer is not the same answer as
+    # a rule the folder wrote, and the difference is the whole point of the row.
+    "policy_addr_limited": ("The target is {kind}: {host}. A yes on this button does not open a request "
+                            "that leaves this machine — the folder has to say so once, as a rule.",
+                            "الهدف من نوع {kind}: {host}. الموافقة على هذا الزر لا تفتح طلبًا يخرج من هذا "
+                            "الجهاز — لا بد أن يقول المجلد ذلك مرة واحدة، كقاعدة."),
+    "policy_addr_named": ("The target is hostname {host} ({kind}). This check cannot tell which address it "
+                          "resolves to, so this folder must explicitly allow network access before sending.",
+                          "الهدف هو اسم النطاق {host} ({kind}). لا يستطيع هذا الفحص معرفة العنوان الذي سيشير إليه، "
+                          "لذلك يجب أن يسمح هذا المجلد صراحةً بالوصول إلى الشبكة قبل إرسال الطلب."),
+    "policy_addr_unreadable": ("The target is {kind}, and its form is {host}. This tool will not send a "
+                               "request to an address it cannot read; confirm once to send it anyway, "
+                               "knowing the form it is written in.",
+                               "الهدف من نوع {kind}، وصيغته {host}. هذه الأداة لن ترسل طلبًا إلى عنوان لا "
+                               "تستطيع قراءته؛ أكّد مرة واحدة لترسله رغم ذلك وأنت تعرف الصيغة الذي كُتب بها."),
+    "env_names_unreadable": ("Could not read the environment files to compare them: {error}. The "
+                             "missing-key list is left empty rather than guessed.",
+                             "تعذّرت قراءة ملفات البيئة لمقارنتها: {error}. تُركت قائمة المفاتيح المفقودة "
+                             "فارغة بدل تخمينها."),
+    "stage_line": ("{where} — step {number} of {total}",
+                   "{where} — الخطوة {number} من {total}"),
+    "policy_heading": ("What this folder answers without asking:",
+                       "ما يجيبه هذا المجلد من غير سؤال:"),
+    "policy_allow_note": ("{count} of {total} action classes are answered by this folder's own rule",
+                          "{count} من {total} من أنواع الأفعال تُجيبها قاعدة هذا المجلد نفسها"),
+    "policy_managed_read": ("File access is governed by the project path rules.",
+                             "الوصول للملفات تحكمه قواعد المسارات داخل المشروع."),
+    "policy_managed_write": ("Writes use the proposal review and Auto-Apply safeguards.",
+                              "الكتابة تخضع لمراجعة المقترح وقواعد التطبيق التلقائي."),
+    "policy_managed_delete": ("Every file deletion requires review, including with Auto-Apply.",
+                              "كل حذف لملف يتطلب مراجعة، حتى مع التطبيق التلقائي."),
+    "policy_managed_execute_recipe": ("Recipes use the built-in allowlist and run only when you start them.",
+                                       "الوصفات تخضع للقائمة المسموح بها ولا تعمل إلا عند تشغيلك لها."),
+    "policy_managed_git_local": ("Local Git actions use their own checks; this tool has no push action.",
+                                  "عمليات Git المحلية لها فحوصها؛ ولا توجد في الأداة عملية دفع للمستودع."),
 }
 
 # `apply_rerun_warning` is the only one with no second-language twin in the other window: Tk has no
@@ -598,6 +726,63 @@ def note(key: str, *, arabic: bool = False, **fields) -> str:
         raise KeyError("no shared sentence named " + str(key))
     english, arabic_text = NOTE_TEMPLATES[key]
     return say(arabic, en=english, ar=arabic_text).format(**fields)
+
+
+# The classes that have a sentence. An ALLOW is silence — the operator is not told about a thing the
+# tool went ahead with, which is what an approval flow already looks like from the inside.
+POLICY_SENTENCES = {
+    "write_that_runs": ("policy_ask_write_that_runs", "policy_deny_write_that_runs"),
+    "execute_custom": ("policy_ask_execute_custom", "policy_deny_execute_custom"),
+    "network": ("policy_ask_network", "policy_deny_network"),
+}
+
+# The three answers as words on a button. Action classes stay as codes: they are names of things in the
+# table, the way a recipe id is, and translating a name would break the row that says which one it was.
+POLICY_VERDICT_AR = {"allow": "سماح", "ask": "اسأل", "deny": "رفض"}
+
+
+def policy_verdicts(arabic: bool) -> dict:
+    """The verdict words, so a control can be labelled in the language the task was asked in."""
+    return {code: (POLICY_VERDICT_AR[code] if arabic else code) for code in POLICY_VERDICT_AR}
+
+
+# The words for `policy.ADDRESS_CLASSES`. They are sentences' material, not codes on a button: an operator
+# deciding whether one yes is worth it has to be told in plain language that the target is a metadata
+# address rather than the dev server. `address_words` keeps the pair beside the code so a new class cannot
+# be added to the module without a word in both languages.
+ADDRESS_WORDS = {
+    "loopback": ("this machine's own address", "عنوان هذا الجهاز نفسه"),
+    "link_local": ("a link-local address — the cloud metadata service answers here",
+                   "عنوان رابط محلي — خدمة البيانات الوصفية للسحابة تجيب من هنا"),
+    "private": ("a private network address", "عنوان شبكة خاصة"),
+    "public": ("a public address", "عنوان عام"),
+    "named": ("a name this tool did not look up", "اسم لم تبحث عنه هذه الأداة"),
+    "unknown": ("an address form this tool cannot read", "صيغة عنوان لا تستطيع هذه الأداة قراءتها"),
+}
+
+
+def address_words(arabic: bool) -> dict:
+    """The address class words, the same way the verdict words are handed to a control."""
+    return {code: say(arabic, en=ADDRESS_WORDS[code][0], ar=ADDRESS_WORDS[code][1])
+            for code in ADDRESS_WORDS}
+
+
+
+def policy_line(arabic: bool, action: str, verdict: str, **fields) -> str:
+    """What one action class answers, said in the language the task was asked in.
+
+    The engine and the windows both need this sentence, and neither may write it: a refusal whose words
+    live at the call site is a refusal one window can rephrase into something the operator approves. An
+    unknown class or an ALLOW answers with the empty string, because the caller's own text is then the
+    only thing on screen.
+    """
+    pair = POLICY_SENTENCES.get(str(action or ""))
+    if not pair:
+        return ""
+    if str(action) == "network":
+        fields.setdefault("host", "الوجهة المطلوبة" if arabic else "the requested destination")
+    key = pair[0] if str(verdict or "") == "ask" else pair[1] if str(verdict or "") == "deny" else ""
+    return note(key, arabic=arabic, **fields) if key else ""
 
 
 def impact_lines(report: dict, *, arabic: bool = False) -> list[str]:

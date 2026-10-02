@@ -16,20 +16,20 @@ from tkinter.scrolledtext import ScrolledText
 
 from .catalog import LIVE, models_for
 from .chat import create_chat, context_block, load_chat, respond, title_for
-from . import config, overrides
+from . import config, core, overrides
 from .config import Settings
 from .engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions,
                      load_session, plan,
                      project_key, read_plan_reference, rollback)
 from .errors import AgentError, PolicyError
 from .labels import (INTERRUPTED_STATES, MUTABLE_STATES, STATES, UNVERIFIED_STATES,  # noqa: F401
-                     catalog_status_line, friendly_error, impact_lines, is_arabic, run_warning,
-                     state_label, status_text)
+                     catalog_status_line, friendly_error, impact_lines, is_arabic, policy_line,
+                     run_warning, stage_line, state_label, status_text)
 from .labels import note as shared_note      # `note` is a local variable in two methods here
 from .providers import make_provider
 from .redaction import redact
 from . import memory as memory_store
-from . import planbook, repair, runner, session_flow
+from . import permissions, planbook, policy, repair, runner, session_flow
 from . import host, intent, modes, setup
 from .verification import verify
 from .workspace import Workspace, ensure_project_dir
@@ -237,6 +237,9 @@ class AgentWindow:
         self.cloud_ok = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready — choose your project and describe the change")
         self.state_label = tk.StringVar(value="No task open")
+        # How far along the run is, which is not the same sentence as what happened to it — the state above
+        # decides which buttons work, this one answers the question a person watching asks.
+        self.stage_text = tk.StringVar(value="")
         self.artifact = tk.StringVar(value="No proposal yet")
         self.artifact_detail = tk.StringVar(value="Choose a project to turn a request into reviewed file changes.")
         self.recipe = tk.StringVar()
@@ -1176,6 +1179,10 @@ class AgentWindow:
         self.headline = ttk.Label(parent, textvariable=self.state_label,
                                   font=("Segoe UI", 13, "bold"), anchor="w")
         self.headline.pack(fill="x", pady=(0, 8))
+        self.stage_row = ttk.Label(parent, textvariable=self.stage_text, style="Muted.TLabel", anchor="w")
+        self.stage_row.pack(fill="x", pady=(0, 8))
+        self.stage_text.trace_add("write", lambda *_: self.stage_row.configure(
+            anchor="e" if is_arabic(self.stage_text.get()) else "w"))
         # Tk 8.6 has no bidi engine — measured on this machine: a label takes `justify` and `anchor`
         # but no `-direction` — so alignment is the honest ceiling for the fallback window. The
         # headline follows the language of the sentence that is currently in it.
@@ -1607,6 +1614,11 @@ class AgentWindow:
         task = str(stored.get("task") or "")[:MAX_TASK_CHARS]
         plan_file = str((stored.get("plan_reference") or {}).get("path") or "") or None
         notes = str(stored.get("memory") or "")
+        # The ceiling and the failure both come back off the record: a restart that resumed a fix round
+        # used to find zero rounds spent and an empty prompt, which is how a stopped loop became three more
+        # model turns the person already paid for.
+        self._fix_round = max(self._fix_round, repair.round_of(stored))
+        evidence = str(stored.get("evidence") or "")
         key = self.key.get().strip() or None
         self.chat_message("Tool", shared_note("resume_started", arabic=self.arabic,
                                               task=str(row.get("task") or "")[:60]))
@@ -1619,7 +1631,8 @@ class AgentWindow:
                         progress=lambda line: self.events.put(("progress", line)),
                         cancelled=self.cancel_event.is_set, plan_file=plan_file,
                         chat_id=stored.get("chat_id"), plan_step=stored.get("plan_step"),
-                        memory=notes, resume_run=run_id)
+                        memory=notes, resume_run=run_id,
+                        extra_context=evidence, fix_round=self._fix_round)
 
         def done(path):
             self.display_session(path)
@@ -1663,6 +1676,11 @@ class AgentWindow:
                     + ": " + str(len(planbook.criteria_of(book)))
         if self.chained.get() and row is not None:
             line += " — Send works on it."
+        tally = planbook.verdict_tally(planbook.criterion_verdicts(book))
+        if tally["total"]:
+            # Computed from the ledger's own rows, not from what the last proposal claimed.
+            line += " · " + shared_note("plan_verdicts_line", arabic=self.arabic,
+                                        proved=tally["verified"], total=tally["total"])
         self.plan_status.set(line)
 
     def ledger_for(self, session: dict) -> tuple[Path, dict] | None:
@@ -2209,6 +2227,9 @@ class AgentWindow:
 
     def clear_review(self):
         self.state_label.set("No proposal yet")
+        # An empty stage row is the honest answer here: there is no run to place, and a sentence saying
+        # "step 1 of 8" over a chat with no project attached would be invented.
+        self.stage_text.set("")
         self.artifact.set("No proposal yet")
         self.run_info.set("No command has run yet.")
         self.artifact_detail.set("This chat has no project attached, so nothing is proposed."
@@ -2223,6 +2244,8 @@ class AgentWindow:
         session = load_session(path)
         self.session, self.session_path = session, path
         self.state_label.set(state_label(session["state"], arabic=self.arabic))
+        self.stage_text.set(stage_line(session.get("stage"), arabic=self.arabic,
+                                        stage_order=core.STAGES))
         changes = session.get("changes", [])
         self.artifact.set(state_label(session["state"], arabic=self.arabic))
         self.artifact_detail.set(
@@ -2355,8 +2378,23 @@ class AgentWindow:
         # dropped the `warning` the builder returned, so a proposal that emptied or deleted a file
         # warned about it in the web window only. Both halves are the verb's job now.
         prior = self.unverified_prior_task(self.chat_id, self.repo.get().strip())
+        # The same two verdicts the web window applies to this class of write, read from the same file:
+        # a proposal that edits the file the tool takes its commands from is not only about that file,
+        # and a rule one window set is a rule the other obeys.
+        runs = policy.runs_later_paths((self.session or {}).get("changes"))
+        runs_verdict, runs_line = (permissions.verdict(self.app_dir, self.repo.get().strip(),
+                                                       policy.WRITE_THAT_RUNS), "") if runs else ("", "")
+        if runs:
+            runs_line = policy_line(self.arabic, policy.WRITE_THAT_RUNS, runs_verdict,
+                                    names=", ".join(runs[:3]))
+            if runs_verdict == policy.DENY:
+                self.say(runs_line)
+                return
+        reason = repair.must_ask(self.session, prior)
+        if runs_line and runs_verdict == policy.ASK:
+            reason = (reason + " " + runs_line).strip() if reason else runs_line
         prompt = host.apply_prompt(self.session, notice=self.approval_notice(),
-                                   reason=repair.must_ask(self.session, prior), again=again)
+                                   reason=reason, again=again)
         if not self.ask(prompt["title"], prompt["message"], prompt["warning"], prompt["ok_label"]):
             return
         path, approved = self.session_path, self.session["proposal_hash"]
@@ -2637,6 +2675,7 @@ class AgentWindow:
         reference, step_id = self.session.get("plan_reference"), self.session.get("plan_step")
         plan_file = str(Path(repo) / reference["path"]) if reference and step_id is not None else None
         task, evidence = repair.fix_task(run), repair.evidence(run)
+        context = repair.with_candidates(evidence, Workspace(Path(repo)), self.session)
         notes = self.project_notes()
         # The category belongs in the line the user reads, because "asking for a fix" and "asking for
         # a fix to a dependency the machine cannot resolve" are different odds of working.
@@ -2648,8 +2687,9 @@ class AgentWindow:
                                      api_key=key, allow_paid=paid)
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
                         progress=lambda line: self.events.put(("progress", line)),
-                        cancelled=self.cancel_event.is_set, chat_id=chat_id, extra_context=evidence,
-                        plan_file=plan_file, plan_step=step_id if plan_file else None, memory=notes)
+                        cancelled=self.cancel_event.is_set, chat_id=chat_id, extra_context=context,
+                        plan_file=plan_file, plan_step=step_id if plan_file else None, memory=notes,
+                        fix_round=self._fix_round)
 
         def done(path):
             self.display_session(path)

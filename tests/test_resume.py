@@ -266,6 +266,32 @@ class ResumeThroughTheWindowTests(unittest.TestCase):
         return {"action": "propose", "summary": "Update answer", "checks": ["unit tests"],
                 "changes": [{"path": "app.py", "content": "answer = 2\n"}]}
 
+    def stopped_round(self):
+        """A third fix round that died mid-turn, as the loop leaves it on disk."""
+        script = Script([{"action": "read_file", "path": "app.py"}, RuntimeError("killed")])
+        with self.assertRaises(RuntimeError):
+            plan(Workspace(self.repo), "The Tests command failed. Read the affected files.",
+                 script, Settings(), self.runs, progress=lambda _: None,
+                 fix_round=3, extra_context="AssertionError: 1 != 2")
+        return next(path.name for path in self.runs.iterdir() if path.is_dir())
+
+    def test_resuming_a_round_resumes_its_ceiling_and_its_failure(self):
+        """The window used to restart at zero rounds with an empty prompt, which turned "stopped after 3
+        fix rounds" into a suggestion a restart could walk past three more times — and left the model
+        fixing a failure it could no longer see."""
+        run_id = self.stopped_round()
+        controller = self.controller()
+        controller.refresh_resumable()
+        model = Script([self.proposal()])
+        with patch("ai_code_engineer.webapp.controller.make_provider", return_value=model):
+            controller.action("resume_task", {"run_id": run_id}, lambda event: None)
+            controller.join()
+        self.assertEqual(controller._fix_round, 3)
+        self.assertEqual(controller.snapshot()["fixRounds"]["spent"], 3)
+        self.assertIn("AssertionError: 1 != 2", json.dumps(model.prompts))
+        stored = load_session(self.runs / run_id / "session.json")
+        self.assertEqual(stored["fix_round"], 3, "the resumed turn spent the round it resumed")
+
 
 class ResumableLookupTests(unittest.TestCase):
     def setUp(self):

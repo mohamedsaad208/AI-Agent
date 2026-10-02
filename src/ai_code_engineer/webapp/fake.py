@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, modes, overrides, repair, runner, setup
+from .. import config, git_integration, intent, labels, modes, overrides, permissions, planbook, policy, repair, runner, setup
 from ..errors import PolicyError
 from .controller import PROJECT_ICONS as ICONS
 from . import uistate
@@ -164,6 +164,10 @@ class FakeController:
     def __init__(self) -> None:
         self.prefs = {"style": "claude", "theme": "light", "collapsed": False}
         self.state = "WAITING_APPROVAL"
+        # The scripted window opens on a proposal, so it opens mid-workflow: the strip is drawn from this
+        # field exactly as the real window draws it from the session record, and every scripted action below
+        # moves it the way the real verb would.
+        self.stage = "review"
         self.view = "task"
         self.busy = False
         self.cancellable = False
@@ -173,6 +177,10 @@ class FakeController:
         # The real window's `available` comes from `runner.sandbox_available()`.
         self.sandbox_on = False
         self.sandbox_image = ""
+        # The policy rows, scripted the same way the sandbox switch is: the *answers* are what is being
+        # reviewed, so a click has to move one. Overrides only, because the defaults come from the real
+        # table rather than from anything written here.
+        self.policy_over: dict = {}
         self.composer = "chat"
         # The scripted twin of the controller's `declared` block: the folder's own position, kept by
         # whichever surface wrote it. The preview needs the field or the lock on the badge cannot be
@@ -349,6 +357,62 @@ class FakeController:
         """The same question the real controller asks every write and every run gate."""
         return intent.read_only(self.composer)
 
+    # The scripted plan's own rows and criteria. Statuses are not written here — they follow `self.step`,
+    # so the preview shows one ledger moving rather than five frozen cards.
+    PLAN_STEPS = [(1, "Project foundation", [1]), (2, "Register a user", [1, 2]),
+                  (3, "Login and issue a JWT", [2]), (4, "Protect the routes", [3]),
+                  (5, "Refresh-token rotation", [])]
+    PLAN_CRITERIA = ["A password is stored hashed, never in plain text",
+                     "Logging in with the right password returns a token",
+                     "An expired token is refused by every protected route",
+                     "Refreshing swaps the pair and invalidates the old one"]
+
+    def plan_view(self) -> dict:
+        """The plan card, built the way the real one is: a scripted ledger through `planbook`.
+
+        The statuses follow `self.step` and the verdicts come from the same function the shipped window
+        calls, so the preview cannot drift into drawing a card the real one will not show — and every answer
+        a criterion verdict can give is reachable here without running a build. Step 2 is scripted as closed
+        by a click rather than a command run, which is the difference a verification engine exists to keep.
+        """
+        rows = []
+        for number, (ident, title, accepts) in enumerate(self.PLAN_STEPS, start=1):
+            status = ("verified" if number < self.step else
+                      "in_progress" if number == self.step else "pending")
+            row = {"id": ident, "title": title, "body": title, "status": status,
+                   "session_id": "scripted%02d" % ident if status == "verified" else None,
+                   "verified_at": "2026-10-01 09:1%d" % number if status == "verified" else None,
+                   "accepts": accepts, "sub_goal": None}
+            if number == 2 and status == "verified":
+                row["unproven"] = "the operator said so"
+            rows.append(row)
+        book = {"schema": 2, "root": "", "plan_path": "plan.md", "plan_sha256": "0" * 64,
+                "goal": "Ship the login flow behind a guard",
+                "criteria": list(self.PLAN_CRITERIA), "sub_goals": [], "steps": rows}
+        verdicts = planbook.criterion_verdicts(book)
+        tally = planbook.verdict_tally(verdicts)
+        reasons = {"clicked": labels.note("verdict_clicked"),
+                   "not_run": labels.note("verdict_not_run"),
+                   "uncovered": labels.note("plan_uncovered")}
+        return {"name": "plan.md", "step": self.step, "total": len(rows),
+                "verified": len([row for row in rows if row["status"] == "verified"]),
+                "goal": book["goal"], "criteria": list(self.PLAN_CRITERIA),
+                "uncovered": planbook.uncovered_criteria(book), "sub_goal": "",
+                "strings": {"goal": labels.note("plan_goal"), "criteria": labels.note("plan_criteria"),
+                            "uncovered": labels.note("plan_uncovered"),
+                            "unproven": labels.note("plan_unproven")},
+                "verdicts": [{"number": item["number"], "text": item["text"], "verdict": item["verdict"],
+                              "word": labels.note("verdict_" + item["verdict"]),
+                              "why": reasons.get(item["why"], item["detail"]),
+                              "steps": item["steps"], "at": item["at"]} for item in verdicts],
+                "verdictNote": labels.note("plan_verdicts_line", proved=tally["verified"],
+                                           total=tally["total"]),
+                "note": "Send works on step %d" % self.step,
+                "steps": [{"id": row["id"], "title": row["title"], "status": row["status"],
+                           "current": row["status"] == "in_progress", "accepts": row["accepts"],
+                           "unproven": str(row.get("unproven") or ""), "sub_goal": ""}
+                          for row in rows]}
+
     def snapshot(self) -> dict:
         return {
             "prefs": self.prefs, "busy": self.busy, "cancellable": self.cancellable, "pending": self.pending,
@@ -377,13 +441,7 @@ class FakeController:
                         "text": labels.applied_note(arabic=False, count=len(FILES))}
                        if self.auto_apply and self.state in labels.MUTABLE_STATES
                        else {"count": 0, "text": ""}),
-            "plan": {"name": "plan.md", "step": self.step, "total": 5, "verified": self.step - 1,
-                     "note": "Send works on step %d" % self.step,
-                     "steps": [{"id": 1, "title": "Project foundation", "status": "verified", "current": False},
-                               {"id": 2, "title": "Register a user", "status": "in_progress", "current": self.step == 2},
-                               {"id": 3, "title": "Login and issue a JWT", "status": "pending", "current": self.step == 3},
-                               {"id": 4, "title": "Protect the routes", "status": "pending", "current": self.step == 4},
-                               {"id": 5, "title": "Refresh-token rotation", "status": "pending", "current": self.step == 5}]},
+            "plan": self.plan_view(),
             "provider": {"mode": self.mode, "modes": self.modes, "model": self.model,
                          "models": self.visible_models(), "metrics": dict(self.metrics)},
             "connection": self.connection_info(),
@@ -398,6 +456,22 @@ class FakeController:
             "sandbox": {"on": bool(self.sandbox_on), "image": self.sandbox_image, "available": True,
                         "note": labels.note(runner.sandbox_state(self.sandbox_on,
                                                                  self.sandbox_image, True))},
+            "policy": {"heading": labels.note("policy_heading"),
+                       "lift": labels.note("policy_lift"),
+                       "words": labels.policy_verdicts(False),
+                       "rows": [{"action": name, "declared": name in self.policy_over,
+                                 "editable": name in policy.CONFIGURABLE_ACTIONS,
+                                 "managed": (labels.note("policy_managed_" + name)
+                                             if name in policy.MANAGED_ACTIONS else ""),
+                                 "verdict": (policy.decide(name, self.policy_over.get(name, ""))
+                                             if name in policy.CONFIGURABLE_ACTIONS else "")}
+                                for name in policy.ACTIONS],
+                       "note": labels.note("policy_allow_note",
+                                           count=len(self.policy_over),
+                                           total=len(policy.CONFIGURABLE_ACTIONS))},
+            # The same block the real window builds, from the same table order — the strip is a design and
+            # designs get reviewed here.
+            "stage": uistate.stage_block(self.stage),
             # The loop's budget, from the same constant the real controller reads it from: a field the
             # preview never sends is a field the window is never drawn with.
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
@@ -675,6 +749,7 @@ class FakeController:
             if self.reading_only:
                 return self._refuse(intent.no_write("Roll back"))
             self.state = "ROLLED_BACK"
+            self.stage = "review"
             self._note(emit, "rolled_back", "Task changes rolled back.")
             self.git_restore_offer = {"commit": "9f3c21a", "paths": len(FILES)}
         elif type == "git_restore":
@@ -710,6 +785,7 @@ class FakeController:
             self._note(emit, "git_branch", text)
         elif type == "verify":
             self.state = "VERIFICATION_BLOCKED"
+            self.stage = "verify"
             self._note(emit, "verify", "Syntax checks finished. Project tests have not run.")
         elif type == "stop":
             self.busy = self.cancellable = False
@@ -761,6 +837,16 @@ class FakeController:
                 self.sandbox_on = bool(payload.get("on"))
             if "image" in payload:
                 self.sandbox_image = str(payload.get("image") or "")
+        elif type == "set_policy":
+            # One row, one answer. A click that moved nothing would make the preview useless for
+            # reviewing the thing it exists to show.
+            name = str(payload.get("action") or "")
+            verdict = str(payload.get("verdict") or "")
+            if name in policy.CONFIGURABLE_ACTIONS:
+                if verdict in policy.VERDICTS:
+                    self.policy_over[name] = verdict
+                else:
+                    self.policy_over.pop(name, None)
         elif type == "set_auto_apply":
             # The pill next to Send and the composer placeholder both key off this, so a preview
             # that ignored the click could not be used to review either of them.
@@ -831,6 +917,7 @@ class FakeController:
             if self.reading_only:
                 return self._refuse(intent.no_proposal())
             self.state = "WAITING_APPROVAL"
+            self.stage = "review"
             emit({"kind": "toast", "text": "Proposing %s — review the diff, then Apply"
                   % str(payload.get("path", "that file"))})
         elif type == "setup_check":
@@ -873,10 +960,25 @@ class FakeController:
         elif type == "save_run_config":
             return {"saved": True}
         elif type == "get_readiness":
-            return {"tools": [], "wrappers": [], "configs": [], "recommendations": []}
+            # The `env` block carries the four fields the shipped reader answers, empty: the card's shape is
+            # reviewable here, and the admitted-failure sentence is not — nothing in a preview is unreadable.
+            return {"tools": [], "wrappers": [], "configs": [], "recommendations": [],
+                    "env": {"has_env": False, "has_example": False, "missing_keys": [], "unreadable": ""}}
         elif type == "service_lines":
             return {"lines": [], "status": "running"}
         elif type == "api_test":
+            # The same destination question the shipped window asks, answered from the scripted rows so a
+            # review can declare `network = allow` here and watch the refusal go away. No url at all is
+            # the shape the rail sends before a request has been typed: there is nothing to classify.
+            url = str(payload.get("url") or "")
+            if url:
+                host, kind = policy.address_of(url)
+                if kind in policy.LIMITED and policy.decide(
+                        policy.NETWORK, self.policy_over.get(policy.NETWORK, "")) != policy.ALLOW:
+                    key = ("policy_addr_named" if kind == policy.NAMED else
+                           "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited")
+                    raise PolicyError(labels.note(
+                        key, host=host, kind=labels.address_words(False)[kind]))
             return {"status": 200, "headers": {}, "body": "OK"}
         elif type == "fix_errors":
             return {"status": "fix_requested"}
@@ -973,6 +1075,7 @@ class FakeController:
             self.pending = None
             self.busy = self.cancellable = False
             self.state = "WAITING_APPROVAL"
+            self.stage = "review"
             reply = {"role": "assistant", "author": "AI Code Engineer", "time": _clock(),
                      "text": "Here is the smallest change that satisfies step 2. Three files, and the "
                              "existing `create()` path is untouched.\n\n"
@@ -1024,6 +1127,7 @@ class FakeController:
                                        "confirm": "Apply"}, emit)
         if answer.get("ok"):
             self.state = "APPLIED_UNVERIFIED"
+            self.stage = "approve"
             self._note(emit, "apply", "Applied 3 file(s).")
             emit({"kind": "toast", "text": "Changes applied. You can run the project command now."})
 
@@ -1071,6 +1175,7 @@ class FakeController:
             self._note(emit, "run", "mvn -B test → exit 0 · 41.2s · 14 tests, 0 failures")
             self.runs += 1
             self.state = "CHECKS_PASSED"
+            self.stage = "verify"
             if self.step == 2:
                 self.step = 3
                 emit({"kind": "toast", "text": "Plan step 2/5 verified. Starting step 3: Login and issue a JWT"})

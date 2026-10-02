@@ -12,8 +12,9 @@ import sys
 import tempfile
 import threading
 import uuid
+import xml.etree.ElementTree as ET
 
-from .engine import atomic_json, event, load_session
+from .engine import atomic_json, event, load_session, record_stage
 from .errors import PolicyError
 from . import runner
 from .workspace import Workspace, digest
@@ -45,6 +46,13 @@ def container_command(recipe: str) -> list[str]:
     return command
 
 
+def _validate_java(content: str) -> None:
+    if re.search(r"\bglobal\s+(void|int|boolean|String|long|double|float|byte|short|char)\b", content):
+        raise ValueError("Invalid Java keyword 'global' used in declaration.")
+    if re.search(r'String\s+\w+\s*=\s*"\{"[a-zA-Z0-9_]+":', content):
+        raise ValueError("Unescaped JSON inside Java string literal.")
+
+
 def static_check(session: dict) -> list[dict]:
     ws = Workspace(Path(session["root"]))
     results = []
@@ -67,11 +75,17 @@ def static_check(session: dict) -> list[dict]:
                 ast.parse(current["content"], filename=change["path"])
             elif suffix == ".json":
                 json.loads(current["content"])
+            elif suffix == ".xml":
+                ET.fromstring(current["content"])
+            elif suffix == ".java":
+                _validate_java(current["content"])
+                results.append({"path": change["path"], "status": "not_applicable"})
+                continue
             else:
                 results.append({"path": change["path"], "status": "not_applicable"})
                 continue
             results.append({"path": change["path"], "status": "passed"})
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, ET.ParseError):
             results.append({"path": change["path"], "status": "failed"})
     return results
 
@@ -214,5 +228,6 @@ def verify(path: Path, recipe: str | None = None, image: str | None = None) -> d
         result["status"], "VERIFICATION_BLOCKED")
     session["verification"] = result
     event(session, "verification", status=result["status"])
+    record_stage(session, "verify")
     atomic_json(path, session)
     return result

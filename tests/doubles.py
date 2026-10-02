@@ -100,3 +100,37 @@ class ChatModel:
     def generate(self, messages, json_mode=True):
         self.calls.append((messages, json_mode))
         return "A monotonic clock never moves backwards."
+
+
+class Sentinel:
+    """A socket that records where it was aimed and never leaves the process.
+
+    Two suites need the *aim* and not only the outcome: a gate that let a request through and then failed
+    to connect answers a different question from a refusal that built no request at all. Neither may be
+    answered by reaching a real address, because one of the addresses in question is a private network
+    that exists on some machines and a test that hangs for ten seconds on it is a test of the network.
+    """
+
+    def __init__(self):
+        self.aimed: list[str] = []
+
+    def __call__(self, request, timeout=None):
+        self.aimed.append(getattr(request, "full_url", str(request)))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, count=-1):
+        return b"{}"
+
+    @property
+    def status(self):
+        return 200
+
+    @property
+    def headers(self):
+        return {}

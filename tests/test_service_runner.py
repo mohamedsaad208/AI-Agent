@@ -1,9 +1,11 @@
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from ai_code_engineer import service_runner
 
@@ -69,6 +71,49 @@ class TestProjectConfigAndReadiness(unittest.TestCase):
             res = service_runner.check_project_readiness(repo)
             self.assertIn("API_KEY", res["env"]["missing_keys"])
             self.assertTrue(any("API_KEY" in rec for rec in res["recommendations"]))
+
+    def test_the_env_reader_hands_back_names_and_never_a_value(self):
+        """The file under this reader is the one `ignore.credential` refuses everywhere else, so the
+        promise is not 'names are useful' — it is that nothing of the value crosses the line, including
+        the part of a line after a second `=` and a value that looks like a key."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            (repo / ".env.example").write_text("API_KEY=\n", encoding="utf-8")
+            (repo / ".env").write_text("API_KEY=zzz-secret-value\nDB_URL=postgres://u:zzz-secret-value@h\n"
+                                       "# COMMENT=zzz-secret-value\n", encoding="utf-8")
+            self.assertEqual(service_runner.env_names(repo / ".env"), ["API_KEY", "DB_URL"])
+            res = service_runner.check_project_readiness(repo)
+            self.assertNotIn("zzz-secret-value", json.dumps(res), "a value reached the report")
+            self.assertEqual(res["env"]["missing_keys"], [])
+
+    def test_a_file_that_is_not_named_like_a_secret_is_not_read_at_all(self):
+        """This reader does not decide what counts as a secret file; `ignore` already answered that, and a
+        reader that goes around it is how the answer becomes three answers."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            (repo / "application.yml").write_text("DB_PASSWORD=zzz-secret-value\n", encoding="utf-8")
+            self.assertEqual(service_runner.env_names(repo / "application.yml"), [],
+                             "a file this predicate does not name is a file this reader does not open")
+            (repo / ".env").write_text("DB_PASSWORD=zzz-secret-value\n", encoding="utf-8")
+            self.assertEqual(service_runner.env_names(repo / ".env"), ["DB_PASSWORD"],
+                             "the file the reader exists for still answers, by name only")
+
+    def test_an_unreadable_env_file_says_so_instead_of_reporting_nothing_missing(self):
+        """The `except Exception: pass` this replaced answered a folder whose files could not be read with
+        the same sentence as a folder that was configured. The failure is a field now, with its reason."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            (repo / ".env.example").write_text("API_KEY=\nDB_HOST=\n", encoding="utf-8")
+            (repo / ".env").write_text("API_KEY=x\n", encoding="utf-8")
+            with patch.object(service_runner, "env_names", side_effect=OSError("Permission denied")):
+                broken = service_runner.check_project_readiness(repo)
+            self.assertEqual(broken["env"]["missing_keys"], [])
+            self.assertIn("Permission denied", broken["env"]["unreadable"])
+            self.assertTrue(broken["env"]["has_env"] and broken["env"]["has_example"],
+                            "the two facts a person needs are still said")
+            healthy = service_runner.check_project_readiness(repo)
+            self.assertEqual(healthy["env"]["unreadable"], "", "an admitted failure is not a permanent one")
+            self.assertEqual(healthy["env"]["missing_keys"], ["DB_HOST"])
 
 
 class TestServiceProcessAndBoundedJob(unittest.TestCase):
