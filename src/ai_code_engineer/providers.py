@@ -66,9 +66,10 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
                 continue
             raise _refuse(exc) from None
         except (URLError, TimeoutError, OSError):
-            if attempt < 2:
-                time.sleep(1.5)
-                continue
+            # One ask, one answer: this read owns no retry of its own. `request_probe_with_retry` is
+            # the only place allowed to ask a second time, and a retry buried here multiplied with
+            # it — a probe promised twice became six requests, and a caller that set its own timeout
+            # waited three of them before it was told the model had not answered.
             raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
                            "longer request timeout for a reply this large.") from None
         except (ValueError, UnicodeError):

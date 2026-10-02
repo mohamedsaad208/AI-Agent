@@ -945,11 +945,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                     _seen_paths.add(_hit["path"])
     except Exception:   # noqa: BLE001 — an optional index must never break retrieval
         pass
+    injected = 0
     for entry in _rank_entries:
         name = entry["path"]
         if reference and name == reference["path"]:
             continue
-        if len(observed) >= MAX_CONTEXT_FILES:
+        if len(observed) + injected >= MAX_CONTEXT_FILES:
             break
         try:
             item = ws.read(name)
@@ -960,8 +961,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # The file is larger than what the budget has left. Skipping it used to be the entire
             # answer, which is the failure a small local model pays for: it proposes against a file it
             # has never seen a line of, in a project whose map said the file was right there. An
-            # excerpt of the block around the ranked symbol is sent instead — and it is *not* a read,
-            # because `observed` keeps whole files only, so a proposal still has to open this one.
+            # excerpt of the block around the ranked symbol is sent instead — and like the whole-file
+            # snapshot below, it is not a read: a proposal still has to open this one.
             if excerpts >= MAX_EXCERPTS:
                 continue
             text, line, more = symbols.snippet(item["content"],
@@ -989,7 +990,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
             continue
         remaining -= len(encoded)
-        observed[name] = item["sha256"]
+        # A snapshot the run chose is not a file the model opened. `observed` is the list a proposal is
+        # honoured against, so counting injected content here let a model replace a file it never asked
+        # for — and on a resumed run it re-authorized exactly the files the re-verify loop had just
+        # dropped for having changed on disk. The snapshot still carries the current bytes, and the
+        # auto-read path still charges the run one turn to open the file properly.
+        injected += 1
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
         reason = chosen_reason(entry)
         event(session, "context_file", path=name, sha256=item["sha256"], why=reason,

@@ -2220,10 +2220,11 @@ class AgentController:
         self.title = asked.replace("\n", " ")[:45]
         self._add("user", "You", task, quote_of=quote_of)
         if as_change:
-            self._add("tool", "Tool", "This branch is in Chat mode, so the answer would have been "
-                                      "prose. The message asks for a change, so it is planned as a "
-                                      "proposal instead: review the diff, then Apply to write it. "
-                                      "The next message is Chat again.")
+            self.line("tool", "Tool",
+                      "This branch is in Chat mode, so the answer would have been "
+                      "prose. The message asks for a change, so it is planned as a "
+                      "proposal instead: review the diff, then Apply to write it. "
+                      "The next message is Chat again.")
         self.session = self.session_path = None
         notes = self._project_notes()
         if notes:
