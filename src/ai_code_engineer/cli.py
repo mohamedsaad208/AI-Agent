@@ -277,7 +277,8 @@ def run_policy(args) -> int:
         return 0
 
     if not args.action or not args.verdict:
-        raise AgentError("A policy row names both a configurable class and a verdict: --action and --verdict. "
+        raise AgentError("A policy row needs both a class and a verdict (a configurable class): "
+                         "--action and --verdict. "
                          "`agent policy --repo PATH` alone prints all classes and their safeguards.")
 
     if not permissions.declare(where, folder, args.action, args.verdict, by=permissions.TERMINAL):
