@@ -2,7 +2,7 @@
 # The key is read from GEMINI_API_KEY (or GOOGLE_API_KEY).
 [model]
 provider = "gemini"
-name = "gemini-3.8-flash"
+name = "gemini-3.6-flash"
 endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"
 
@@ -10,4 +10,4 @@ api_key_env = "GEMINI_API_KEY"
 max_turns = 8
 timeout_seconds = 120
 context_chars = 32000
-output_tokens = 4096
+output_tokens = 8192

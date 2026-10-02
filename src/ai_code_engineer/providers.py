@@ -50,22 +50,29 @@ def request_json(url: str, payload: dict | None = None, *, key: str | None = Non
         headers["Authorization"] = "Bearer " + key
     request = Request(url, data=json.dumps(payload).encode() if payload is not None else None,
                       headers=headers)
-    try:
-        with _opener().open(request, timeout=timeout) as response:
-            raw = response.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            raise ProviderError("Provider response exceeds size limit.")
-        result = json.loads(raw)
-        if not isinstance(result, dict):
-            raise ProviderError("Provider returned an invalid response.")
-        return result
-    except HTTPError as exc:
-        raise _refuse(exc) from None
-    except (URLError, TimeoutError, OSError):
-        raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
-                       "longer request timeout for a reply this large.") from None
-    except (ValueError, UnicodeError):
-        raise ProviderError("Provider returned invalid JSON.") from None
+    for attempt in range(3):
+        try:
+            with _opener().open(request, timeout=timeout) as response:
+                raw = response.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ProviderError("Provider response exceeds size limit.")
+            result = json.loads(raw)
+            if not isinstance(result, dict):
+                raise ProviderError("Provider returned an invalid response.")
+            return result
+        except HTTPError as exc:
+            if exc.code in (429, 503) and attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            raise _refuse(exc) from None
+        except (URLError, TimeoutError, OSError):
+            if attempt < 2:
+                time.sleep(1.5)
+                continue
+            raise ProviderUnavailable("Provider connection failed or timed out. A local model needs a "
+                           "longer request timeout for a reply this large.") from None
+        except (ValueError, UnicodeError):
+            raise ProviderError("Provider returned invalid JSON.") from None
 
 
 # A cold Ollama daemon answers nothing for a few seconds while it loads, which is the one failure a
@@ -491,8 +498,10 @@ class OpenAICompatibleProvider:
             self.metrics = counts(streamed)
         self.reasoning = read_reasoning(thought)
         # Proposals must be complete; chat tolerates a missing finish_reason.
-        if not (finish == "stop" or (not json_mode and finish is None)):
-            raise ProviderError("Model did not finish normally; output discarded.")
+        # Google Gemini via OpenAI endpoint marks json action envelopes with function_call_filter
+        if not (finish == "stop" or (not json_mode and finish is None) or
+                (isinstance(finish, str) and "function_call_filter" in finish)):
+            raise ProviderError(f"Model did not finish normally (finish={finish!r}); output discarded.")
         if self.kind.routing and echoed:
             self.model = echoed
         if not isinstance(value, str) or not value:

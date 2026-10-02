@@ -1,7 +1,7 @@
 [model]
 provider = "ollama"
 name = "qwen2.5-coder:7b"
-fast_model = "qwen2.5-coder:1.5b"
+fast_model = "qwen2.5-coder:7b"
 strong_model = "qwen2.5-coder:7b"
 # The address is the only line here that a different machine may need. It is resolved in one order -
 # this value, then OLLAMA_HOST, then Ollama's own row in the provider table - so a machine running the
@@ -11,6 +11,6 @@ semantic_model_dir = "models"
 
 [limits]
 max_turns = 12
-timeout_seconds = 120
+timeout_seconds = 300
 context_chars = 24000
 output_tokens = 4096
