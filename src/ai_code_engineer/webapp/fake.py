@@ -975,9 +975,10 @@ class FakeController:
                 host, kind = policy.address_of(url)
                 if kind in policy.LIMITED and policy.decide(
                         policy.NETWORK, self.policy_over.get(policy.NETWORK, "")) != policy.ALLOW:
+                    key = ("policy_addr_named" if kind == policy.NAMED else
+                           "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited")
                     raise PolicyError(labels.note(
-                        "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited",
-                        host=host, kind=labels.address_words(False)[kind]))
+                        key, host=host, kind=labels.address_words(False)[kind]))
             return {"status": 200, "headers": {}, "body": "OK"}
         elif type == "fix_errors":
             return {"status": "fix_requested"}

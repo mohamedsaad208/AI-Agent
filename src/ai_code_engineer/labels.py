@@ -661,10 +661,8 @@ NOTE_TEMPLATES = {
     "policy_deny_execute_custom": ("A model asked for a shell command. Commands here come from you, not from "
                                    "the agent.",
                                    "أحد النماذج طلب أمر نظام. الأوامر هنا صادرة منك، لا من الوكيل."),
-    "policy_ask_network": ("This address is outside the local ranges the provider rules already accept. "
-                            "Confirm to send the request once.",
-                            "هذا العنوان خارج النطاقات المحلية التي تقبلها قواعد المزوّد. أكّد لإرسال الطلب "
-                            "مرة واحدة."),
+    "policy_ask_network": ("Send one network request to {host}? Confirm to continue.",
+                            "هل تريد إرسال طلب شبكة واحد إلى {host}؟ أكّد للمتابعة."),
     "policy_deny_network": ("A model asked to reach an address. This tool sends a network request when you "
                             "press the button that makes one, and not otherwise.",
                             "أحد النماذج طلب الوصول إلى عنوان. هذه الأداة ترسل طلب شبكة عندما تضغط الزر الذي "
@@ -682,6 +680,10 @@ NOTE_TEMPLATES = {
                             "that leaves this machine — the folder has to say so once, as a rule.",
                             "الهدف من نوع {kind}: {host}. الموافقة على هذا الزر لا تفتح طلبًا يخرج من هذا "
                             "الجهاز — لا بد أن يقول المجلد ذلك مرة واحدة، كقاعدة."),
+    "policy_addr_named": ("The target is hostname {host} ({kind}). This check cannot tell which address it "
+                          "resolves to, so this folder must explicitly allow network access before sending.",
+                          "الهدف هو اسم النطاق {host} ({kind}). لا يستطيع هذا الفحص معرفة العنوان الذي سيشير إليه، "
+                          "لذلك يجب أن يسمح هذا المجلد صراحةً بالوصول إلى الشبكة قبل إرسال الطلب."),
     "policy_addr_unreadable": ("The target is {kind}, and its form is {host}. This tool will not send a "
                                "request to an address it cannot read; confirm once to send it anyway, "
                                "knowing the form it is written in.",
@@ -777,6 +779,8 @@ def policy_line(arabic: bool, action: str, verdict: str, **fields) -> str:
     pair = POLICY_SENTENCES.get(str(action or ""))
     if not pair:
         return ""
+    if str(action) == "network":
+        fields.setdefault("host", "الوجهة المطلوبة" if arabic else "the requested destination")
     key = pair[0] if str(verdict or "") == "ask" else pair[1] if str(verdict or "") == "deny" else ""
     return note(key, arabic=arabic, **fields) if key else ""
 

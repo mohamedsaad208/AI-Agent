@@ -168,6 +168,31 @@ Closing the loop between code generation and execution feedback:
 - **Secret Redaction:** `redaction.py` strips PEM keys, AWS tokens, GitHub tokens, Slack keys, Google API keys, JWTs, and database passwords from terminal output before sending to the LLM.
 - **Protected Policy Files:** Prevents modification of agent policy files (`.cursorrules`, `.github`, `.mvn`, `mcp.json`).
 
+### Folder policy overrides
+
+Show the decisions and safeguards for a project folder:
+
+```bash
+agent policy --repo PATH
+```
+
+Set a decision for a configurable action class (`write_that_runs`, `execute_custom`, or `network`):
+
+```bash
+agent policy --repo PATH --action network --verdict deny
+```
+
+Verdicts are `allow`, `ask`, and `deny`. Overrides are stored outside the project in
+`.agent-permissions.json` beside the application's own data, so a project change cannot rewrite its
+own rules. A missing or unreadable store contributes no overrides; the program uses the built-in
+defaults (for example, custom commands and network requests ask). Removing the file therefore removes
+the saved overrides and restores those defaults.
+
+Hostnames such as `db.internal` are not resolved during the destination check. Since they could point
+to a private service, requests to hostnames require an explicit `network = allow` rule for that folder.
+Private and link-local numeric addresses have the same requirement. Do not use that rule for folders
+whose code or configuration you do not trust.
+
 ---
 
 # 💻 Platform Guide

@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer import intent
+from ai_code_engineer import intent, permissions, policy
 from ai_code_engineer.errors import PolicyError
 from ai_code_engineer.webapp import server as server_module
 from ai_code_engineer.webapp.controller import AgentController
@@ -1663,6 +1663,22 @@ class SnapshotShapeTests(unittest.TestCase):
             controller._draft = "Fix the add function"
             self.assertEqual(controller.snapshot()["draft"], "Fix the add function")
             controller.close()
+
+    def test_unresolved_internal_hostname_needs_a_folder_rule(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            controller = AgentController(Path(temp) / "app-data")
+            self.addCleanup(controller.close)
+            controller.repo = str(root)
+
+            stopped = controller.address_gate("https://db.internal/admin")
+            self.assertIn("db.internal", stopped)
+            self.assertIn("cannot tell which address", stopped)
+
+            permissions.declare(controller.app_dir, root, policy.NETWORK, policy.ALLOW, by="cli")
+            self.assertEqual(controller.address_gate("https://db.internal/admin"), "")
 
     def test_the_header_line_names_the_folder_step_and_model(self):
         import tempfile

@@ -16,9 +16,12 @@ Nothing here decides anything: it answers what was declared, and records who dec
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import policy
@@ -31,10 +34,54 @@ WEB, DESKTOP, TERMINAL, SAVED = "web", "gui", "cli", "saved"
 # (mtime_ns, size) -> the parsed block: a snapshot read asks this on every drawn row, and a snapshot goes
 # out on every streamed log line, so it must not re-read the disk each time.
 _cache: dict[str, tuple[tuple, dict]] = {}
+_thread_locks: dict[str, threading.RLock] = {}
+_thread_locks_guard = threading.Lock()
 
 
 def path(app_dir) -> Path:
     return Path(app_dir) / FILE
+
+
+@contextmanager
+def _store_lock(app_dir):
+    """Serialize permission read/modify/write cycles across threads and processes."""
+    lock_path = Path(app_dir) / (FILE + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.path.normcase(str(lock_path.resolve()))
+    with _thread_locks_guard:
+        thread_lock = _thread_locks.setdefault(key, threading.RLock())
+    with thread_lock:
+        if os.name == "nt":
+            import ctypes
+            mutex_name = "Local\\AICodeEngineerPermissions_" + hashlib.sha256(
+                key.encode("utf-8", errors="surrogatepass")).hexdigest()
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+            kernel.CreateMutexW.restype = ctypes.c_void_p
+            kernel.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+            kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+            kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+            handle = kernel.CreateMutexW(None, False, mutex_name)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            result = kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if result not in (0, 0x80):
+                kernel.CloseHandle(handle)
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                yield
+            finally:
+                kernel.ReleaseMutex(handle)
+                kernel.CloseHandle(handle)
+        else:
+            import fcntl
+            with lock_path.open("a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _kept(value) -> str:
@@ -137,35 +184,37 @@ def declare(app_dir, folder, action: str, value: str, by: str = "") -> dict:
     name = str(action or "")
     if not key or name not in policy.CONFIGURABLE_ACTIONS:
         return {}
-    rows = dict(_rows(app_dir))
-    row = dict(rows.get(key) or {})
-    actions = dict(row.get("actions") or {})
-    actions[name] = _kept(value)
-    rows[key] = {"actions": actions, "by": str(by or "")[:40],
-                 "at": time.strftime("%Y-%m-%d %H:%M"),
-                 "path": str(Path(folder).resolve())[:400]}
-    _write(app_dir, rows)
-    return rows[key]
+    with _store_lock(app_dir):
+        rows = dict(_rows(app_dir))
+        row = dict(rows.get(key) or {})
+        actions = dict(row.get("actions") or {})
+        actions[name] = _kept(value)
+        rows[key] = {"actions": actions, "by": str(by or "")[:40],
+                     "at": time.strftime("%Y-%m-%d %H:%M"),
+                     "path": str(Path(folder).resolve())[:400]}
+        _write(app_dir, rows)
+        return rows[key]
 
 
 def forget(app_dir, folder, action: str = "") -> None:
     """Drop one class's declaration, or the folder's whole set. What is left answers the table."""
     key = folder_key(folder)
-    rows = dict(_rows(app_dir))
-    if key not in rows:
-        return
-    name = str(action or "")
-    if not name:
-        rows.pop(key)
-    elif name in policy.CONFIGURABLE_ACTIONS and name in rows[key].get("actions", {}):
-        actions = dict(rows[key]["actions"])
-        actions.pop(name, None)
-        rows[key] = {**rows[key], "actions": actions}
-        if not actions:
+    with _store_lock(app_dir):
+        rows = dict(_rows(app_dir))
+        if key not in rows:
+            return
+        name = str(action or "")
+        if not name:
             rows.pop(key)
-    else:
-        return
-    _write(app_dir, rows)
+        elif name in policy.CONFIGURABLE_ACTIONS and name in rows[key].get("actions", {}):
+            actions = dict(rows[key]["actions"])
+            actions.pop(name, None)
+            rows[key] = {**rows[key], "actions": actions}
+            if not actions:
+                rows.pop(key)
+        else:
+            return
+        _write(app_dir, rows)
 
 
 def listed(app_dir) -> list[dict]:

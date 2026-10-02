@@ -276,7 +276,7 @@ class TestPolicyAtTheButton(unittest.TestCase):
         # Answered "no", because a test that reaches the internet is a test that fails on a plane.
         self.c.confirm = lambda *args, **kwargs: (self.asked.append(args), False)[1]
         with self.assertRaises(PolicyError):
-            self.c.run_api_test({"url": "https://api.example.com/x"})
+            self.c.run_api_test({"url": "https://8.8.8.8/x"})
         self.assertEqual(len(self.asked), 1, "the ask is the last thing before the request")
 
     def test_a_folder_that_denied_network_refuses_without_asking(self):
@@ -436,18 +436,23 @@ class TheAddressAtTheButton(unittest.TestCase):
             self.assertIn(labels.address_words(False)[policy.UNKNOWN], said, url)
         self.assertEqual(self.sentinel.aimed, [], "none of them was tried")
 
-    def test_loopback_and_a_name_keep_the_ask_they_have_today(self):
-        for url in ("http://127.0.0.1:8080/", "http://localhost:8080/", "http://api.example.com/"):
+    def test_loopback_and_a_public_numeric_address_keep_the_one_time_ask(self):
+        for url in ("http://127.0.0.1:8080/", "http://localhost:8080/", "http://8.8.8.8/"):
             self.c.run_api_test({"url": url})
         self.assertEqual(len(self.asked), 3, "the escalation added no dialog to an address at home")
         self.assertEqual(len(self.sentinel.aimed), 3)
 
-    def test_nothing_is_resolved_to_find_out_where_a_name_goes(self):
+    def test_an_unresolved_hostname_needs_a_folder_rule_before_any_request(self):
         resolver = MagicMock(side_effect=AssertionError("the gate looked a name up"))
         self.addCleanup(setattr, socket, "getaddrinfo", socket.getaddrinfo)
         socket.getaddrinfo = resolver
-        self.c.run_api_test({"url": "http://db.internal:5432/"})
+        with self.assertRaises(PolicyError) as caught:
+            self.c.run_api_test({"url": "http://db.internal:5432/"})
         resolver.assert_not_called()
+        self.assertEqual(self.sentinel.aimed, [])
+        self.assertIn("db.internal", str(caught.exception))
+        permissions.declare(self.app_dir, self.repo, policy.NETWORK, policy.ALLOW)
+        self.c.run_api_test({"url": "http://db.internal:5432/"})
         self.assertEqual(self.sentinel.aimed, ["http://db.internal:5432/"])
 
     def test_the_refusal_reads_the_same_in_the_scripted_preview(self):
@@ -456,10 +461,10 @@ class TheAddressAtTheButton(unittest.TestCase):
         from ai_code_engineer.webapp.fake import FakeController
         fake = FakeController()
         with self.assertRaises(PolicyError) as caught:
-            fake.action("api_test", {"url": "http://169.254.169.254/"}, lambda event: None)
-        self.assertIn("169.254.169.254", str(caught.exception))
+            fake.action("api_test", {"url": "http://db.internal/"}, lambda event: None)
+        self.assertIn("db.internal", str(caught.exception))
         fake.policy_over[policy.NETWORK] = policy.ALLOW
-        self.assertEqual(fake.action("api_test", {"url": "http://169.254.169.254/"},
+        self.assertEqual(fake.action("api_test", {"url": "http://db.internal/"},
                                      lambda event: None),
                          {"status": 200, "headers": {}, "body": "OK"})
 

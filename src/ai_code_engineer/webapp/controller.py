@@ -1241,14 +1241,15 @@ class AgentController:
         `169.254.169.254` — the address a cloud instance answers its credentials on — exactly as easily as
         it reached `localhost:8080`. So the destination is asked separately, and the only answer that opens
         it is the folder's own declared `allow`: a yes pressed on a dialog is not a rule the folder wrote,
-        and that difference is the whole escalation. Loopback and public names keep today's verdict, and a
-        name is judged as a name on purpose — finding out whether a name is private is done by sending the
-        request this gate exists to think about first.
+        and that difference is the whole escalation. Loopback and public numeric addresses keep today's
+        verdict. A hostname is treated as limited because this gate does not resolve DNS and cannot tell
+        whether it points at a private service.
         """
         host, kind = policy.address_of(url)
-        if kind not in policy.LIMITED or self.policy_check(policy.NETWORK)[0] == policy.ALLOW:
+        if kind not in policy.LIMITED or self.policy_check(policy.NETWORK, host=host)[0] == policy.ALLOW:
             return ""
-        key = "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited"
+        key = ("policy_addr_named" if kind == policy.NAMED else
+               "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited")
         stopped = shared_note(key, arabic=self.arabic, host=host, kind=address_words(self.arabic)[kind])
         if self.repo:
             stopped += "  " + shared_note("policy_how", arabic=self.arabic, folder=self.repo,
@@ -3281,7 +3282,8 @@ class AgentController:
         stopped = self.address_gate(url)
         if stopped:
             raise PolicyError(stopped)
-        stopped = self.policy_confirm(policy.NETWORK)
+        host, _kind = policy.address_of(url)
+        stopped = self.policy_confirm(policy.NETWORK, host=host)
         if stopped:
             raise PolicyError(stopped)
         headers = dict(payload.get("headers") or {})

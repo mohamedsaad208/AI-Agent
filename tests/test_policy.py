@@ -15,6 +15,7 @@ either module imports a window.
 """
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -109,14 +110,14 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(policy.address_class("172.15.0.1"), policy.PUBLIC,
                          "the private range starts at 172.16, and a class that guesses is a class that lies")
 
-    def test_a_name_is_judged_as_a_name_and_never_resolved(self):
-        """The limit, stated: finding out whether a name is private is done by sending the request this
-        gate exists to think about first, so a name keeps today's verdict instead of being escalated."""
-        self.assertEqual(policy.address_class("localhost"), policy.NAMED)
+    def test_a_name_is_not_resolved_and_requires_an_explicit_network_rule(self):
+        """Without resolving DNS, a hostname cannot be distinguished from a private service."""
         self.assertEqual(policy.address_class("db.internal"), policy.NAMED)
         self.assertEqual(policy.address_class("deadbeef"), policy.NAMED,
                          "a label that merely looks like hex is a name, not an address form")
-        self.assertNotIn(policy.NAMED, policy.LIMITED)
+        self.assertIn(policy.NAMED, policy.LIMITED)
+        self.assertEqual(policy.address_class("localhost"), policy.LOOPBACK)
+        self.assertEqual(policy.address_class("api.localhost"), policy.LOOPBACK)
         source = Path(policy.__file__).read_text(encoding="utf-8")
         for shape in ("getaddrinfo", "socket.", "urlopen("):
             self.assertNotIn(shape, source, "the class reads a string: " + shape)
@@ -161,7 +162,7 @@ class AddressTests(unittest.TestCase):
             self.assertEqual({code for code, word in words.items() if labels.is_arabic(word) == arabic},
                              set(policy.ADDRESS_CLASSES))
             self.assertEqual(len(set(words.values())), len(words), "two classes sharing a word is one bug")
-        for key in ("policy_addr_limited", "policy_addr_unreadable"):
+        for key in ("policy_addr_limited", "policy_addr_named", "policy_addr_unreadable"):
             english, arabic_text = labels.NOTE_TEMPLATES[key]
             self.assertTrue(labels.is_arabic(arabic_text), key)
             self.assertEqual(english.count("{"), arabic_text.count("{"), key)
@@ -182,6 +183,30 @@ class StoreTests(unittest.TestCase):
     def test_a_folder_nobody_spoke_about_answers_the_table(self):
         self.assertEqual(permissions.overrides(self.app, self.root), {})
         self.assertEqual(permissions.verdict(self.app, self.root, policy.EXECUTE_CUSTOM), policy.ASK)
+
+    def test_removing_the_store_drops_overrides_and_restores_the_documented_defaults(self):
+        permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.DENY)
+        permissions.path(self.app).unlink()
+        self.assertEqual(permissions.overrides(self.app, self.root), {})
+        self.assertEqual(permissions.verdict(self.app, self.root, policy.EXECUTE_CUSTOM), policy.ASK)
+
+    def test_concurrent_processes_keep_both_policy_changes(self):
+        source = str(Path(__file__).resolve().parents[1] / "src")
+        child = (
+            "import sys,time; from pathlib import Path; "
+            "sys.path.insert(0, sys.argv[1]); "
+            "from ai_code_engineer import permissions,policy; "
+            "write=permissions._write; "
+            "permissions._write=lambda app,rows: (time.sleep(.2),write(app,rows)); "
+            "permissions.declare(Path(sys.argv[2]),Path(sys.argv[3]),sys.argv[4],policy.ALLOW)"
+        )
+        actions = (policy.NETWORK, policy.EXECUTE_CUSTOM)
+        processes = [subprocess.Popen([sys.executable, "-c", child, source, str(self.app),
+                                       str(self.root), action]) for action in actions]
+        for process in processes:
+            self.assertEqual(process.wait(timeout=10), 0)
+        self.assertEqual(permissions.overrides(self.app, self.root),
+                         {action: policy.ALLOW for action in actions})
 
     def test_a_declared_verdict_survives_the_round_trip(self):
         permissions.declare(self.app, self.root, policy.EXECUTE_CUSTOM, policy.ALLOW, by="web")
@@ -292,10 +317,11 @@ class VocabularyTests(unittest.TestCase):
                              "a class with no sentence says nothing rather than guessing")
 
     def test_the_ask_and_the_deny_of_one_class_are_two_different_sentences(self):
-        ask = labels.policy_line(False, policy.NETWORK, policy.ASK)
-        deny = labels.policy_line(False, policy.NETWORK, policy.DENY)
+        ask = labels.policy_line(False, policy.NETWORK, policy.ASK, host="api.example.com")
+        deny = labels.policy_line(False, policy.NETWORK, policy.DENY, host="api.example.com")
         self.assertTrue(ask and deny and ask != deny)
-        self.assertTrue(labels.is_arabic(labels.policy_line(True, policy.NETWORK, policy.ASK)))
+        self.assertTrue(labels.is_arabic(labels.policy_line(
+            True, policy.NETWORK, policy.ASK, host="api.example.com")))
 
     def test_the_verdict_words_flip_with_the_language(self):
         english, arabic = labels.policy_verdicts(False), labels.policy_verdicts(True)

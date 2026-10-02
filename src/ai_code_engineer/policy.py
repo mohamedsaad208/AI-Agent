@@ -120,7 +120,7 @@ ADDRESS_CLASSES = (LOOPBACK, LINK_LOCAL, PRIVATE, PUBLIC, NAMED, UNKNOWN)
 
 # The classes that are not this machine's own: a request that lands here leaves the laptop and arrives at
 # a neighbour — a private network, a link-local metadata service, or somewhere the tool cannot see.
-LIMITED = (LINK_LOCAL, PRIVATE, UNKNOWN)
+LIMITED = (LINK_LOCAL, PRIVATE, NAMED, UNKNOWN)
 
 # A host is a label or a number: decimal-and-dot forms are the ones some stacks still route (`127.1`,
 # `0177.0.0.1`, `2130706433`), and so is a written-out hex literal. A word that merely looks like hex is
@@ -134,14 +134,16 @@ def address_class(host: str) -> str:
 
     It never resolves a name, and that is the decision rather than an oversight: finding out whether
     `metadata.example` is private is done by sending the request this gate exists to think about first.
-    A **name** therefore answers `named` and keeps the verdict the table already gives it. Loopback keeps
-    its verdict too, because testing the app you are building is the reason the button exists. CGNAT
-    (`100.64.0.0/10`) reads as `public`, because that is what the standard library says and this module
-    does not argue with it.
+    A **name** answers `named`, but is treated as limited because this module does not resolve DNS and
+    cannot know whether it points at a private service. Loopback keeps its verdict, because testing the
+    app you are building is the reason the button exists. CGNAT (`100.64.0.0/10`) reads as `public`,
+    because that is what the standard library says and this module does not argue with it.
     """
     value = str(host or "").strip().rstrip(".").lower()
     if not value:
         return UNKNOWN
+    if value == "localhost" or value.endswith(".localhost"):
+        return LOOPBACK
     try:
         found = ipaddress.ip_address(value)
     except ValueError:
