@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from doubles import Sentinel
 from ai_code_engineer.webapp import controller
+from ai_code_engineer import labels
 from ai_code_engineer import permissions
 from ai_code_engineer import policy
 from ai_code_engineer import service_runner
@@ -364,6 +371,97 @@ class TestPolicyAtTheButton(unittest.TestCase):
         with self.assertRaises(PolicyError):
             self.c.set_policy({"action": "sudo", "verdict": policy.ALLOW})
         self.assertEqual(permissions.overrides(self.app_dir, self.repo), {})
+
+
+class TheAddressAtTheButton(unittest.TestCase):
+    """#14: one yes on the API-test button used to reach the cloud metadata address exactly as easily as
+    it reached the dev server. The destination is now asked on its own, and the only answer that opens it
+    is a row the folder wrote — a yes pressed on a dialog is not a rule.
+
+    Nothing may aim a socket here, and nothing resolves a name either: the limit is asserted, because a
+    gate that resolved `localhost` to find out where it goes would be sending the request it exists to
+    think about first.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.app_dir = Path(self.temp_dir.name)
+        self.repo = self.app_dir / "my_project"
+        self.repo.mkdir()
+        self.c = controller.AgentController(self.app_dir)
+        self.c.repo = str(self.repo)
+        self.asked = []
+        self.c.confirm = lambda *args, **kwargs: (self.asked.append(args), True)[1]
+        self.sentinel = Sentinel()
+        stopper = patch("urllib.request.urlopen", self.sentinel)
+        stopper.start()
+        self.addCleanup(stopper.stop)
+
+    def tearDown(self):
+        service_runner.GLOBAL_SERVICES.stop_all()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    def test_the_metadata_address_is_refused_before_anything_is_aimed(self):
+        with self.assertRaises(PolicyError) as caught:
+            self.c.run_api_test({"url": "http://169.254.169.254/latest/meta-data/iam"})
+        self.assertEqual(self.sentinel.aimed, [], "the refusal comes before the request is built")
+        self.assertEqual(self.asked, [], "a dialog that cannot open the address is not asked about it")
+        said = str(caught.exception)
+        self.assertIn("169.254.169.254", said, "the refusal names the address it refused")
+        self.assertIn(labels.address_words(False)[policy.LINK_LOCAL], said,
+                      "and says what kind of place it is, in words the operator reads")
+
+    def test_a_yes_on_the_ask_does_not_open_a_private_network(self):
+        with self.assertRaises(PolicyError):
+            self.c.run_api_test({"url": "http://10.0.0.9:3000/x"})
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.sentinel.aimed, [])
+
+    def test_a_row_the_folder_wrote_does_open_it(self):
+        permissions.declare(self.app_dir, self.repo, policy.NETWORK, policy.ALLOW)
+        res = self.c.run_api_test({"url": "http://10.0.0.9:3000/x"})
+        self.assertEqual(self.sentinel.aimed, ["http://10.0.0.9:3000/x"])
+        self.assertEqual(self.asked, [], "allow is silence, at both gates")
+        self.assertTrue(res["ok"])
+
+    def test_an_address_form_the_gate_cannot_read_is_refused_with_its_form(self):
+        for url in ("http://127.1/", "http://0177.0.0.1/", "http://2130706433/"):
+            with self.assertRaises(PolicyError) as caught:
+                self.c.run_api_test({"url": url})
+            said = str(caught.exception)
+            self.assertIn(url.split("//", 1)[1].rstrip("/"), said, url)
+            self.assertIn(labels.address_words(False)[policy.UNKNOWN], said, url)
+        self.assertEqual(self.sentinel.aimed, [], "none of them was tried")
+
+    def test_loopback_and_a_name_keep_the_ask_they_have_today(self):
+        for url in ("http://127.0.0.1:8080/", "http://localhost:8080/", "http://api.example.com/"):
+            self.c.run_api_test({"url": url})
+        self.assertEqual(len(self.asked), 3, "the escalation added no dialog to an address at home")
+        self.assertEqual(len(self.sentinel.aimed), 3)
+
+    def test_nothing_is_resolved_to_find_out_where_a_name_goes(self):
+        resolver = MagicMock(side_effect=AssertionError("the gate looked a name up"))
+        self.addCleanup(setattr, socket, "getaddrinfo", socket.getaddrinfo)
+        socket.getaddrinfo = resolver
+        self.c.run_api_test({"url": "http://db.internal:5432/"})
+        resolver.assert_not_called()
+        self.assertEqual(self.sentinel.aimed, ["http://db.internal:5432/"])
+
+    def test_the_refusal_reads_the_same_in_the_scripted_preview(self):
+        """`--fake` is where this design gets reviewed, so it answers the destination question with the
+        same function and the same sentence — and a declared row opens it there too."""
+        from ai_code_engineer.webapp.fake import FakeController
+        fake = FakeController()
+        with self.assertRaises(PolicyError) as caught:
+            fake.action("api_test", {"url": "http://169.254.169.254/"}, lambda event: None)
+        self.assertIn("169.254.169.254", str(caught.exception))
+        fake.policy_over[policy.NETWORK] = policy.ALLOW
+        self.assertEqual(fake.action("api_test", {"url": "http://169.254.169.254/"},
+                                     lambda event: None),
+                         {"status": 200, "headers": {}, "body": "OK"})
 
 
 if __name__ == "__main__":

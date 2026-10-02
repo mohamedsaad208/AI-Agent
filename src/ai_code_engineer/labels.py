@@ -673,6 +673,22 @@ NOTE_TEMPLATES = {
                    "--action {action} --verdict allow|ask|deny",
                    "للإجابة بشكل مختلف من هنا، شغّل:  agent policy --repo \"{folder}\" "
                    "--action {action} --verdict allow|ask|deny"),
+    # An address class that is not this machine's own costs more than one yes. These are the two shapes of
+    # that refusal, said before any dialog opens: an ask the operator can answer is not the same answer as
+    # a rule the folder wrote, and the difference is the whole point of the row.
+    "policy_addr_limited": ("The target is {kind}: {host}. A yes on this button does not open a request "
+                            "that leaves this machine — the folder has to say so once, as a rule.",
+                            "الهدف من نوع {kind}: {host}. الموافقة على هذا الزر لا تفتح طلبًا يخرج من هذا "
+                            "الجهاز — لا بد أن يقول المجلد ذلك مرة واحدة، كقاعدة."),
+    "policy_addr_unreadable": ("The target is {kind}, and its form is {host}. This tool will not send a "
+                               "request to an address it cannot read; confirm once to send it anyway, "
+                               "knowing the form it is written in.",
+                               "الهدف من نوع {kind}، وصيغته {host}. هذه الأداة لن ترسل طلبًا إلى عنوان لا "
+                               "تستطيع قراءته؛ أكّد مرة واحدة لترسله رغم ذلك وأنت تعرف الصيغة الذي كُتب بها."),
+    "env_names_unreadable": ("Could not read the environment files to compare them: {error}. The "
+                             "missing-key list is left empty rather than guessed.",
+                             "تعذّرت قراءة ملفات البيئة لمقارنتها: {error}. تُركت قائمة المفاتيح المفقودة "
+                             "فارغة بدل تخمينها."),
     "stage_line": ("{where} — step {number} of {total}",
                    "{where} — الخطوة {number} من {total}"),
     "policy_heading": ("What this folder answers without asking:",
@@ -714,6 +730,28 @@ POLICY_VERDICT_AR = {"allow": "سماح", "ask": "اسأل", "deny": "رفض"}
 def policy_verdicts(arabic: bool) -> dict:
     """The verdict words, so a control can be labelled in the language the task was asked in."""
     return {code: (POLICY_VERDICT_AR[code] if arabic else code) for code in POLICY_VERDICT_AR}
+
+
+# The words for `policy.ADDRESS_CLASSES`. They are sentences' material, not codes on a button: an operator
+# deciding whether one yes is worth it has to be told in plain language that the target is a metadata
+# address rather than the dev server. `address_words` keeps the pair beside the code so a new class cannot
+# be added to the module without a word in both languages.
+ADDRESS_WORDS = {
+    "loopback": ("this machine's own address", "عنوان هذا الجهاز نفسه"),
+    "link_local": ("a link-local address — the cloud metadata service answers here",
+                   "عنوان رابط محلي — خدمة البيانات الوصفية للسحابة تجيب من هنا"),
+    "private": ("a private network address", "عنوان شبكة خاصة"),
+    "public": ("a public address", "عنوان عام"),
+    "named": ("a name this tool did not look up", "اسم لم تبحث عنه هذه الأداة"),
+    "unknown": ("an address form this tool cannot read", "صيغة عنوان لا تستطيع هذه الأداة قراءتها"),
+}
+
+
+def address_words(arabic: bool) -> dict:
+    """The address class words, the same way the verdict words are handed to a control."""
+    return {code: say(arabic, en=ADDRESS_WORDS[code][0], ar=ADDRESS_WORDS[code][1])
+            for code in ADDRESS_WORDS}
+
 
 
 def policy_line(arabic: bool, action: str, verdict: str, **fields) -> str:

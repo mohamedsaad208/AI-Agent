@@ -782,6 +782,33 @@ class TheWriteCardAndTheChips(unittest.TestCase):
         self.assertIn("ARABIC_RUN.test(m.text) ? 'rtl' : 'auto'", self.flat)
 
 
+class TheFailureThatIsAField(unittest.TestCase):
+    """UI 4.7 / V2 #14: the readiness card used to answer an unreadable `.env` with "nothing missing".
+
+    The server now sends a field that says it could not look, and the card has to have somewhere to put
+    it. `innerHTML` is how `el` fills a node here, so an empty node is the only safe way to reserve a line
+    that may later hold a sentence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.projects = (static / "ui-projects.js").read_text(encoding="utf-8")
+
+    def test_the_line_exists_before_there_is_a_failure_to_show(self):
+        block = self.projects.split("const envSec = ")[1].split("body.appendChild(envSec)")[0]
+        self.assertEqual(block.count("envSec.appendChild"), 4,
+                         "the heading, the two facts, and the one line that may stay empty")
+        self.assertIn("if (env.unreadable) unreadable.textContent = env.unreadable;", block,
+                      "innerHTML would have parsed the server's sentence as markup")
+
+    def test_the_client_builds_no_reason_of_its_own(self):
+        self.assertIn("unreadable.dir = 'auto'", self.projects,
+                      "the sentence is the server's, in the language the folder was read in")
+        for invented in ("could not read", "unreadable .env", "Missing keys: unknown"):
+            self.assertNotIn(invented, self.projects, "the client wrote its own failure: " + invented)
+
+
 class TheCountsOnTheChangeCard(unittest.TestCase):
     """UI 4.6: a card that names four files says how big each change is, from numbers already sent.
 

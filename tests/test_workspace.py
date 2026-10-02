@@ -67,8 +67,8 @@ class PathPolicyTests(unittest.TestCase):
             with self.subTest(refused=name):
                 self.refuse(name, "Only supported text files are accessible:")
         # The credential gates run before this one, so a suffix-less secret never reaches it.
-        self.refuse(".env", "Protected path.")
-        self.refuse(".env.production", "Protected path.")
+        self.refuse(".env", "Protected path: .env")
+        self.refuse(".env.production", "Protected path: .env.production")
 
     def test_the_suffix_gate_folds_case_the_way_the_read_gate_folds_it(self):
         """workspace.py:132 admits any case, and the syntax gates in verification and engine
@@ -113,13 +113,13 @@ class PathPolicyTests(unittest.TestCase):
                      ".venv/lib/site.py", "build/libs/Text.java", "__pycache__/m.py",
                      ".idea/workspace.xml", "dist/bundle.js"):
             with self.subTest(name=name):
-                self.refuse(name, "Protected path.")
+                self.refuse(name, "Protected path: " + name)
 
     def test_a_credential_shaped_name_is_refused_but_a_source_file_naming_one_is_not(self):
         for name in ("token.json", "my-secrets.json", "credentials.yml", "id_rsa.key",
                      "prod-passwords.txt", ".env"):
             with self.subTest(refused=name):
-                self.refuse(name, "Protected path.")
+                self.refuse(name, "Protected path: " + name)
         # The same words inside an identifier are ordinary source; refusing them would make
         # half of any auth codebase unreadable.
         for name in ("JwtTokenProvider.java", "PasswordValidator.kt", "keystore.py"):
@@ -131,7 +131,7 @@ class PathPolicyTests(unittest.TestCase):
         a file anyone reviewed — even one that does not exist yet."""
         for name in ("TOKEN~1.JSON", "GIT~1/config.txt", "NODE_M~1/index.js", "src/App~2.java"):
             with self.subTest(name=name):
-                self.refuse(name, "Protected path.")
+                self.refuse(name, "Protected path: " + name)
 
     def test_a_windows_device_name_is_refused(self):
         for name in ("NUL.txt", "CON", "com1.py", "lpt9.txt", "sub/AUX.md"):

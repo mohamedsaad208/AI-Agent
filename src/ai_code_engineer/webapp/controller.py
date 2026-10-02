@@ -39,8 +39,8 @@ from ..engine import event as record_event    # `event` is a parameter name in `
 from ..errors import AgentError, PolicyError
 from ..labels import (INTERRUPTED_STATES, MUTABLE_STATES, QUOTE_CHARS, STEP_FIELDS, TONE,
                       UNVERIFIED_STATES,
-                      applied_line, applied_note, artifact_card, asked_of, batch_summary_line,
-                      branch_started, branch_switched,
+                      address_words, applied_line, applied_note, artifact_card, asked_of,
+                      batch_summary_line, branch_started, branch_switched,
                       catalog_status_line, checkpoint_note, detail_section, executed_line,
                       executing_line, friendly_error, fix_offers_off_line, impact_lines, is_arabic,
                       log_dropped_line, log_line,
@@ -1235,6 +1235,28 @@ class AgentController:
             return ""
         self.say(line)
         return line
+
+    def address_gate(self, url: str) -> str:
+        """The sentence that stops a request aimed somewhere other than at this machine, or "" to go ahead.
+
+        The table answers `network` as one question, and one yes on the API-test button reached
+        `169.254.169.254` — the address a cloud instance answers its credentials on — exactly as easily as
+        it reached `localhost:8080`. So the destination is asked separately, and the only answer that opens
+        it is the folder's own declared `allow`: a yes pressed on a dialog is not a rule the folder wrote,
+        and that difference is the whole escalation. Loopback and public names keep today's verdict, and a
+        name is judged as a name on purpose — finding out whether a name is private is done by sending the
+        request this gate exists to think about first.
+        """
+        host, kind = policy.address_of(url)
+        if kind not in policy.LIMITED or self.policy_check(policy.NETWORK)[0] == policy.ALLOW:
+            return ""
+        key = "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited"
+        stopped = shared_note(key, arabic=self.arabic, host=host, kind=address_words(self.arabic)[kind])
+        if self.repo:
+            stopped += "  " + shared_note("policy_how", arabic=self.arabic, folder=self.repo,
+                                          action=policy.NETWORK)
+        self.say(stopped)
+        return stopped
 
     def policy_block(self) -> dict:
         """This folder's answers, as data with the sentences already chosen.
@@ -3251,7 +3273,11 @@ class AgentController:
             raise PolicyError("API test requires a valid http:// or https:// URL.")
         # A scheme check says what the string looks like, not where the packet goes. The provider path
         # already refuses to leave the loopback range without consent; this one sends whatever the page
-        # was handed, to anywhere, with whatever headers — so it asks the same table first.
+        # was handed, to anywhere, with whatever headers — so it asks the same table first, and then asks
+        # where the address actually is before it spends a click on a question that cannot open it.
+        stopped = self.address_gate(url)
+        if stopped:
+            raise PolicyError(stopped)
         stopped = self.policy_confirm(policy.NETWORK)
         if stopped:
             raise PolicyError(stopped)

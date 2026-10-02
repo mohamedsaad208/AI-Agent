@@ -93,6 +93,93 @@ class WriteClassTests(unittest.TestCase):
         self.assertEqual(policy.write_action(""), policy.WRITE)
 
 
+class AddressTests(unittest.TestCase):
+    """Where a request target is, answered from the string alone — the third question `policy` decides.
+
+    The vocabulary matters more than the ranges: a caller that cannot tell a metadata address from a dev
+    server is one yes away from sending credentials to it, and a class the module invented silently would
+    make the escalation answer questions nobody asked.
+    """
+
+    def test_this_machines_own_loopback_is_not_an_escalation(self):
+        for host in ("127.0.0.1", "127.5.5.5", "::1"):
+            self.assertEqual(policy.address_class(host), policy.LOOPBACK, host)
+        self.assertNotIn(policy.LOOPBACK, policy.LIMITED,
+                         "testing the app you are building is why the button exists")
+
+    def test_the_metadata_address_is_link_local_and_a_neighbour_is_private(self):
+        self.assertEqual(policy.address_class("169.254.169.254"), policy.LINK_LOCAL)
+        self.assertEqual(policy.address_class("fe80::1"), policy.LINK_LOCAL)
+        for host in ("10.0.0.5", "192.168.1.7", "172.16.5.9", "fd00::1"):
+            self.assertEqual(policy.address_class(host), policy.PRIVATE, host)
+        for host in ("169.254.169.254", "10.0.0.5", "172.16.5.9", "fd00::1"):
+            self.assertIn(policy.address_class(host), policy.LIMITED, host)
+
+    def test_a_public_host_is_answered_as_one(self):
+        self.assertEqual(policy.address_class("8.8.8.8"), policy.PUBLIC)
+        self.assertEqual(policy.address_class("172.15.0.1"), policy.PUBLIC,
+                         "the private range starts at 172.16, and a class that guesses is a class that lies")
+
+    def test_a_name_is_judged_as_a_name_and_never_resolved(self):
+        """The limit, stated: finding out whether a name is private is done by sending the request this
+        gate exists to think about first, so a name keeps today's verdict instead of being escalated."""
+        self.assertEqual(policy.address_class("localhost"), policy.NAMED)
+        self.assertEqual(policy.address_class("db.internal"), policy.NAMED)
+        self.assertEqual(policy.address_class("deadbeef"), policy.NAMED,
+                         "a label that merely looks like hex is a name, not an address form")
+        self.assertNotIn(policy.NAMED, policy.LIMITED)
+        source = Path(policy.__file__).read_text(encoding="utf-8")
+        for shape in ("getaddrinfo", "socket.", "urlopen("):
+            self.assertNotIn(shape, source, "the class reads a string: " + shape)
+
+    def test_a_form_that_is_neither_a_name_nor_a_readable_address_escalates(self):
+        """`127.1`, `0177.0.0.1` and `2130706433` are loopback to some resolvers and nothing to others.
+        An address this tool cannot read is not a public host, so it is `unknown`, and `unknown` is one of
+        the limited classes."""
+        for host in ("127.1", "0177.0.0.1", "2130706433", "0x7f000001", "", "http://127.0.0.1"):
+            self.assertEqual(policy.address_class(host), policy.UNKNOWN, repr(host))
+        self.assertIn(policy.UNKNOWN, policy.LIMITED)
+
+    def test_the_host_comes_out_of_the_url_with_the_port_and_the_credentials_left_behind(self):
+        for url, host in (("http://127.0.0.1:8080/users", "127.0.0.1"),
+                          ("http://user:pass@10.0.0.9:3000/x", "10.0.0.9"),
+                          ("http://[::1]:9/admin", "::1"),
+                          ("https://api.example.com", "api.example.com")):
+            self.assertEqual(policy.address_of(url), (host, policy.address_class(host)), url)
+
+    def test_a_url_this_library_rejects_has_no_readable_host(self):
+        for bad in ("", "not a url", "http://[::1"):
+            self.assertEqual(policy.address_of(bad)[1], policy.UNKNOWN, bad)
+
+    def test_the_range_answers_are_the_standard_librarys_and_are_recorded_as_such(self):
+        """CGNAT (`100.64.0.0/10`) is not `is_private` in Python, so it answers public here. Asserting it
+        keeps the agreement honest: if the library ever changes, this test moves with it and says so."""
+        self.assertEqual(policy.address_class("100.64.0.1"), policy.PUBLIC)
+
+    def test_a_link_local_that_names_its_interface_is_still_link_local(self):
+        """`fe80::1%eth0` and the percent form the URL carries are one address to the library, so writing
+        the interface down does not drop a metadata-range target out of the escalated set."""
+        for host in ("fe80::1", "fe80::1%eth0", "fe80::1%25eth0"):
+            self.assertEqual(policy.address_class(host), policy.LINK_LOCAL, host)
+        self.assertEqual(policy.address_of("http://[fe80::1%25eth0]/x")[1], policy.LINK_LOCAL)
+
+    def test_every_class_has_a_word_in_both_languages(self):
+        """The refusal is the one place an operator reads a class, and a missing key there would raise in
+        the middle of a dialog that already asked them to decide."""
+        for arabic in (False, True):
+            words = labels.address_words(arabic)
+            self.assertEqual(set(words), set(policy.ADDRESS_CLASSES))
+            self.assertEqual({code for code, word in words.items() if labels.is_arabic(word) == arabic},
+                             set(policy.ADDRESS_CLASSES))
+            self.assertEqual(len(set(words.values())), len(words), "two classes sharing a word is one bug")
+        for key in ("policy_addr_limited", "policy_addr_unreadable"):
+            english, arabic_text = labels.NOTE_TEMPLATES[key]
+            self.assertTrue(labels.is_arabic(arabic_text), key)
+            self.assertEqual(english.count("{"), arabic_text.count("{"), key)
+            self.assertEqual(labels.note(key, host="7f00host", kind="linkkind").count("7f00host"), 1, key)
+            self.assertEqual(labels.note(key, host="7f00host", kind="linkkind").count("linkkind"), 1, key)
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -249,8 +336,11 @@ class PlacementTests(unittest.TestCase):
     def test_neither_module_reaches_for_a_window_or_a_provider(self):
         for module in (permissions, policy):
             source = (Path(module.__file__).read_text(encoding="utf-8"))
-            for banned in ("webapp", "controller", "providers", "gui", "requests"):
+            for banned in ("webapp", "controller", "providers", "gui", "requests", "socket"):
                 self.assertNotIn("import " + banned, source, module.__name__ + " imports " + banned)
+            self.assertNotIn("ipaddress.", source.split("def address_class")[1].split("\n\n")[0]
+                             if "def address_class" in source else "",
+                             "the class answers from the parsed address, not by resolving it")
 
 
 if __name__ == "__main__":

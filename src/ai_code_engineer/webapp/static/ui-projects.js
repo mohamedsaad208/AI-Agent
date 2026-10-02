@@ -417,6 +417,10 @@ async function readinessDrawer() {
   if (env.missing_keys && env.missing_keys.length) {
     envSec.appendChild(el('div', 'warn small', 'Missing keys in .env: ' + env.missing_keys.map(k => esc(k)).join(', ')));
   }
+  const unreadable = el('div', 'warn small');
+  unreadable.dir = 'auto';
+  if (env.unreadable) unreadable.textContent = env.unreadable;
+  envSec.appendChild(unreadable);
   body.appendChild(envSec);
 
   if (data.recommendations && data.recommendations.length) {

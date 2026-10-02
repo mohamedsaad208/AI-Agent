@@ -956,10 +956,23 @@ class FakeController:
         elif type == "save_run_config":
             return {"saved": True}
         elif type == "get_readiness":
-            return {"tools": [], "wrappers": [], "configs": [], "recommendations": []}
+            # The `env` block carries the four fields the shipped reader answers, empty: the card's shape is
+            # reviewable here, and the admitted-failure sentence is not — nothing in a preview is unreadable.
+            return {"tools": [], "wrappers": [], "configs": [], "recommendations": [],
+                    "env": {"has_env": False, "has_example": False, "missing_keys": [], "unreadable": ""}}
         elif type == "service_lines":
             return {"lines": [], "status": "running"}
         elif type == "api_test":
+            # The same destination question the shipped window asks, answered from the scripted rows so a
+            # review can declare `network = allow` here and watch the refusal go away. No url at all is
+            # the shape the rail sends before a request has been typed: there is nothing to classify.
+            url = str(payload.get("url") or "")
+            if url:
+                host, kind = policy.address_of(url)
+                if kind in policy.LIMITED and self.policy_over.get(policy.NETWORK) != policy.ALLOW:
+                    raise PolicyError(labels.note(
+                        "policy_addr_unreadable" if kind == policy.UNKNOWN else "policy_addr_limited",
+                        host=host, kind=labels.address_words(False)[kind]))
             return {"status": 200, "headers": {}, "body": "OK"}
         elif type == "fix_errors":
             return {"status": "fix_requested"}
