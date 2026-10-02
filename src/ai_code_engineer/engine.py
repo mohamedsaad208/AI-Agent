@@ -719,7 +719,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
          chat_id: str | None = None, extra_context: str | None = None,
          plan_step: int | None = None, memory: str | None = None, step=None,
          on_token=None, goal: str = "", criteria: list[str] | None = None,
-         accepts: list[int] | None = None, resume_run: str | None = None) -> Path:
+         accepts: list[int] | None = None, resume_run: str | None = None,
+         fix_round: int = 0) -> Path:
     """Run the tool loop until the model proposes a change.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
@@ -821,6 +822,10 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             session["criteria"] = [str(c)[:200] for c in criteria[:8]]
         if accepts:
             session["accepts"] = [int(a) for a in accepts if isinstance(a, int)]
+    if fix_round:
+        # Charged on the record before the round costs a request: a restart that resumes this session has
+        # to find the number here, or the ceiling it stopped at becomes free again.
+        session["fix_round"] = max(1, int(fix_round))
     if memory and memory.strip():
         if len(memory) > memory_module.MAX_MEMORY:
             raise PolicyError(f"Project notes must stay within {memory_module.MAX_MEMORY} characters.")

@@ -1614,6 +1614,11 @@ class AgentWindow:
         task = str(stored.get("task") or "")[:MAX_TASK_CHARS]
         plan_file = str((stored.get("plan_reference") or {}).get("path") or "") or None
         notes = str(stored.get("memory") or "")
+        # The ceiling and the failure both come back off the record: a restart that resumed a fix round
+        # used to find zero rounds spent and an empty prompt, which is how a stopped loop became three more
+        # model turns the person already paid for.
+        self._fix_round = max(self._fix_round, repair.round_of(stored))
+        evidence = str(stored.get("evidence") or "")
         key = self.key.get().strip() or None
         self.chat_message("Tool", shared_note("resume_started", arabic=self.arabic,
                                               task=str(row.get("task") or "")[:60]))
@@ -1626,7 +1631,8 @@ class AgentWindow:
                         progress=lambda line: self.events.put(("progress", line)),
                         cancelled=self.cancel_event.is_set, plan_file=plan_file,
                         chat_id=stored.get("chat_id"), plan_step=stored.get("plan_step"),
-                        memory=notes, resume_run=run_id)
+                        memory=notes, resume_run=run_id,
+                        extra_context=evidence, fix_round=self._fix_round)
 
         def done(path):
             self.display_session(path)
@@ -2663,6 +2669,7 @@ class AgentWindow:
         reference, step_id = self.session.get("plan_reference"), self.session.get("plan_step")
         plan_file = str(Path(repo) / reference["path"]) if reference and step_id is not None else None
         task, evidence = repair.fix_task(run), repair.evidence(run)
+        context = repair.with_candidates(evidence, Workspace(Path(repo)), self.session)
         notes = self.project_notes()
         # The category belongs in the line the user reads, because "asking for a fix" and "asking for
         # a fix to a dependency the machine cannot resolve" are different odds of working.
@@ -2674,8 +2681,9 @@ class AgentWindow:
                                      api_key=key, allow_paid=paid)
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
                         progress=lambda line: self.events.put(("progress", line)),
-                        cancelled=self.cancel_event.is_set, chat_id=chat_id, extra_context=evidence,
-                        plan_file=plan_file, plan_step=step_id if plan_file else None, memory=notes)
+                        cancelled=self.cancel_event.is_set, chat_id=chat_id, extra_context=context,
+                        plan_file=plan_file, plan_step=step_id if plan_file else None, memory=notes,
+                        fix_round=self._fix_round)
 
         def done(path):
             self.display_session(path)
