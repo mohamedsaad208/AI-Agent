@@ -1005,6 +1005,9 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     # The identical-reply guard restarts on a resumed run: it counts answers seen in one sitting, and a
     # person who closed the app and came back is in a new sitting by definition.
     repeated = {}
+    # A user who raises the request timeout for a slow local model has asked for
+    # patience, so the whole-task budget follows it instead of staying fixed.
+    budget_seconds = max(1200, settings.timeout_seconds * 3)
     started = time.monotonic() - float(resumed.get("elapsed") or 0)
     start_turn = int(resumed.get("turn") or 0)
     # Everything the prompt says that does not change between turns, frozen once the retrieval
@@ -1030,6 +1033,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # long the run has been going, and a second clock call per turn is a second tick in tests
             # that fake the clock to make a slow model exhaust the budget on purpose.
             elapsed = time.monotonic() - started
+            if elapsed > budget_seconds:
+                raise AgentError("Task time budget exhausted.")
             taskstate.note_files(state, observed)
             base[1]["content"] = (base_template + "\n"
                                   + taskstate.block(state, state_budget)).rstrip()

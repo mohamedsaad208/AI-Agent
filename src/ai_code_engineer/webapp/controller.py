@@ -2163,9 +2163,12 @@ class AgentController:
                     if asks_for_a_change(asked) and not planning_mode.requests_plan(asked) else "")
             self.start_chat(task, settings, cloud, paid, key, note,
                             asked=asked, quote_of=quote_of)
-            return
-        if (not repo or self.composer == CHAT_COMPOSER
-                or planning_mode.requests_plan(asked)):
+        # A bound project answers in prose by default: bound means it may *read* that project,
+        # never that a greeting became a change request. A message that opens with "add" or
+        # "صلح" is a different thing, and it is planned as a change — for this message only,
+        # because remembering the route would turn the next "thanks" into a rejected diff.
+        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked) and not planning_mode.requests_plan(asked)
+        if not repo or (self.composer == CHAT_COMPOSER and not as_change) or planning_mode.requests_plan(asked):
             self.start_chat(task, settings, cloud, paid, key, asked=asked, quote_of=quote_of)
             return
         if plan_file:
@@ -2216,6 +2219,11 @@ class AgentController:
                 self.status = status_text("prior_unverified", arabic=self.arabic)
         self.title = asked.replace("\n", " ")[:45]
         self._add("user", "You", task, quote_of=quote_of)
+        if as_change:
+            self._add("tool", "Tool", "This branch is in Chat mode, so the answer would have been "
+                                      "prose. The message asks for a change, so it is planned as a "
+                                      "proposal instead: review the diff, then Apply to write it. "
+                                      "The next message is Chat again.")
         self.session = self.session_path = None
         notes = self._project_notes()
         if notes:
@@ -2285,7 +2293,6 @@ class AgentController:
 
         # A status set here is overwritten the moment the job starts, so the routing notice
         # rides along as the running line — which is also the entry the log keeps.
-        as_change = self.composer == CHANGE_COMPOSER
         running = ("⚡ Switched to Change mode to propose and write file edits…" if as_change
                    else "Connecting to the model and preparing changes…")
         self.run_job(work, done, running, cancellable=True,
@@ -2519,10 +2526,8 @@ class AgentController:
         if note:
             self.line("tool", "Tool", note)
         repo = self.repo
-        # The web window's Plan button is the prose-only composer. Its mode instruction is explicit,
-        # so even an imperative like "Generate a project" becomes a future plan, never a diff.
-        # Explicit roadmap wording also activates the planner in standalone/read-only conversations.
-        is_plan = self.composer == CHAT_COMPOSER or planning_mode.requests_plan(asked or task)
+        # Explicit roadmap wording activates the planner in standalone/read-only conversations.
+        is_plan = planning_mode.requests_plan(asked or task)
         plan_issues: list[str] = []
 
         def work():
