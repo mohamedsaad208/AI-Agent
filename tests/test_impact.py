@@ -355,9 +355,12 @@ class ReviewWireTests(unittest.TestCase):
         self.runs = self.app / ".agent-runs"
 
     def propose(self, task="Remove the audit method"):
-        script = Script([{"action": "propose", "summary": "Drop audit and the password argument",
-                          "checks": ["unit tests"],
-                          "changes": [{"path": CHANGED, "content": SERVICE_NEW}]}])
+        # A retrieval snapshot informs the model but does not authorise the write, so the first
+        # proposal is refused and the run opens the file itself; the second one is honoured.
+        change = {"action": "propose", "summary": "Drop audit and the password argument",
+                  "checks": ["unit tests"],
+                  "changes": [{"path": CHANGED, "content": SERVICE_NEW}]}
+        script = Script([change, dict(change)])
         return plan(self.ws, task, script, Settings(), self.runs, progress=lambda _: None)
 
     def test_a_proposal_records_what_it_breaks_beside_itself(self):

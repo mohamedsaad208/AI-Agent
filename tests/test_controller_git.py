@@ -309,7 +309,9 @@ class BranchTests(unittest.TestCase):
         controller.join()
         state = controller.snapshot()
         self.assertEqual(state["review"]["state"], "Changes ready for review")
-        self.assertEqual(len(self.model.actions), 1)
+        self.assertEqual(len(self.model.actions), 2,
+                         "the first proposal was refused for a file the model never opened, "
+                         "the second was honoured")
         self.assertEqual((self.repo / "calculator.py").read_text(), CALCULATOR_BAD,
                          "a proposal writes nothing until Apply")
 

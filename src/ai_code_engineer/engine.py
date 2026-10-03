@@ -962,7 +962,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # answer, which is the failure a small local model pays for: it proposes against a file it
             # has never seen a line of, in a project whose map said the file was right there. An
             # excerpt of the block around the ranked symbol is sent instead — and like the whole-file
-            # snapshot below, it is not a read: a proposal still has to open this one.
+            # snapshot below, it reaches the model without authorising a proposal for the file.
             if excerpts >= MAX_EXCERPTS:
                 continue
             text, line, more = symbols.snippet(item["content"],
@@ -990,11 +990,11 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
             continue
         remaining -= len(encoded)
-        # A snapshot the run chose is not a file the model opened. `observed` is the list a proposal is
+        # A snapshot the run chose is not a file the model opened. `observed` is the set a proposal is
         # honoured against, so counting injected content here let a model replace a file it never asked
-        # for — and on a resumed run it re-authorized exactly the files the re-verify loop had just
-        # dropped for having changed on disk. The snapshot still carries the current bytes, and the
-        # auto-read path still charges the run one turn to open the file properly.
+        # for -- and on a resumed run it re-authorised exactly the paths the re-verify loop above had
+        # just dropped for changing on disk. The snapshot still carries the current bytes, and the
+        # auto-read path below charges the run one turn to open the file properly.
         injected += 1
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
         reason = chosen_reason(entry)
