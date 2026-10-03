@@ -2163,6 +2163,7 @@ class AgentController:
                     if asks_for_a_change(asked) and not planning_mode.requests_plan(asked) else "")
             self.start_chat(task, settings, cloud, paid, key, note,
                             asked=asked, quote_of=quote_of)
+            return
         # A bound project answers in prose by default: bound means it may *read* that project,
         # never that a greeting became a change request. A message that opens with "add" or
         # "صلح" is a different thing, and it is planned as a change — for this message only,
