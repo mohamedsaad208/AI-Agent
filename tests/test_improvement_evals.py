@@ -137,10 +137,12 @@ class EngineContinuityThroughTrim(unittest.TestCase):
 
     def test_state_envelope_survives_history_trim(self):
         phrase = "do not rename the public API surface"
+        propose = {"action": "propose", "summary": "nudge ping", "checks": ["run unittest"],
+                   "changes": [{"path": "api.py", "content": "def ping():\n    return 3\n"}]}
         provider = ScriptedProvider([
             {"action": "read_file", "path": "app.py", "state": {"constraints": [phrase]}},
-            {"action": "propose", "summary": "nudge ping", "checks": ["run unittest"],
-             "changes": [{"path": "api.py", "content": "def ping():\n    return 3\n"}]},
+            propose,       # refused: api.py reached the prompt as a snapshot, not as a read
+            dict(propose),  # honoured after the run opened the file itself
         ])
         settings = Settings(context_chars=12000)
         path = plan(self.ws(), "Read app.py then update api.py", provider,

@@ -869,7 +869,6 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         session["evidence"] = extra_context[:4000]
         event(session, "evidence_attached", characters=len(extra_context))
     history, observed = [], {}
-    stale_on_resume: list[str] = []
     if resumed:
         # The conversation the run was in, not a summary of it: a resumed loop that forgot what it had
         # already read proposes the same file twice and burns its budget re-learning the task.
@@ -886,7 +885,6 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 stale.append(name)
             else:
                 observed[name] = digest_of
-        stale_on_resume = stale
         if stale:
             progress("Files changed or gone since the run stopped: "
                      + ", ".join(stale[:6]) + ("…" if len(stale) > 6 else "")
@@ -947,11 +945,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                     _seen_paths.add(_hit["path"])
     except Exception:   # noqa: BLE001 — an optional index must never break retrieval
         pass
+    injected = 0
     for entry in _rank_entries:
         name = entry["path"]
         if reference and name == reference["path"]:
             continue
-        if len(observed) >= MAX_CONTEXT_FILES:
+        if len(observed) + injected >= MAX_CONTEXT_FILES:
             break
         try:
             item = ws.read(name)
@@ -962,8 +961,8 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # The file is larger than what the budget has left. Skipping it used to be the entire
             # answer, which is the failure a small local model pays for: it proposes against a file it
             # has never seen a line of, in a project whose map said the file was right there. An
-            # excerpt of the block around the ranked symbol is sent instead — and it is *not* a read,
-            # because `observed` keeps whole files only, so a proposal still has to open this one.
+            # excerpt of the block around the ranked symbol is sent instead — and like the whole-file
+            # snapshot below, it reaches the model without authorising a proposal for the file.
             if excerpts >= MAX_EXCERPTS:
                 continue
             text, line, more = symbols.snippet(item["content"],
@@ -991,12 +990,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
             continue
         remaining -= len(encoded)
-        # A snapshot carries the file's current bytes, but it is not the run's word that the file has
-        # not moved since. On a resumed run the re-verify loop above already dropped these paths for
-        # changing on disk, and re-authorising them here is what let a model overwrite an edit it had
-        # never been shown.
-        if name not in stale_on_resume:
-            observed[name] = item["sha256"]
+        # A snapshot the run chose is not a file the model opened. `observed` is the set a proposal is
+        # honoured against, so counting injected content here let a model replace a file it never asked
+        # for -- and on a resumed run it re-authorised exactly the paths the re-verify loop above had
+        # just dropped for changing on disk. The snapshot still carries the current bytes, and the
+        # auto-read path below charges the run one turn to open the file properly.
+        injected += 1
         base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
         reason = chosen_reason(entry)
         event(session, "context_file", path=name, sha256=item["sha256"], why=reason,

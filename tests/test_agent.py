@@ -782,7 +782,9 @@ class AgentTests(unittest.TestCase):
         and `checks` before it loses the file, and refusing the write cost a six-minute turn each time
         for two sentences nobody executes."""
         provider = RecordingProvider([
-            {"action": "propose", "changes": [{"path": "app.py", "content": "answer = 42\n"}]}])
+            {"action": "propose", "changes": [{"path": "app.py", "content": "answer = 42\n"}]},
+            {"action": "propose", "changes": [{"path": "app.py", "content": "answer = 42\n"}]},
+        ])
         path = plan(self.ws, "make app.py answer", provider, Settings(), self.base / "runs",
                     progress=lambda _: None)
         session = load_session(path)
@@ -798,14 +800,14 @@ class AgentTests(unittest.TestCase):
                "changes": [{"path": "app.py", "content": "answer = 42\n"}]}
         good = {"action": "propose", "summary": "Answer", "checks": ["mvn test"],
                 "changes": [{"path": "app.py", "content": "answer = 42\n"}]}
-        provider = RecordingProvider([bad, good])
+        provider = RecordingProvider([bad, good, good])   # refused for its type, then for the unread file
         path = plan(self.ws, "make app.py answer", provider, Settings(), self.base / "runs",
                     progress=lambda _: None)
         session = load_session(path)
         self.assertEqual(session["state"], "WAITING_APPROVAL")
         refused = [item for item in session["events"] if item["kind"] == "rejected_action"]
-        self.assertIn("short summary", refused[-1]["reason"])
-        self.assertIn("short summary", " ".join(m["content"] for m in provider.prompts[-1]))
+        self.assertIn("short summary", refused[0]["reason"])
+        self.assertIn("short summary", " ".join(m["content"] for m in provider.prompts[1]))
 
     def test_a_blocked_task_keeps_the_reason_that_blocked_it(self):
         provider = ScriptedProvider([self.UNKNOWN] * 5)
