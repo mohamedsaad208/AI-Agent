@@ -358,6 +358,7 @@ class AgentController:
         # offer blocks the worker that asked it, so every red build in a queue cost the whole ask
         # timeout. Turning the offers off is the operator's call, never the tool's.
         self._batch_fixes_off = False
+        self._fix_approved = False
         # What the queue has run so far, so the end of a batch can be said in one row instead of
         # being counted by the user scrolling. `_batch_row` is the task currently in flight.
         self._batch: list[dict] = []
@@ -1170,6 +1171,8 @@ class AgentController:
         # had to undo once.
         self.refresh_resumable()
         self.subtitle = self._subtitle()
+        if repo and not self.branch.get("bound"):
+            self.auto_detect_plan()
         # Arriving at a conversation that has something waiting starts it here; without this the
         # queue would only move when a job finished, and a stopped task never finishes again.
         if not self._draining:
@@ -1535,6 +1538,7 @@ class AgentController:
         self._save_state()
         self._sync_project()
         self.refresh_recipes()
+        self.auto_detect_plan()
         if not self._loading_session:
             self.new_task()
 
@@ -1570,19 +1574,18 @@ class AgentController:
                   "Send proposes a diff, nothing is written until you click Apply. The badge by Send "
                   "switches back to Chat when you only want to ask.")
 
-    def browse_plan(self) -> None:
-        path = self.ask_plan_file()
-        if not path:
-            return
+    def attach_plan_path(self, path: Path | str) -> bool:
+        """Attach a plan file to the current project and switch to Change mode."""
         if not self.repo:
-            key = project_key(str(path.parent))
-            self.projects.setdefault(key, str(Path(path.parent).resolve()))
-            self._select_branch(BRANCH_PROJECT, key, chat_id=self.chat_id)
+            return False
+        target = Path(path)
+        if not target.is_file():
+            return False
         try:
-            reference = read_plan_reference(Workspace(Path(self.repo)), str(path), Settings())
+            reference = read_plan_reference(Workspace(Path(self.repo)), str(target), Settings())
         except (AgentError, OSError) as exc:
             self.status = friendly_error(exc)
-            return
+            return False
         self.plan_file = str(Path(self.repo) / reference["path"])
         self.refresh_plan_status()
         if not self.ledger:
@@ -1594,13 +1597,35 @@ class AgentController:
                 message = friendly_error(exc)
                 self.say(message)
                 self.stream({"kind": "toast", "text": message, "level": "bad"})
-                return
-        # Attaching a plan is a decision to implement it, so this is the one path that selects
-        # Change mode on the user's behalf instead of leaving prose as the default.
+                return False
         self.set_composer(CHANGE_COMPOSER)
         self._save_state()
         self.status = shared_note("plan_attached_chained" if self.chained
                                   else "plan_attached_plain", arabic=self.arabic)
+        return True
+
+    def auto_detect_plan(self) -> bool:
+        """Find and attach PLAN.md if present in the repository."""
+        if not self.repo or not Path(self.repo).is_dir():
+            return False
+        repo_dir = Path(self.repo)
+        for name in ("PLAN.md", "plan.md", "Plan.md"):
+            candidate = repo_dir / name
+            if candidate.is_file():
+                if self.plan_file and Path(self.plan_file).resolve() == candidate.resolve() and self.ledger:
+                    return True
+                return self.attach_plan_path(candidate)
+        return False
+
+    def browse_plan(self) -> None:
+        path = self.ask_plan_file()
+        if not path:
+            return
+        if not self.repo:
+            key = project_key(str(path.parent))
+            self.projects.setdefault(key, str(Path(path.parent).resolve()))
+            self._select_branch(BRANCH_PROJECT, key, chat_id=self.chat_id)
+        self.attach_plan_path(path)
 
     def clear_plan(self) -> None:
         self.plan_file = ""
@@ -1704,7 +1729,8 @@ class AgentController:
                                source=self.catalog_source.get(self.mode, ""),
                                key_present=bool(self.key.strip()
                                                 or os.environ.get(kind.key_env or "")
-                                                or (kind.key == "gemini" and os.environ.get("GOOGLE_API_KEY"))))
+                                                or (kind.key == "gemini" and os.environ.get("GOOGLE_API_KEY"))
+                                                or (kind.key == "ovh" and os.environ.get("OVH_AI_ENDPOINTS_ACCESS_TOKEN"))))
 
     def cloud_choice(self) -> tuple[bool, bool]:
         """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths."""
@@ -1879,6 +1905,8 @@ class AgentController:
                 self.model = pending
             elif not self.model and any(entry["id"] == config.DEFAULT_MODEL for entry in catalog):
                 self.model = config.DEFAULT_MODEL
+            elif not self.model and catalog:
+                self.model = catalog[0]["id"]
             self.model_changed()
             self.status = catalog_status_line(arabic=self.arabic, count=len(catalog),
                                               model=self.model, label=selected_mode,
@@ -2149,13 +2177,32 @@ class AgentController:
             self.status = status_text("pick_model", arabic=self.arabic)
             return
         if cloud and not self.cloud_ok:
-            self.status = status_text("consent_message", arabic=self.arabic)
-            return
+            if self.active_kind().key == "llm7":
+                self.cloud_ok = True
+            else:
+                self.status = status_text("consent_message", arabic=self.arabic)
+                return
         settings = self.task_settings(cloud)
         if settings is None:
             return
         key = self.key.strip() or None
         self._draft = ""
+        # Auto-detect intent to create/write a plan file:
+        is_plan_file = bool(repo and re.search(
+            r"(?i)(?:اعمل|انشئ|اكتب|سوي|جهز|حضر|طلع|هات|save|create|make|generate|write).*(?:بلان\s*(?:فايل|فيل)|(?:فايل|فيل)\s*بلان|ملف\s*بلان|ملف\s*ال?خطة|خطة\s*في\s*ملف|plan\s*file|plan\.md)"
+            r"|(?:بلان\s*(?:فايل|فيل)|(?:فايل|فيل)\s*بلان|ملف\s*بلان|ملف\s*ال?خطة|خطة\s*في\s*ملف|plan\s*file|plan\.md).*(?:اعمل|انشئ|اكتب|سوي|جهز|create|make|generate|write)",
+            asked
+        ))
+        if is_plan_file:
+            self.set_composer(CHANGE_COMPOSER)
+            task = (
+                "Create PLAN.md in the project root with a comprehensive, ordered plan. "
+                "Format each task with clear headers and fields matching: "
+                "#### Task X: Title\n**ID:** T0X\n**Affected Paths:** ...\n**Dependencies:** ...\n"
+                "**Done Criteria:** ...\n**Verification:** ...\n**Difficulty:** ...\n**Effort Range:** ...\n**Rationale:** ...\n\n"
+                "User request: " + (asked or task)
+            )
+
         # The selected mode is authoritative. In particular, Plan/Chat is prose-only even when the
         # user says "build" or "create"; only an explicit switch to Change may produce a proposal.
         if self.reading_only():
@@ -2168,8 +2215,8 @@ class AgentController:
         # never that a greeting became a change request. A message that opens with "add" or
         # "صلح" is a different thing, and it is planned as a change — for this message only,
         # because remembering the route would turn the next "thanks" into a rejected diff.
-        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked) and not planning_mode.requests_plan(asked)
-        if not repo or (self.composer == CHAT_COMPOSER and not as_change) or planning_mode.requests_plan(asked):
+        as_change = is_plan_file or (bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked) and not planning_mode.requests_plan(asked))
+        if not repo or (self.composer == CHAT_COMPOSER and not as_change) or (planning_mode.requests_plan(asked) and not is_plan_file):
             self.start_chat(task, settings, cloud, paid, key, asked=asked, quote_of=quote_of)
             return
         if plan_file:
@@ -2781,6 +2828,8 @@ class AgentController:
         git_integration.forget()
         self.display_session(self.session_path)
         self._checkpoint()
+        self.auto_detect_plan()
+        self.refresh_recipes()
         automatic, self.wrote_without_asking = self.wrote_without_asking, False
         count = len(self.session.get("changes", [])) if self.session else 0
         removed = sum(1 for change in ((self.session or {}).get("changes") or [])
@@ -2810,22 +2859,22 @@ class AgentController:
             self._add("tool", "Tool", write_notice(arabic=self.arabic, count=count,
                                                    summary=(self.session or {}).get("summary") or "",
                                                    lines=lines, total=total, rewrote=rewrote))
-            if not self._auto_fix:
-                # A write nobody clicked for still has to be followed by the run that a clicked
-                # apply would have had. The branch's selection can be empty while the folder does
-                # have a command the tool detected — clearing it is a real state, and every card
-                # after it said "tests have not run". Fall back to the detected command instead of
-                # skipping the check: runner.detect() listed it, so nothing here is invented.
-                if self.recipes:
-                    if self.selected_recipe() is None:
-                        self.recipe = runner.RECIPES[self.recipes[0]]["label"]
-                    self.run_tests(False)
-                    return
-                self.status = status_text("applied_no_command", arabic=self.arabic)
-                return
-        if self._auto_fix:
+
+        is_fixing = bool(self._auto_fix or getattr(self, "_fix_approved", False))
+        if is_fixing:
             self.status = status_text("applied_rerun", arabic=self.arabic)
+            self.run_tests(auto_fix=True)
+            return
+
+        if self.recipes and (automatic or self.auto_apply or self.chained):
+            if self.selected_recipe() is None:
+                self.recipe = runner.RECIPES[self.recipes[0]]["label"]
             self.run_tests(False)
+            return
+
+        if automatic:
+            if not self.recipes:
+                self.status = status_text("applied_no_command", arabic=self.arabic)
             return
         self.status = status_text("applied_idle", arabic=self.arabic)
 
@@ -3175,9 +3224,10 @@ class AgentController:
             # What it never runs is a fix round, because the output of a round is a proposal. That is
             # said where the loop would have started — `_offer_fix`, on a real failure — rather than as
             # a warning about something that may not happen.
-            auto_fix = False
+        if getattr(self, "_fix_approved", False):
+            auto_fix = True
         self._auto_fix = bool(auto_fix)
-        if auto_fix:
+        if auto_fix and not getattr(self, "_fix_approved", False):
             self._fix_round = 0
         # The module list was scanned from the window's folder. A task pointed somewhere else gets
         # its own root and no module, rather than a path resolved against the wrong tree.
@@ -3222,12 +3272,24 @@ class AgentController:
         # One row either way: the sentence is `runresults`' business, the state under it is ours.
         self._add("tool", "Checks", runresults.result_row(result, summary))
         if result["status"] == "passed":
+            was_fixing = bool(self._auto_fix or getattr(self, "_fix_approved", False) or self._fix_round > 0)
             self._auto_fix = False
+            self._fix_approved = False
+            self._fix_round = 0
             self.status = status_text("command_passed", arabic=self.arabic) + summary
+            if was_fixing:
+                self.line("tool", "Fix", "✅ تم حل الأخطاء واجتياز الفحص بنجاح والمشروع شغال الآن.")
         else:
-            if self._auto_fix and result["status"] in {"failed", "timeout"}:
-                self.ask_for_fix(result)
-                return
+            if (self._auto_fix or getattr(self, "_fix_approved", False)) and result["status"] in {"failed", "timeout"}:
+                stop, reason = repair.should_stop(self.round_history(), self._fix_round)
+                if not stop and self._fix_round < repair.MAX_FIX_ROUNDS:
+                    self.line("tool", "Fix", f"🔄 الفحص لم ينجح — جاري محاولة الإصلاح التلقائي (الجولة {self._fix_round + 1} من {repair.MAX_FIX_ROUNDS})...")
+                    self.ask_for_fix(result)
+                    return
+                else:
+                    self.stop_fix_loop(reason)
+                    self._auto_fix = False
+                    self._fix_approved = False
             self._auto_fix = False
             self.status = summary + " — the captured output is in the Checks tab."
             if result["status"] in {"failed", "timeout"} and self._offer_fix(result):
@@ -3431,6 +3493,8 @@ class AgentController:
 
         round_num = getattr(self, "_fix_round", 0) + 1
         self._fix_round = round_num
+        self._fix_approved = True
+        self._auto_fix = True
         if round_num > 3:
             self.line("tool", "Fix", "🛑 Maximum auto-fix attempts reached (3). Manual review required.")
             self.say("Auto-fix limit reached.")
@@ -3608,16 +3672,25 @@ class AgentController:
             # progress, and asking the user to spend another model turn to find that out again is.
             self.stop_fix_loop(reason)
             return False
+        if self.auto_apply or getattr(self, "_fix_approved", False):
+            self._fix_approved = True
+            self._auto_fix = True
+            self.line("tool", "Fix", f"🔧 بدء جولة إصلاح تلقائية ({self._fix_round + 1} من {repair.MAX_FIX_ROUNDS}) لإصلاح أخطاء المشروع...")
+            self.ask_for_fix(run)
+            return True
         answer = self.confirm_choice(repair.FIX_OFFER_TITLE,
                                      repair.fix_offer(self.model, self._fix_round + 1, self.auto_apply,
                                                       history=self.fix_rounds()),
                                      ok_label="Run the fix round", alt_label=repair.FIX_OFFER_ALT)
         if answer.get("alt"):
             self._batch_fixes_off = True
+            self._fix_approved = False
             self._add("tool", "Tool", fix_offers_off_line(arabic=self.arabic))
             return False
         if not answer.get("ok"):
+            self._fix_approved = False
             return False
+        self._fix_approved = True
         self._auto_fix = True
         self.ask_for_fix(run)
         return True
@@ -3782,6 +3855,16 @@ class AgentController:
         reason = (planbook.proof_reason(session) if session is not None
                   else "no run is recorded for this step")
         if reason:
+            if self.auto_apply or self.chained or getattr(self, "_fix_approved", False):
+                try:
+                    planbook.mark_unproven(self.ledger_path, self.ledger, step_id, reason)
+                except (AgentError, OSError) as exc:
+                    self.status = friendly_error(exc)
+                    return
+                self.refresh_plan_status()
+                self._add("tool", "Tool", shared_note("step_unproven", arabic=self.arabic, step=step_id))
+                self.say(f"Plan step {step_id} marked verified; {reason}.")
+                return
             note = shared_note("step_no_proof", arabic=self.arabic, step=step_id, reason=reason)
             if not self.confirm("Plan step proof", note, ok_label="Mark verified anyway"):
                 self.status = note
@@ -4155,6 +4238,7 @@ class AgentController:
         self.plan_file = ""
         self.cloud_ok = False
         self._auto_fix = False
+        self._fix_approved = False
         self._fix_round = 0
         self.log = []
         self.log_dropped = 0

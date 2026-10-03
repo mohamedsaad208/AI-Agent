@@ -42,6 +42,8 @@ RECOMMENDED = {
     "qwen3:4b": "more careful answers, roughly 2× slower on this machine",
     "gemini-2.0-flash": "Google Gemini (Google AI Studio) — generous free tier, fast response, excellent for coding",
     "llama-3.3-70b-versatile": "Groq — ultra-fast LPU inference (300+ tok/s) with flagship open-weights reasoning",
+    "codestral-latest": "LLM7 (Free) — Mistral Codestral model for code and chat",
+    "Meta-Llama-3_3-70B-Instruct": "OVH AI Endpoints — flagship Llama 3.3 70B on European cloud",
 }
 
 
@@ -103,6 +105,12 @@ KINDS = (
     Kind("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "openai", True, True,
          "GEMINI_API_KEY", verified=("gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"),
          url_env="GEMINI_BASE_URL"),
+    Kind("llm7", "LLM7 (Free)", "https://api.llm7.io/v1", "openai", True, False,
+         "LLM7_API_KEY", verified=("codestral-latest", "mistral-Nemo-Instruct-2407", "nemotron-3-nano:30b"),
+         url_env="LLM7_BASE_URL"),
+    Kind("ovh", "OVH AI Endpoints", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "openai", True, True,
+         "OVH_API_KEY", verified=("Meta-Llama-3_3-70B-Instruct", "Qwen2.5-Coder-32B-Instruct", "Mistral-7B-Instruct-v0.3"),
+         url_env="OVH_BASE_URL"),
     # A user-typed base URL. The shape is OpenAI-compatible; the trust is decided by the host, so
     # loopback is local and anything else is treated exactly like a cloud row.
     Kind("generic", "Custom endpoint", "", "openai", False, False, "", url_env="AGENT_ENDPOINT"),
@@ -111,6 +119,8 @@ BY_KEY = {kind.key: kind for kind in KINDS}
 OLLAMA = BY_KEY["ollama"]
 OPENROUTER = BY_KEY["openrouter"]
 GEMINI = BY_KEY["gemini"]
+LLM7 = BY_KEY["llm7"]
+OVH = BY_KEY["ovh"]
 GENERIC = BY_KEY["generic"]
 DEFAULT_KIND = OLLAMA
 

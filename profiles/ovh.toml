@@ -1,0 +1,13 @@
+# OVH AI Endpoints: hosted inference on European cloud.
+# The key is read from OVH_API_KEY (or OVH_AI_ENDPOINTS_ACCESS_TOKEN).
+[model]
+provider = "ovh"
+name = "Meta-Llama-3_3-70B-Instruct"
+endpoint = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+api_key_env = "OVH_API_KEY"
+
+[limits]
+max_turns = 8
+timeout_seconds = 120
+context_chars = 32000
+output_tokens = 8192
