@@ -73,6 +73,10 @@ class Stub:
             raise PolicyError("Unknown project.")
         return {"key": key, "name": Path(str(key)).name}
 
+    def memory_panel(self, chat_id=""):
+        self.received.append(("memory_panel", chat_id))
+        return {"available": True, "root": "demo2"}
+
     def set_reply(self, request_id, reply):
         self.answer = reply
         self.reply.set()
@@ -370,7 +374,10 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.get("/api/bootstrap")[0], 200)
         self.assertEqual(self.get("/api/fs", query="&path=C%3A")[0], 200)
         self.assertEqual(self.get("/api/project", query="&project=demo2")[0], 200)
-        # /api/options was the endpoint no client called; a fourth route would be the same drift.
+        self.assertEqual(self.get("/api/memory")[0], 200)
+        # The client asks for it by name, in a literal the parity gate reads.
+        self.assertIn("api('/api/memory')", ui_script())
+        # /api/options was the endpoint no client called; a route nobody asks for is the same drift.
         self.assertEqual(self.get("/api/options")[0], 404)
 
     def test_the_timeout_the_browser_widget_advertises_is_the_one_the_server_clamps_to(self):
@@ -587,6 +594,85 @@ class ControllerSurfaceTests(unittest.TestCase):
             self.assertEqual(set(info["toolchain"]), set(first["toolchain"]))
         with self.assertRaises(PolicyError):
             controller.project_info("never-granted")
+
+    def test_the_preview_memory_panel_answers_the_tab_with_the_fields_the_real_one_sends(self):
+        """One tab, two windows, one shape.
+
+        A key only the shipped controller sends is a control that renders as nothing in the window the
+        design gets reviewed in, and the drift stays invisible until somebody ships it. The preview
+        builds its answer with `compass.editable_sections` and `compass.block` rather than a copy of
+        the layout, so what is compared here is the payload the real files produce.
+        """
+        import tempfile
+        from ai_code_engineer import compass
+        from ai_code_engineer.memory_store import MemoryStore
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as where:
+            root = Path(where).resolve() / "repo"
+            root.mkdir()
+            store = MemoryStore(root)
+            store.set_goal("Ship the duplicate-email check before the freeze")
+            store.add_items("constraints", ["Do not add dependencies"], "project")
+            store.set_text("task", "Make create() reject a duplicate email", "chat", "0" * 32)
+            real = set(compass.readout(store, "0" * 32))
+        scripted = FakeController().memory_panel()
+        self.assertEqual(sorted(real - set(scripted)), [],
+                         "the Memory tab is shown a field by the real window that the preview omits")
+        self.assertTrue(scripted["available"])
+        self.assertEqual(sorted({row["name"] + "/" + row["layer"] for row in scripted["sections"]}),
+                         sorted(["goal/project", "constraints/project", "decisions/project",
+                                 "open_issues/project", "progress/project", "task/chat",
+                                 "steps/chat", "decisions/chat", "open_issues/chat"]))
+        self.assertLessEqual(scripted["tokens"], scripted["limit"])
+        self.assertIn("Project compass", scripted["compass"])
+
+    def test_the_preview_refuses_a_layer_that_is_not_one_of_the_three(self):
+        """A click the shipped window refuses has to be refused here too.
+
+        The preview is what the design gets reviewed in, so a dead button that reads as working in the
+        preview teaches a behaviour the product does not have — worse than an empty panel. The refusal
+        is the same sentence the real compass raises, because neither window writes its own.
+        """
+        from ai_code_engineer import labels
+        reply = FakeController().action("memory_reset", {"layer": "everything"}, lambda row: None)
+        self.assertEqual(reply["error"], labels.note("memory_reset_target", target="everything"))
+        self.assertTrue(reply["panel"]["available"],
+                        "a refused reset left the preview with no panel to redraw")
+
+    def test_the_memory_panel_calls_only_helpers_the_bundle_defines(self):
+        """A browser script has no import that fails, so a call to a helper nobody wrote is silent.
+
+        The Memory tab's reset button once answered its own click by naming a function that did not
+        exist in any of the seven files. Nothing in Python could see it: the parity gate reads the
+        action names the page posts, and the broken line never reached one. This reads the block that
+        paints the panel and asks, of every bare call in it, that some script in the bundle wrote it.
+        """
+        import re
+        whole = ui_script()
+        panel = whole.split("function loadMemory()", 1)[1].split("\n  function show(name)", 1)[0]
+        self.assertTrue(panel.strip(), "the memory panel moved out of the block this guard reads")
+        called = set(re.findall(r"(?<![\w$.])([a-z][A-Za-z0-9_$]*)\s*\(", panel))
+        declared = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", whole))
+        declared |= set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", whole))
+        # `if`/`for` are the panel's own control flow, and `var(--mono)` is a CSS function inside a
+        # style attribute -- neither is a call the client makes on a helper.
+        self.assertEqual(sorted(called - declared - {"if", "for", "while", "switch", "var"}), [],
+                         "the Memory tab calls a helper no script in the bundle defines")
+
+    def test_a_helper_the_panel_invents_is_found_by_the_guard_that_reads_it(self):
+        """The guard above has to fail on the bug it exists for, or it is a sentence about a regex.
+
+        The name is planted inside the real block, so the split that finds the panel still works and
+        only the missing definition is new.
+        """
+        import re
+        planted = ui_script().replace("function loadMemory() {",
+                                      "function loadMemory() { memoryNoSuchHelper();", 1)
+        panel = planted.split("function loadMemory()", 1)[1].split("\n  function show(name)", 1)[0]
+        called = set(re.findall(r"(?<![\w$.])([a-z][A-Za-z0-9_$]*)\s*\(", panel))
+        declared = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", planted))
+        declared |= set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", planted))
+        self.assertIn("memoryNoSuchHelper", called - declared,
+                      "a helper the page invented would pass the guard that reads the panel")
 
     def test_the_preview_projects_are_the_ones_the_sidebar_lists(self):
         listed = {group["key"] for group in FakeController().snapshot()["projects"]}
@@ -947,6 +1033,16 @@ class TheCompactThread(unittest.TestCase):
         self.assertIn("opacity: 0", self.css.split("\n.macts {", 1)[1].split("}", 1)[0])
         self.assertIn(".msg:hover .macts, .msg:focus-within .macts", self.css)
 
+    def test_the_prompt_sits_on_the_reading_edge_with_its_actions_behind_it(self):
+        """A prompt is the operator's own line: the avatar opens it on the left, the bubble runs to
+        the far edge, and the copy/reply icons tuck in on the side the text is not on."""
+        me = self.css.split("\n.msg.me {", 1)[1].split("}", 1)[0]
+        self.assertIn("flex-direction: row", me,
+                      "a reversed row puts the Y avatar on the far side of its own prompt")
+        self.assertIn(".msg.me .body { align-items: flex-end", self.css)
+        self.assertIn(".msg.me .bubline { flex-direction: row-reverse", self.css,
+                      ".macts is appended after the bubble, so only the row can turn it around")
+
 
 class TheQuietActivityList(unittest.TestCase):
     """UI 4.6: Activity shows what happened to the task, and the transcript lives in a block under it.
@@ -1113,6 +1209,7 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
         package = Path(__file__).resolve().parents[1] / "src/ai_code_engineer"
         cls.servers = "".join((package / name).read_text(encoding="utf-8") for name in
                               ("host.py", "webapp/controller.py", "webapp/fake.py", "webapp/server.py"))
+        cls.engine = (package / "engine.py").read_text(encoding="utf-8")
 
     def test_every_event_kind_the_page_listens_for_is_one_a_server_can_send(self):
         import re
@@ -1122,6 +1219,12 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
         # alone would call them dead: the shared stream sink, and the ask helper that blocks on them.
         sent |= set(re.findall(r"self\._stream\([^)]*\"([a-z_]+)\"", self.servers))
         sent |= set(re.findall(r"_ask\(\"([a-z_]+)\"", self.servers))
+        # The bus is the fourth producer on the same wire: `Hub.publish` forwards what the engine
+        # records, either as the session kind itself or as the typed event the EventAdapter rewrites
+        # it into (`stage` → `StageChanged`). Neither is a `"kind":` literal in a webapp file.
+        sent |= set(re.findall(r'event\(session, "([a-z_]+)"', self.engine))
+        sent |= {re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+                 for name in re.findall(r"return ux\.([A-Z]\w+)\(", self.engine)}
         self.assertEqual(sorted(heard - sent), [],
                          "the page handles an event nothing emits, which is a silent feature")
 
@@ -1263,6 +1366,17 @@ class TheStepRowsInTheThread(unittest.TestCase):
         for rule in (".steprow {", ".st-head {", ".st-chev {", ".st-body {", ".st-out {",
                      ".st-files {", ".st-note {", ".steprow.live .st-head {"):
             self.assertIn(rule, self.css, f"{rule} is missing, so the row renders as bare text")
+
+    def test_a_long_path_wraps_inside_the_row_instead_of_poking_out_of_it(self):
+        """A step row says which files it touched, and a path is one unbroken token. Given a pill
+        radius, the second wrapped line is cut by an oval drawn around a shape that is no longer a
+        capsule — so the row rounds a rectangle and breaks the name where it has to."""
+        head = self.css.split("\n.st-head {", 1)[1].split("}", 1)[0]
+        text = self.css.split("\n.st-txt {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("99px", head, "the pill radius came back on a row that wraps")
+        for block in (head, text):
+            self.assertIn("overflow-wrap: anywhere", block)
+            self.assertIn("word-break: break-word", block)
 
     def test_the_row_does_not_borrow_the_plan_cards_class(self):
         """Found in the preview window: `.step` was already the plan card's row in the rail, so the two
@@ -2012,6 +2126,93 @@ class TheGraphSheet(unittest.TestCase):
         self.assertNotIn("#", block, "a hard-coded colour in the graph rules")
         self.assertNotIn("rgb(", block)
         self.assertIn("var(--", block, "and still painted from tokens")
+
+
+class ThePlanChecklistLivesInTheRail(unittest.TestCase):
+    """T3.2's own column is retired: the checklist is the rail's Tasks tab at every width.
+
+    A fourth strip took more from the conversation than the card gave back, and a window at 1400px
+    had already proved one home was enough for it. The markup stays and is hidden rather than
+    deleted, so the grid has nothing to reserve — and `planWide()` is the one switch that says where
+    the card is drawn, which is why the tab list and the column both ask it instead of each keeping
+    a copy of the answer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+        cls.tokens = (static / "tokens.css").read_text(encoding="utf-8")
+        cls.js = ui_script()
+
+    def test_the_grid_holds_three_areas_and_no_room_for_a_fourth(self):
+        self.assertNotIn("--plan-w", self.css + self.tokens,
+                         "a token for a column nothing shows is a promise the layout broke")
+        self.assertIn(".app { position: relative; display: grid; "
+                      "grid-template-columns: var(--side-w) minmax(0, 1fr) var(--rail-w);", self.css)
+        self.assertIn("html.side-collapsed .app { grid-template-columns: "
+                      "62px minmax(0, 1fr) var(--rail-w) }", self.css)
+        self.assertIn(".plan-col { display: none !important }", self.css)
+
+    def test_the_rail_offers_the_tasks_tab_at_every_width(self):
+        wide = self.js.split("function planWide(")[1].split("\n}\n")[0]
+        self.assertIn("return false", wide, "the column asked to come back without the rail knowing")
+        rail = self.js.split("function renderRail(")[1].split("\n}\n")[0]
+        self.assertIn("sections.push(['tasks', 'Tasks'", rail)
+        self.assertIn("'tasks' : 'changes'", rail,
+                      "a run with a plan and nothing written yet opens on the checklist")
+
+
+class TheRailGivesWayToItsOwnContent(unittest.TestCase):
+    """A rail is the narrowest surface in the window, so everything in it truncates or wraps.
+
+    Found on a run with a long command in the custom-run row and a deep path in a link's counter:
+    a flex child that keeps its default `min-width: auto` refuses to shrink below its content, and
+    the card grows past the column that holds it instead of the text giving way.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        static = Path(__file__).resolve().parents[1] / "src/ai_code_engineer/webapp/static"
+        cls.css = (static / "app.css").read_text(encoding="utf-8")
+
+    def block(self, rule):
+        return self.css.split("\n" + rule, 1)[1].split("}", 1)[0]
+
+    def test_the_command_row_wraps_and_its_field_shrinks(self):
+        self.assertIn("flex-wrap: wrap", self.block(".custom-cmd-row {"))
+        self.assertIn("min-width: 0", self.block(".custom-cmd-input {"))
+        self.assertIn("flex: 1 1 120px", self.block(".custom-cmd-input {"))
+        sub = self.block(".custom-cmd-sub {")
+        self.assertIn("min-width: 0", sub)
+        self.assertIn("max-width: 80px", sub)
+
+    def test_a_links_counter_truncates_and_the_row_with_it_too(self):
+        self.assertIn("text-overflow: ellipsis", self.block(".link .r {"))
+        self.assertIn("white-space: nowrap", self.block(".link .r {"))
+        card = self.block(".card .link {")
+        for promise in ("min-width: 0", "max-width: 100%", "overflow: hidden"):
+            self.assertIn(promise, card)
+
+
+class TheSettingsSheetOpensOnATab(unittest.TestCase):
+    """The sheet paints one named section; a click hands it an event, and a blank sheet is the result.
+
+    `onclick = openSettings` passes the MouseEvent as the tab, and `sections[tab]()` is a TypeError
+    the modal swallows after it appended an empty body — so the gear opened a dialog with no content
+    and no way to tell what went wrong.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = ui_script()
+
+    def test_a_tab_that_is_not_a_name_falls_back_to_the_project_and_plan(self):
+        sheet = self.js.split("function openSettings(")[1].split("\n}\n")[0]
+        self.assertIn("if (typeof tab !== 'string') tab = 'project';", sheet)
+
+    def test_the_gear_names_the_tab_it_wants(self):
+        self.assertIn("$('app-settings-btn').onclick = () => openSettings('project');", self.js)
 
 
 if __name__ == "__main__":

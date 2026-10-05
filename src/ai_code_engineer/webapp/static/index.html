@@ -45,6 +45,11 @@
     </div>
   </aside>
 
+  <!-- Run layout: the conversation and its event timeline take the centre, changes & diffs sit in
+       the rail, and the plan checklist lives on the rail's Tasks tab. The column below is the
+       checklist's retired home and stays hidden — see app.css and planWide() in ui-run.js. -->
+  <aside class="plan-col" id="plan-col" aria-label="Plan checklist"></aside>
+
   <main class="main">
     <header class="top">
       <button class="icon-btn" id="sidebar-expand" title="Expand sidebar (Ctrl+B)" aria-label="Expand sidebar">
@@ -53,6 +58,17 @@
       <div style="min-width:0;flex:1">
         <h1 id="title">New chat</h1>
         <div class="sub" id="subtitle">Standalone chat — no folder attached, nothing to change</div>
+      </div>
+      <div class="runbar" id="runbar">
+        <span class="stage-badge hidden" id="top-stage" title="Current workflow stage"></span>
+        <span class="elapsed hidden" id="top-elapsed" title="Elapsed time for this run">⏱ 00:00</span>
+        <form class="steer-box" id="steer-form" autocomplete="off" spellcheck="false">
+          <input id="steer-text" dir="auto" maxlength="600" disabled
+            placeholder="Steer the run…" aria-label="Steering instruction for the running task"
+            title="One sentence added to the run in flight. Enter to steer at the next step, Shift+Enter to interrupt the current ask.">
+          <button type="submit" class="line-btn" id="steer-go" disabled title="Steer — applied at the run's next step">📌 Steer</button>
+        </form>
+        <button class="top-stop hidden" id="top-stop" title="Stop the running task">■ Stop</button>
       </div>
       <div class="seg" id="mode-seg" role="tablist" aria-label="Mode switcher">
         <button id="mode-btn-plan" title="Plan & Discuss: brainstorm, formulate plan, and structure tasks">Plan</button>

@@ -34,7 +34,9 @@ PROTECTED_DIRS = {
     # it is being checked against is not being checked against anything. Its real home is beside the
     # app's own records, outside every approved folder; this entry is the belt.
     ".agent-permissions.json",
-    ".venv", "venv", ".gradle", ".m2",
+    # The servers an outside tool may arrive from, for the same reason and with the same belt.
+    ".agent-mcp.json",
+    ".venv", "venv", ".pkgcheck", ".gradle", ".m2",
     ".idea",
 }
 # Matches files that *are* credentials, not source that merely names one — `token.json` yes,
@@ -55,7 +57,9 @@ GENERATED_DIRS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".next", ".nuxt",
     ".turbo", ".sass-cache", "coverage", "htmlcov", ".terraform",
     # The tool's own output. `.agent-runs` is protected above; these three were in no list at all.
-    ".agent-webview", ".agent-chats", ".design-preview",
+    # `.agent` is the project's own memory folder (`memory_store`): it belongs to the map even less
+    # than the run logs do, and a model that can open its own compass as a source file can propose it.
+    ".agent-webview", ".agent-chats", ".design-preview", ".agent",
 }
 # A directory whose name says it holds generated code: Maven's `generated-sources`, protobuf's `gen`,
 # a hand-rolled `src/generated`. Matched against the whole segment, so `chargeback-api` is safe.

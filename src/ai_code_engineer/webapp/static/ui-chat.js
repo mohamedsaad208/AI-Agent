@@ -222,8 +222,9 @@ function renderThread() {
 }
 
 /* The wait, counted. This is the app's only repeating timer, and it measures this window's own wait:
-   the request left here and the answer has not come back. Nothing server-side is redrawn per second,
-   which is what keeps a long build from costing snapshots, and it stops with the job that started it. */
+   the request left here and the answer has not come back. It also drives the top bar's elapsed face,
+   which counts from the server's `job_started` — the same beat, because both stop when the job ends.
+   Nothing server-side is redrawn per second, which is what keeps a long build from costing snapshots. */
 let TICK = null, WAITED = 0;
 function clockFace(seconds) {
   const m = Math.floor(seconds / 60), s = seconds % 60;
@@ -238,7 +239,10 @@ function paintClock() {
 function startClock() {
   stopClock();
   WAITED = 0;
-  TICK = setInterval(() => { WAITED += 1; paintClock(); }, 1000);
+  TICK = setInterval(() => {
+    WAITED += 1; paintClock();
+    if (typeof paintRunBar === 'function') paintRunBar();
+  }, 1000);
 }
 function stopClock() { if (TICK !== null) { clearInterval(TICK); TICK = null; } }
 

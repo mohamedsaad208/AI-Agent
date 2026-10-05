@@ -11,8 +11,10 @@ command to run (`service_runner.py` calls it `CONFIG_FILE`); a write that change
 is its own class. The second is where a request target actually is — because a scheme check answers what
 a string looks like, and the one button that sends a request (`run_api_test`) was trusting it, so
 `address_class` answers the destination question in codes, next to the table that decides what to do about
-them. Every current command and network entry point is operator-triggered; task-originated policy belongs
-at a task-originated execution boundary if one is added later.
+them. Every operator-triggered command and network entry point answers where it stands; the
+task-originated one — the planning loop's tools — is checked at its own boundary,
+`tools.ToolRegistry.run`, which asks the verdict for the class each tool names before its handler may
+run.
 
 The table is code, the verdicts are codes, and the sentences are not here — a reason is a `labels` key
 like every other thing the tool says. Overrides are remembered by `permissions.py`, which is the file

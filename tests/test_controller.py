@@ -278,6 +278,34 @@ class ControllerTests(unittest.TestCase):
             self.assertTrue(self.controller.arabic,
                             "the notice language is the task's, so a stale session cannot pin it")
 
+    def test_a_pinned_language_beats_the_task_in_front_of_it(self):
+        """The other half of the rule: `language` is a decision somebody took on this machine, and a
+        task cannot undo it. Anything other than the two pins leaves the task answering for itself."""
+        with patch("ai_code_engineer.runner.run", return_value=run_result()):
+            self.plan_a_fix("عايز اصلح دالة الجمع في calculator.py")
+        self.assertTrue(self.controller.arabic, "unpinned, an Arabic task speaks Arabic")
+        self.controller.language = "en"
+        self.assertFalse(self.controller.arabic,
+                         "an operator who pinned English is not overruled by the task on screen")
+        self.controller.language = "ar"
+        self.assertTrue(self.controller.arabic)
+        self.controller.language = "auto"
+        self.assertTrue(self.controller.arabic, "releasing the pin gives the task its voice back")
+
+    def test_a_pinned_language_survives_the_restart(self):
+        """The pin is a machine preference, so it has to be in the registry the next launch reads."""
+        self.controller.language = "en"
+        self.controller._save_state()
+        again = self.build()
+        self.assertEqual(again.language, "en")
+        self.assertFalse(again.arabic, "a reopened window still refuses to switch")
+
+    def test_an_unconfigured_machine_defaults_to_english(self):
+        """Nothing saved, nothing pinned: the sentence this window owes is English by default."""
+        fresh = self.build()
+        self.assertEqual(fresh.language, "auto")
+        self.assertFalse(fresh.arabic)
+
     def test_the_write_notice_is_plain_text_because_the_thread_escapes_it(self):
         """Tool rows go through esc() with no markdown pass, so `**bold**` would be literal stars."""
         self.controller.set_auto_apply(True)
@@ -308,7 +336,8 @@ class ControllerTests(unittest.TestCase):
         carry that instead of the generic "tests have not run"."""
         self.controller.set_auto_apply(True)
         self.controller.recipes = []                       # what runner.detect() answers for a bare folder
-        with patch("ai_code_engineer.runner.run", return_value=run_result()) as run:
+        with patch("ai_code_engineer.runner.run", return_value=run_result()) as run, \
+             patch("ai_code_engineer.runner.targets", return_value=[]):
             self.plan_a_fix("Fix add in calculator.py")
             self.controller.join()
         self.assertFalse(run.called, "there is no command to run, so nothing may claim one ran")

@@ -33,8 +33,8 @@ from .. import permissions
 from .. import policy
 from .. import service_runner
 from ..config import Settings
-from ..engine import (MAX_TASK_CHARS, apply_proposal, atomic_json, chat_sessions, diff_size,
-                      load_session, plan, project_key, proposal_rejected, propose_block,
+from ..engine import (MAX_TASK_CHARS, SteeringInbox, apply_proposal, atomic_json, chat_sessions,
+                      diff_size, load_session, plan, project_key, proposal_rejected, propose_block,
                       read_plan_reference, reopen_proposal, rollback)
 from ..engine import event as record_event    # `event` is a parameter name in `stream()` below
 from ..errors import AgentError, PolicyError
@@ -57,8 +57,8 @@ from ..labels import note as shared_note     # `note` is a local variable in thr
 from ..providers import make_provider
 from ..redaction import redact
 from .. import memory as memory_store
-from .. import (git_integration, host, ignore, intent, modes, overrides, planbook, repair,
-                runner, session_flow, setup, symbols)
+from .. import (compass, git_integration, host, ignore, intent, modes, overrides, planbook,
+                repair, runner, session_flow, setup, symbols)
 from ..verification import verify
 from ..workspace import Workspace, ensure_project_dir
 from . import connection, projects, requestqueue, runresults, uistate
@@ -223,6 +223,10 @@ def _asked_file_count(text: str) -> int | None:
 class AgentController:
     """One user, one window, one task at a time. ``busy`` is the lock that keeps it that way."""
 
+    # Until `__init__` reads the saved preference, this window pins nothing and every sentence
+    # follows the task it was given — which is English unless someone asked in Arabic.
+    language = "auto"
+
     def __init__(self, app_dir: Path) -> None:
         self.app_dir = Path(app_dir).resolve()
         # First run writes the override file and its signing key beside the other records; an existing
@@ -295,6 +299,10 @@ class AgentController:
         self.active_mode = "Ollama"
         self.busy = False
         self.cancellable = False
+        # The steering box of the job in flight: the top bar's Steer field writes into it, and the
+        # engine loop reads it at its turn checkpoints. Replaced when a job starts (see `run_job`).
+        self._steering: SteeringInbox | None = None
+        self._job_started_at: float | None = None
         self.pending: str | None = None
         # The newest line the running job said, so the strip can tell a progress line from an outcome
         # worth keeping when the job ends.
@@ -358,6 +366,7 @@ class AgentController:
         # offer blocks the worker that asked it, so every red build in a queue cost the whole ask
         # timeout. Turning the offers off is the operator's call, never the tool's.
         self._batch_fixes_off = False
+        self._fix_approved = False
         # What the queue has run so far, so the end of a batch can be said in one row instead of
         # being counted by the user scrolling. `_batch_row` is the task currently in flight.
         self._batch: list[dict] = []
@@ -404,6 +413,11 @@ class AgentController:
         self.fast_model = str(self._saved_ui.get("fast_model", "qwen2.5-coder:1.5b"))
         self.strong_model = str(self._saved_ui.get("strong_model", "qwen2.5-coder:7b"))
         self.semantic_model_dir = str(self._saved_ui.get("semantic_model_dir", "models"))
+        # The machine's own say about language: "en" and "ar" pin every sentence this window writes,
+        # and anything else — the default — leaves it to the task in front of the window, which
+        # answers in English for a task not written in Arabic. See `arabic` below.
+        saved_language = str(self._saved_ui.get("language") or "").strip().lower()
+        self.language = saved_language if saved_language in ("en", "ar") else "auto"
         saved_auto = self._saved_ui.get("auto_apply")
         if isinstance(saved_auto, dict):
             self._auto_pref = {str(row): bool(flag) for row, flag in saved_auto.items()}
@@ -530,6 +544,9 @@ class AgentController:
     def stream(self, event: dict) -> None:
         self._emit(event)
 
+    def _show_preview(self) -> None:
+        self._emit({"kind": "view", "value": "preview"})
+
     def ask_directory(self, title: str, hint: str = "", mustexist: bool = True) -> Path | None:
         start = self.repo or str(Path.home())
         answer = self._ask("folder", {"title": title, "hint": hint, "path": start, "mustexist": mustexist})
@@ -572,6 +589,11 @@ class AgentController:
                 return
             self._job_started = True
             self.busy, self.cancellable = True, cancellable
+            # A fresh steering box per job: instructions said during the last run belong to that
+            # run's record, not to whatever starts next. And the top bar's elapsed clock measures
+            # itself against this moment, taken once here so a reload mid-run counts from the start.
+            self._steering = SteeringInbox()
+            self._job_started_at = time.time()
             self.cancel_event.clear()
             self.status = status
             self._last_progress = ""
@@ -611,6 +633,12 @@ class AgentController:
             # sitting there after the answer arrived is the phantom this window keeps having to kill.
             if self.status in (status, self._last_progress):
                 self.status = ""
+            # An instruction the run never reached — said to a job that has no tool loop, or typed
+            # while the last turn was closing — is work the operator already wrote. It becomes an
+            # ordinary queued message rather than a line quietly dropped with the finished box.
+            if self._steering is not None:
+                for row in self._steering.waiting():
+                    self.queue_add(row["text"])
             # The queue runs from here rather than from a timer: this is the only moment that is
             # known to be "the task has finished", and a chained job (propose → apply → run) keeps
             # busy set until the chain is truly done, so the drain waits for the last step.
@@ -885,13 +913,18 @@ class AgentController:
 
     @property
     def arabic(self) -> bool:
-        """Was the task in front of the window asked in Arabic?
+        """Is the sentence this window owes the operator an Arabic one?
 
-        The model is already told to answer in the language it was asked in; this is the same rule
-        applied to the sentences we write. It reads the session's task first, then the last thing
-        the user typed, because a status line set before any session exists still answers to that
-        person. Anything with no text of theirs to look at stays English.
+        English is the answer, and the only two things that change it are decisions somebody took:
+        the machine's `language` preference pinning one tongue outright, or a task written in Arabic
+        — the model is told to answer in the language it was asked in, and this is the same rule
+        applied to the sentences we write. Nothing else flips it: a page of Arabic pasted into a
+        path, or a reply in another tongue, leaves this window speaking what the operator asked for.
+        It reads the session's task first, then the last thing the user typed, because a status line
+        set before any session exists still answers to that person.
         """
+        if self.language != "auto":
+            return self.language == "ar"
         task = asked_of((self.session or {}).get("task") or "")
         if not task:
             task = asked_of(next((m.get("text", "") for m in reversed(self.messages)
@@ -931,6 +964,11 @@ class AgentController:
                       "theme": self._saved_ui.get("theme", "light"),
                       "collapsed": bool(self._saved_ui.get("collapsed", False))},
             "busy": self.busy, "cancellable": self.cancellable, "pending": self.pending,
+            # The top bar's permanent run row: elapsed is counted client-side from the moment this
+            # job claimed the window (so a reload mid-run reads the true wait), and the waiting
+            # count tells the Steer box its words are queued without a poll of its own.
+            "job_started": self._job_started_at,
+            "steering_waiting": len(self._steering.waiting()) if self._steering else 0,
             # The strip under the header draws from here. It used to be write-only — about sixty
             # sentences were assigned to this field and none of them reached a surface, which is
             # why the ones this window does show had to be rebuilt in the front end.
@@ -983,7 +1021,7 @@ class AgentController:
             "policy": self.policy_block(),
             # And where the run itself stands, read off the session rather than off a window's memory.
             "stage": self.stage_block(),
-            "memory": {"info": self._memory_info()},
+            "memory": {"info": self._memory_info(), "goal_pending": self._goal_waiting()},
             "settings": {"project": self.repo, "plan": self.plan_file, "chained": self.chained,
                          "auto_apply": self.auto_apply, "bound": bool(self.branch.get("bound")),
                          "timeout": self.request_timeout, "model_info": self._model_info(),
@@ -1025,6 +1063,8 @@ class AgentController:
             "queue_chat": lambda: self.queue_detached(str(payload.get("id", ""))),
             "queue_resume": self.queue_resume,
             "stop": self.stop, "apply": self.apply, "rollback": self.undo,
+            # One sentence to the loop that is already running — the top bar's Steer field.
+            "steer": lambda: self.steer(payload),
             "reject": self.reject,
             "git_branch": lambda: self.git_branch(str(payload.get("back", ""))),
             "git_restore": self.git_restore,
@@ -1081,6 +1121,11 @@ class AgentController:
             "set_theme": lambda: self.set_pref("theme", str(payload.get("theme", "light"))),
             "set_draft": lambda: setattr(self, "_draft", payload.get("text", "")),
             "save_memory": lambda: self.save_memory(payload.get("text", "")),
+            # The project's own memory, answered through the same module the `memory` command uses.
+            "memory_write": lambda: self.memory_write(payload),
+            "memory_goal": lambda: self.memory_goal(payload),
+            "memory_answer": lambda: self.memory_answer(payload),
+            "memory_reset": lambda: self.memory_reset(payload),
             "select_file": lambda: setattr(self, "review_file", int(payload.get("index", 0))),
             "select_tab": lambda: setattr(self, "diff_tab", str(payload.get("tab", "diff"))),
             "refresh_models": self.check_setup,
@@ -1170,6 +1215,8 @@ class AgentController:
         # had to undo once.
         self.refresh_resumable()
         self.subtitle = self._subtitle()
+        if repo and not self.branch.get("bound"):
+            self.auto_detect_plan()
         # Arriving at a conversation that has something waiting starts it here; without this the
         # queue would only move when a job finished, and a stopped task never finishes again.
         if not self._draining:
@@ -1535,6 +1582,7 @@ class AgentController:
         self._save_state()
         self._sync_project()
         self.refresh_recipes()
+        self.auto_detect_plan()
         if not self._loading_session:
             self.new_task()
 
@@ -1570,19 +1618,18 @@ class AgentController:
                   "Send proposes a diff, nothing is written until you click Apply. The badge by Send "
                   "switches back to Chat when you only want to ask.")
 
-    def browse_plan(self) -> None:
-        path = self.ask_plan_file()
-        if not path:
-            return
+    def attach_plan_path(self, path: Path | str) -> bool:
+        """Attach a plan file to the current project and switch to Change mode."""
         if not self.repo:
-            key = project_key(str(path.parent))
-            self.projects.setdefault(key, str(Path(path.parent).resolve()))
-            self._select_branch(BRANCH_PROJECT, key, chat_id=self.chat_id)
+            return False
+        target = Path(path)
+        if not target.is_file():
+            return False
         try:
-            reference = read_plan_reference(Workspace(Path(self.repo)), str(path), Settings())
+            reference = read_plan_reference(Workspace(Path(self.repo)), str(target), Settings())
         except (AgentError, OSError) as exc:
             self.status = friendly_error(exc)
-            return
+            return False
         self.plan_file = str(Path(self.repo) / reference["path"])
         self.refresh_plan_status()
         if not self.ledger:
@@ -1594,13 +1641,35 @@ class AgentController:
                 message = friendly_error(exc)
                 self.say(message)
                 self.stream({"kind": "toast", "text": message, "level": "bad"})
-                return
-        # Attaching a plan is a decision to implement it, so this is the one path that selects
-        # Change mode on the user's behalf instead of leaving prose as the default.
+                return False
         self.set_composer(CHANGE_COMPOSER)
         self._save_state()
         self.status = shared_note("plan_attached_chained" if self.chained
                                   else "plan_attached_plain", arabic=self.arabic)
+        return True
+
+    def auto_detect_plan(self) -> bool:
+        """Find and attach PLAN.md if present in the repository."""
+        if not self.repo or not Path(self.repo).is_dir():
+            return False
+        repo_dir = Path(self.repo)
+        for name in ("PLAN.md", "plan.md", "Plan.md"):
+            candidate = repo_dir / name
+            if candidate.is_file():
+                if self.plan_file and Path(self.plan_file).resolve() == candidate.resolve() and self.ledger:
+                    return True
+                return self.attach_plan_path(candidate)
+        return False
+
+    def browse_plan(self) -> None:
+        path = self.ask_plan_file()
+        if not path:
+            return
+        if not self.repo:
+            key = project_key(str(path.parent))
+            self.projects.setdefault(key, str(Path(path.parent).resolve()))
+            self._select_branch(BRANCH_PROJECT, key, chat_id=self.chat_id)
+        self.attach_plan_path(path)
 
     def clear_plan(self) -> None:
         self.plan_file = ""
@@ -1704,7 +1773,8 @@ class AgentController:
                                source=self.catalog_source.get(self.mode, ""),
                                key_present=bool(self.key.strip()
                                                 or os.environ.get(kind.key_env or "")
-                                                or (kind.key == "gemini" and os.environ.get("GOOGLE_API_KEY"))))
+                                                or (kind.key == "gemini" and os.environ.get("GOOGLE_API_KEY"))
+                                                or (kind.key == "ovh" and os.environ.get("OVH_AI_ENDPOINTS_ACCESS_TOKEN"))))
 
     def cloud_choice(self) -> tuple[bool, bool]:
         """``(cloud, paid)`` for the row on screen — one answer, used by all three send paths."""
@@ -1879,6 +1949,8 @@ class AgentController:
                 self.model = pending
             elif not self.model and any(entry["id"] == config.DEFAULT_MODEL for entry in catalog):
                 self.model = config.DEFAULT_MODEL
+            elif not self.model and catalog:
+                self.model = catalog[0]["id"]
             self.model_changed()
             self.status = catalog_status_line(arabic=self.arabic, count=len(catalog),
                                               model=self.model, label=selected_mode,
@@ -1966,6 +2038,137 @@ class AgentController:
             return "Choose a project folder to edit its notes."
         saved = self._project_notes()
         return f"{len(saved)} chars saved · {memory_store.key_for(self.repo)}.md · sent with every task here"
+
+    # ----------------------- the project's own memory: the compass panel -----------------------
+    #
+    # Every method below answers through `compass`, the same module the terminal's `memory` command
+    # answers through, so a line written in the window is the same line with the same rules behind it
+    # — same layer, same cap, same approval asked for a goal. Nothing here decides anything about
+    # memory; it turns a payload into a call and a refusal into a status line.
+
+    def _compass_store(self):
+        """The store for the folder on screen, or None when there is no folder to remember for."""
+        if not self.repo:
+            return None
+        try:
+            return compass.store_for(self.repo)
+        except (AgentError, OSError, ValueError):
+            return None
+
+    def _goal_waiting(self) -> str:
+        """The proposal the Memory tab is holding an answer for, for the rail's badge.
+
+        Read on every snapshot, so it is a `stat` and a small sidecar rather than a readout: the badge
+        has to say whether anything needs the operator, and the tab it points at asks for the rest of
+        the record on the click.
+        """
+        store = self._compass_store()
+        if store is None:
+            return ""
+        try:
+            if not store.meta_path().is_file():
+                return ""
+            return str(store.read_meta().get("pending_goal") or "")
+        except (AgentError, OSError, ValueError):
+            return ""
+
+    def _compass_chat(self) -> str:
+        """The conversation whose layer the panel shows: the open session's own id when it has one."""
+        return str((self.session or {}).get("chat_id") or self.chat_id or "")
+
+    def memory_panel(self, chat_id: str = "") -> dict:
+        """Everything the Memory tab draws, asked for on the click instead of pushed every snapshot.
+
+        The readout opens both markdown files and the sidecar and rebuilds the block the model is
+        fed; a window polling a run's progress has no reason to pay for that twice a second, and a
+        tab that is not open has no reason to hold a copy of it at all.
+        """
+        store = self._compass_store()
+        if store is None:
+            return {"available": False,
+                    "why": status_text("need_folder_notes", arabic=self.arabic)}
+        try:
+            answer = compass.readout(store, str(chat_id or "") or self._compass_chat())
+        except (AgentError, OSError, ValueError) as exc:
+            return {"available": False, "why": friendly_error(exc)}
+        answer["available"] = True
+        return answer
+
+    def memory_write(self, payload: dict) -> dict:
+        """One line the operator typed, into the section they pointed at."""
+        store = self._compass_store()
+        if store is None:
+            return self._compass_refused()
+        try:
+            written = compass.edit_section(store, payload.get("section", ""),
+                                          str(payload.get("text") or ""),
+                                          self._compass_chat(),
+                                          layer=str(payload.get("layer") or ""),
+                                          arabic=self.arabic)
+        except (AgentError, OSError) as exc:
+            return self._compass_failed(exc)
+        self.status = shared_note("notes_saved", arabic=self.arabic)
+        return {"written": written, "panel": self.memory_panel()}
+
+    def memory_goal(self, payload: dict) -> dict:
+        """The goal, stated by a hand — which is the approval the protection asks for.
+
+        There is no path from this window that replaces a stored goal without the person clicking it,
+        and the field is drawn read-only for that reason: a run's proposal arrives as a pending
+        answer, and `memory_answer` is what moves it.
+        """
+        store = self._compass_store()
+        if store is None:
+            return self._compass_refused()
+        outcome = compass.state_goal(store, str(payload.get("text") or ""), approved=True,
+                                     source="user", arabic=self.arabic)
+        if not outcome.applied and outcome.reason not in ("same", "hand-edit"):
+            return self._compass_failed(AgentError(
+                shared_note("goal_empty", arabic=self.arabic)))
+        self.status = outcome.message
+        return {"goal": outcome.goal, "reason": outcome.reason, "panel": self.memory_panel()}
+
+    def memory_answer(self, payload: dict) -> dict:
+        """Approve or refuse the goal that is waiting: the answer the protection was built to ask for."""
+        store = self._compass_store()
+        if store is None:
+            return self._compass_refused()
+        outcome = compass.answer_goal(store, str(payload.get("answer") or "").casefold() == "approve",
+                                      arabic=self.arabic)
+        self.status = outcome.message
+        return {"reason": outcome.reason, "goal": outcome.goal, "panel": self.memory_panel()}
+
+    def memory_reset(self, payload: dict) -> dict:
+        """Empty one layer, and keep what it said in the answer — the window cannot undo this.
+
+        The button asks twice before it does this, and the layer names how much the second click
+        takes: `project` also drops the goal and the approval recorded with it, which is a different
+        amount of loss from forgetting one conversation, and a single "clear memory" button would
+        have made them the same click. The answer carries the record it just dropped, because a
+        memory with no other witness is gone.
+        """
+        store = self._compass_store()
+        if store is None:
+            return self._compass_refused()
+        wanted = str(payload.get("chat_id") or "") or self._compass_chat()
+        try:
+            answer = compass.reset(store, str(payload.get("layer") or "chat"), wanted,
+                                   arabic=self.arabic)
+        except (AgentError, OSError) as exc:
+            return self._compass_failed(exc)
+        # The store says which layers went; the sentence naming the loss is the one the terminal prints
+        # too, so a reset means the same thing in both windows.
+        self.status = shared_note("memory_reset_" + answer["said"], arabic=self.arabic)
+        return {"removed": answer["removed"], "said": answer["said"], "was": answer["was"],
+                "panel": self.memory_panel()}
+
+    def _compass_refused(self) -> dict:
+        self.status = status_text("need_folder_notes", arabic=self.arabic)
+        return {"error": self.status, "panel": self.memory_panel()}
+
+    def _compass_failed(self, exc: Exception) -> dict:
+        self.status = friendly_error(exc)
+        return {"error": self.status, "panel": self.memory_panel()}
 
     def _metrics_info(self) -> dict:
         """The token counts the provider measured for the task on screen, if it measured any.
@@ -2149,13 +2352,32 @@ class AgentController:
             self.status = status_text("pick_model", arabic=self.arabic)
             return
         if cloud and not self.cloud_ok:
-            self.status = status_text("consent_message", arabic=self.arabic)
-            return
+            if self.active_kind().key in {"llm7", "gemini"}:
+                self.cloud_ok = True
+            else:
+                self.status = status_text("consent_message", arabic=self.arabic)
+                return
         settings = self.task_settings(cloud)
         if settings is None:
             return
         key = self.key.strip() or None
         self._draft = ""
+        # Auto-detect intent to create/write a plan file:
+        is_plan_file = bool(repo and re.search(
+            r"(?i)(?:اعمل|انشئ|اكتب|سوي|جهز|حضر|طلع|هات|save|create|make|generate|write).*(?:بلان\s*(?:فايل|فيل)|(?:فايل|فيل)\s*بلان|ملف\s*بلان|ملف\s*ال?خطة|خطة\s*في\s*ملف|plan\s*file|plan\.md)"
+            r"|(?:بلان\s*(?:فايل|فيل)|(?:فايل|فيل)\s*بلان|ملف\s*بلان|ملف\s*ال?خطة|خطة\s*في\s*ملف|plan\s*file|plan\.md).*(?:اعمل|انشئ|اكتب|سوي|جهز|create|make|generate|write)",
+            asked
+        ))
+        if is_plan_file:
+            self.set_composer(CHANGE_COMPOSER)
+            task = (
+                "Create PLAN.md in the project root with a comprehensive, ordered plan. "
+                "Format each task with clear headers and fields matching: "
+                "#### Task X: Title\n**ID:** T0X\n**Affected Paths:** ...\n**Dependencies:** ...\n"
+                "**Done Criteria:** ...\n**Verification:** ...\n**Difficulty:** ...\n**Effort Range:** ...\n**Rationale:** ...\n\n"
+                "User request: " + (asked or task)
+            )
+
         # The selected mode is authoritative. In particular, Plan/Chat is prose-only even when the
         # user says "build" or "create"; only an explicit switch to Change may produce a proposal.
         if self.reading_only():
@@ -2168,8 +2390,8 @@ class AgentController:
         # never that a greeting became a change request. A message that opens with "add" or
         # "صلح" is a different thing, and it is planned as a change — for this message only,
         # because remembering the route would turn the next "thanks" into a rejected diff.
-        as_change = bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked) and not planning_mode.requests_plan(asked)
-        if not repo or (self.composer == CHAT_COMPOSER and not as_change) or planning_mode.requests_plan(asked):
+        as_change = is_plan_file or (bool(repo) and self.composer == CHAT_COMPOSER and asks_for_a_change(asked) and not planning_mode.requests_plan(asked))
+        if not repo or (self.composer == CHAT_COMPOSER and not as_change) or (planning_mode.requests_plan(asked) and not is_plan_file):
             self.start_chat(task, settings, cloud, paid, key, asked=asked, quote_of=quote_of)
             return
         if plan_file:
@@ -2271,10 +2493,12 @@ class AgentController:
                 accepts = (current_row.get("accepts") or []) if current_row else None
                 return plan(Workspace(Path(repo)), run_task, provider, settings, self.runs,
                             progress=lambda line: self._progress(line),
+                            tool_providers=self._mcp_providers(Path(repo)),
                             step=self._step, on_token=(feed.feed if feed else None),
                             cancelled=self.cancel_event.is_set, plan_file=plan_file, chat_id=chat_id,
                             plan_step=step_id, memory=notes,
-                            goal=goal, criteria=criteria, accepts=accepts)
+                            goal=goal, criteria=criteria, accepts=accepts,
+                            steering=self._steering)
             finally:
                 if feed:
                     feed.close()
@@ -2288,7 +2512,7 @@ class AgentController:
             self.display_session(path)
             if self.session and self.session.get("changes"):
                 self.status = status_text("proposal_ready", arabic=self.arabic)
-                self._emit({"kind": "view", "value": "preview"})
+                self._show_preview()
                 self.auto_apply_ready()
             else:
                 self.status = status_text("no_proposal", arabic=self.arabic)
@@ -2299,6 +2523,21 @@ class AgentController:
                    else "Connecting to the model and preparing changes…")
         self.run_job(work, done, running, cancellable=True,
                      on_busy=lambda: self.queue_add(asked or task, reference=queued_reference))
+
+    def _mcp_providers(self, folder: Path) -> list:
+        """The outside tools this operator configured, for a run pointed at `folder`.
+
+        `mcp` is imported here rather than at the top so a window that never configured a server never
+        loads a stdio client. A row that cannot be read is said through the running line and skipped,
+        never raised: a task that needs no outside tool must still plan, and the reason belongs in the
+        log the operator can open, not in a traceback they cannot.
+        """
+        from .. import mcp
+        providers, problems = mcp.providers_from_config(self.app_dir / mcp.CONFIG_NAME, cwd=folder)
+        for problem in problems:
+            self._progress("MCP: " + (problem["server"] + ": " if problem["server"] else "")
+                           + problem["reason"])
+        return providers
 
     def _progress(self, line: str, *, record: bool = True) -> None:
         self.pending = line
@@ -2636,6 +2875,30 @@ class AgentController:
                 # "skip to the next one". It holds; ▶ in the strip resumes it.
                 self._queue_held = True
 
+    def steer(self, payload: dict) -> dict | None:
+        """Say one thing to the loop that is already running (T3.3's Steer box).
+
+        The instruction goes to the current job's `SteeringInbox` and is read by the engine at its
+        next turn checkpoint — never inside a tool call, and never restarting finished work. An
+        urgent instruction also cuts short the ask in flight, which is what the loop passes its
+        provider as the cancel predicate for. Validation (empty text, length cap, queue cap) lives
+        in the box, and its `PolicyError` reaches the browser as the friendly line the server writes.
+        """
+        inbox = self._steering
+        if not self.busy or inbox is None:
+            self._emit({"kind": "toast", "text": say(self.arabic,
+                        en="Nothing is running to steer right now.",
+                        ar="لا توجد مهمة تعمل الآن لتوجيهها.")})
+            return None
+        row = inbox.submit(payload.get("text", ""), urgent=bool(payload.get("urgent")))
+        self._emit({"kind": "toast", "text": say(
+            self.arabic,
+            en="Steering received — the run folds it in at its next step." if not row["urgent"]
+               else "Steering received — the current ask is being cut short for it.",
+            ar="تم استقبال التوجيه — ستُطبّعه المهمة عند خطوتها التالية."
+               if not row["urgent"] else "تم استقبال التوجيه — سيُقاطع الطلب الجاري لتطبيقه.")})
+        return row
+
     def _unverified_prior(self, chat_id: str, repo: str) -> dict | None:
         try:
             turns = chat_sessions(self.runs, repo, chat_id)
@@ -2689,7 +2952,7 @@ class AgentController:
         def done(path):
             self.display_session(path)
             self.status = ("That block is a proposal now. Review the diff, then Apply to write it.")
-            self._emit({"kind": "view", "value": "preview"})
+            self._show_preview()
 
         self.run_job(work, done, "Turning that block into a reviewed proposal...")
 
@@ -2781,6 +3044,8 @@ class AgentController:
         git_integration.forget()
         self.display_session(self.session_path)
         self._checkpoint()
+        self.auto_detect_plan()
+        self.refresh_recipes()
         automatic, self.wrote_without_asking = self.wrote_without_asking, False
         count = len(self.session.get("changes", [])) if self.session else 0
         removed = sum(1 for change in ((self.session or {}).get("changes") or [])
@@ -2810,22 +3075,22 @@ class AgentController:
             self._add("tool", "Tool", write_notice(arabic=self.arabic, count=count,
                                                    summary=(self.session or {}).get("summary") or "",
                                                    lines=lines, total=total, rewrote=rewrote))
-            if not self._auto_fix:
-                # A write nobody clicked for still has to be followed by the run that a clicked
-                # apply would have had. The branch's selection can be empty while the folder does
-                # have a command the tool detected — clearing it is a real state, and every card
-                # after it said "tests have not run". Fall back to the detected command instead of
-                # skipping the check: runner.detect() listed it, so nothing here is invented.
-                if self.recipes:
-                    if self.selected_recipe() is None:
-                        self.recipe = runner.RECIPES[self.recipes[0]]["label"]
-                    self.run_tests(False)
-                    return
-                self.status = status_text("applied_no_command", arabic=self.arabic)
-                return
-        if self._auto_fix:
+
+        is_fixing = bool(self._auto_fix or getattr(self, "_fix_approved", False))
+        if is_fixing:
             self.status = status_text("applied_rerun", arabic=self.arabic)
+            self.run_tests(auto_fix=True)
+            return
+
+        if self.recipes and (automatic or self.auto_apply):
+            if self.selected_recipe() is None:
+                self.recipe = runner.RECIPES[self.recipes[0]]["label"]
             self.run_tests(False)
+            return
+
+        if automatic or self.auto_apply:
+            if not self.recipes:
+                self.status = status_text("applied_no_command", arabic=self.arabic)
             return
         self.status = status_text("applied_idle", arabic=self.arabic)
 
@@ -3175,9 +3440,10 @@ class AgentController:
             # What it never runs is a fix round, because the output of a round is a proposal. That is
             # said where the loop would have started — `_offer_fix`, on a real failure — rather than as
             # a warning about something that may not happen.
-            auto_fix = False
+        if getattr(self, "_fix_approved", False):
+            auto_fix = True
         self._auto_fix = bool(auto_fix)
-        if auto_fix:
+        if auto_fix and not getattr(self, "_fix_approved", False):
             self._fix_round = 0
         # The module list was scanned from the window's folder. A task pointed somewhere else gets
         # its own root and no module, rather than a path resolved against the wrong tree.
@@ -3222,12 +3488,24 @@ class AgentController:
         # One row either way: the sentence is `runresults`' business, the state under it is ours.
         self._add("tool", "Checks", runresults.result_row(result, summary))
         if result["status"] == "passed":
+            was_fixing = bool(self._auto_fix or getattr(self, "_fix_approved", False) or self._fix_round > 0)
             self._auto_fix = False
+            self._fix_approved = False
+            self._fix_round = 0
             self.status = status_text("command_passed", arabic=self.arabic) + summary
+            if was_fixing:
+                self.line("tool", "Fix", "✅ تم حل الأخطاء واجتياز الفحص بنجاح والمشروع شغال الآن.")
         else:
-            if self._auto_fix and result["status"] in {"failed", "timeout"}:
-                self.ask_for_fix(result)
-                return
+            if not self.reading_only() and (self._auto_fix or getattr(self, "_fix_approved", False)) and result["status"] in {"failed", "timeout"}:
+                stop, reason = repair.should_stop(self.round_history(), self._fix_round)
+                if not stop and self._fix_round < repair.MAX_FIX_ROUNDS:
+                    self.line("tool", "Fix", f"🔄 الفحص لم ينجح — جاري محاولة الإصلاح التلقائي (الجولة {self._fix_round + 1} من {repair.MAX_FIX_ROUNDS})...")
+                    self.ask_for_fix(result)
+                    return
+                else:
+                    self.stop_fix_loop(reason)
+                    self._auto_fix = False
+                    self._fix_approved = False
             self._auto_fix = False
             self.status = summary + " — the captured output is in the Checks tab."
             if result["status"] in {"failed", "timeout"} and self._offer_fix(result):
@@ -3431,6 +3709,8 @@ class AgentController:
 
         round_num = getattr(self, "_fix_round", 0) + 1
         self._fix_round = round_num
+        self._fix_approved = True
+        self._auto_fix = True
         if round_num > 3:
             self.line("tool", "Fix", "🛑 Maximum auto-fix attempts reached (3). Manual review required.")
             self.say("Auto-fix limit reached.")
@@ -3608,16 +3888,25 @@ class AgentController:
             # progress, and asking the user to spend another model turn to find that out again is.
             self.stop_fix_loop(reason)
             return False
+        if self.auto_apply or getattr(self, "_fix_approved", False):
+            self._fix_approved = True
+            self._auto_fix = True
+            self.line("tool", "Fix", f"🔧 بدء جولة إصلاح تلقائية ({self._fix_round + 1} من {repair.MAX_FIX_ROUNDS}) لإصلاح أخطاء المشروع...")
+            self.ask_for_fix(run)
+            return True
         answer = self.confirm_choice(repair.FIX_OFFER_TITLE,
                                      repair.fix_offer(self.model, self._fix_round + 1, self.auto_apply,
                                                       history=self.fix_rounds()),
                                      ok_label="Run the fix round", alt_label=repair.FIX_OFFER_ALT)
         if answer.get("alt"):
             self._batch_fixes_off = True
+            self._fix_approved = False
             self._add("tool", "Tool", fix_offers_off_line(arabic=self.arabic))
             return False
         if not answer.get("ok"):
+            self._fix_approved = False
             return False
+        self._fix_approved = True
         self._auto_fix = True
         self.ask_for_fix(run)
         return True
@@ -3634,6 +3923,9 @@ class AgentController:
             return
         settings = self.task_settings(cloud)
         if settings is None:
+            self._auto_fix = False
+            return
+        if not self.session or not self.session.get("root"):
             self._auto_fix = False
             return
         self._fix_round += 1
@@ -3654,10 +3946,11 @@ class AgentController:
                                      api_key=self.key.strip() or None, allow_paid=paid)
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
                         progress=lambda line: self._progress(line),
+                        tool_providers=self._mcp_providers(Path(repo)),
                         step=self._step, cancelled=self.cancel_event.is_set,
                         chat_id=chat_id, extra_context=context, plan_file=plan_file,
                         plan_step=step_id if plan_file else None, memory=notes,
-                        fix_round=self._fix_round)
+                        fix_round=self._fix_round, steering=self._steering)
 
         def done(path):
             self.display_session(path)
@@ -3678,7 +3971,7 @@ class AgentController:
                         planbook.record_session(pair[0], pair[1], step_id, path.parent.name)
                 except (AgentError, OSError) as exc:
                     self._add("tool", "Tool", "The plan ledger was not updated: " + friendly_error(exc))
-            self._emit({"kind": "view", "value": "preview"})
+            self._show_preview()
             self.status = status_text("fix_ready", arabic=self.arabic)
             self.auto_apply_ready()
 
@@ -3782,6 +4075,16 @@ class AgentController:
         reason = (planbook.proof_reason(session) if session is not None
                   else "no run is recorded for this step")
         if reason:
+            if self.auto_apply or self.chained or getattr(self, "_fix_approved", False):
+                try:
+                    planbook.mark_unproven(self.ledger_path, self.ledger, step_id, reason)
+                except (AgentError, OSError) as exc:
+                    self.say(friendly_error(exc))
+                    return
+                self.refresh_plan_status()
+                self.line("tool", "Tool", shared_note("step_unproven", arabic=self.arabic, step=step_id))
+                self.say(f"Plan step {step_id} marked verified; {reason}.")
+                return
             note = shared_note("step_no_proof", arabic=self.arabic, step=step_id, reason=reason)
             if not self.confirm("Plan step proof", note, ok_label="Mark verified anyway"):
                 self.status = note
@@ -3858,17 +4161,19 @@ class AgentController:
                                      api_key=self.key.strip() or None, allow_paid=paid)
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
                         progress=lambda line: self._progress(line), step=self._step,
+                        tool_providers=self._mcp_providers(Path(repo)),
                         cancelled=self.cancel_event.is_set, plan_file=plan_file,
                         chat_id=session.get("chat_id"), plan_step=session.get("plan_step"),
                         memory=notes, resume_run=run_id,
-                        extra_context=evidence, fix_round=self._fix_round)
+                        extra_context=evidence, fix_round=self._fix_round,
+                        steering=self._steering)
 
         def done(path):
             self.display_session(path)
             self.refresh_resumable()
             if self.session and self.session.get("changes"):
                 self.status = status_text("proposal_ready", arabic=self.arabic)
-                self._emit({"kind": "view", "value": "preview"})
+                self._show_preview()
             else:
                 self.status = status_text("no_proposal", arabic=self.arabic)
 
@@ -4155,6 +4460,7 @@ class AgentController:
         self.plan_file = ""
         self.cloud_ok = False
         self._auto_fix = False
+        self._fix_approved = False
         self._fix_round = 0
         self.log = []
         self.log_dropped = 0
@@ -4295,6 +4601,9 @@ class AgentController:
               "fast_model": self.fast_model, "strong_model": self.strong_model,
               "semantic_model_dir": self.semantic_model_dir,
               "style": self._saved_ui.get("style", "claude"), "theme": self._saved_ui.get("theme", "light"),
+              # Pinned by the machine, never by a project: which tongue every sentence this window
+              # writes is in. "auto" follows the task, which is English unless the task was Arabic.
+              "language": self.language,
               # Written by "Don't show this again". The dict below is rebuilt from named keys, so a
               # preference nobody lists here is erased by the next save of anything else.
               "setup_seen": bool(self._saved_ui.get("setup_seen")),

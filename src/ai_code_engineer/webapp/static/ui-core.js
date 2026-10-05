@@ -118,14 +118,23 @@ function windowGoneDeaf(reason) {
 const STREAM_RETRY_LIMIT = 4;
 let streamRetries = 0;
 
+/* The id of the last frame this page read. A reconnect the browser makes itself carries that in a
+   header, but the reconnect *here* is a new EventSource, which carries nothing — so the page names
+   the id in the URL and the server replays whatever fell in the gap. Without that, a blip mid-run
+   silently costs the window every event between the last snapshot and the reconnection. */
+let lastEventId = '';
+
 function connectEvents() {
-  const src = new EventSource('/api/events?t=' + encodeURIComponent(TOKEN));
+  const url = '/api/events?t=' + encodeURIComponent(TOKEN)
+    + (lastEventId ? '&last=' + encodeURIComponent(lastEventId) : '');
+  const src = new EventSource(url);
   /* A dropped stream reconnects on its own, and every event it missed was a whole snapshot. The
      window then keeps showing the last one it saw — measured live: the review card said "Apply
      changes" was unavailable while the server was sitting on a pending proposal waiting for that
      very click. Re-reading the bootstrap when a stream opens costs one request and ends the drift. */
   src.onopen = () => { streamRetries = 0; api('/api/bootstrap').then(render).catch(() => {}); };
   src.onmessage = (row) => {
+    if (row.lastEventId) lastEventId = row.lastEventId;
     let msg; try { msg = JSON.parse(row.data); } catch { return; }
     applyEvent(msg);
   };
@@ -153,6 +162,13 @@ function applyEvent(msg) {
                     state.data.messages.push(msg.message); renderThread(); break;
     case 'token': appendToken(msg.text); break;
     case 'busy': setBusy(msg.value, msg.cancellable); break;
+    // Engine events that bear on the permanent run row, taken live rather than waiting for the
+    // next full snapshot: a stage move repaints the badge, a read steering instruction decrements
+    // the waiting count the Steer field shows.
+    case 'stage_changed': applyStageCode(msg.stage); break;
+    case 'steer':
+      if (DATA && DATA.steering_waiting) { DATA.steering_waiting -= 1; paintRunBar(); }
+      break;
     case 'confirm': drawAsk(msg); break;
     case 'retract': retractAsk(msg.id); break;
     case 'toast': toast(msg.text, msg.level); break;
@@ -216,10 +232,9 @@ function render(data) {
   if (state.openStep) state.lockScroll = true;
   renderThemePick(); renderNav(); renderHeader(); renderThread(); renderComposer();
   renderQueue(); renderSetup(); renderQuote();
-  renderRail(); renderLog();
+  renderRail(); renderLog(); takePreviewOffer();
+  paintRunBar();
   syncSettings();
-  // A proposal that arrived on this snapshot was already asked to show itself.
-  takePreviewOffer();
   setBusy(data.busy, data.cancellable);
 
   const wasBusy = !!state.wasBusy;

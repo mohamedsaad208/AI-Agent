@@ -9,9 +9,15 @@ import shutil
 import sys
 
 from .config import load_settings, validate
-from .engine import apply_proposal, load_session, plan, reopen_proposal, review, rollback
+from .engine import (apply_proposal, load_session, plan, plan_mode_text,
+                     reject_proposal, reopen_proposal, review, rollback)
 from .errors import AgentError
-from .labels import asked_of, is_arabic, policy_line, policy_verdicts
+from . import error_fmt
+from . import events as ux
+from . import terminal
+from .cli_view import event_view, startup_banner
+from .diff_parse import CONTEXT
+from .labels import asked_of, is_arabic, policy_line, policy_verdicts, rejected_note
 from .labels import note as shared_note
 from .providers import make_provider
 from .report import export_file, find_session
@@ -48,6 +54,10 @@ def parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=f"{ROBOT_BANNER.strip()}\n\nReview-first Python developer agent"
     )
+    # A flag on the root rather than on each command: the answer to "what actually went wrong"
+    # is asked at the moment of the failure, whatever command was running.
+    root.add_argument("--details", action="store_true",
+                      help="On failure, show the traceback the friendly error hides")
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Check Python, local Ollama, Docker and key presence")
     first = sub.add_parser("setup", help="Run the first checks in order, and prove the red line offline")
@@ -90,12 +100,25 @@ def parser() -> argparse.ArgumentParser:
     draft.add_argument("--config", type=Path)
     draft.add_argument("--model", help="Override model ID (provider is selected in config)")
     draft.add_argument("--plan-file", help="Markdown/text plan inside the selected project")
+    draft.add_argument("--plan", action="store_true",
+                       help="Plan Mode: print the read-only plan (Goal, Affected files, Steps, "
+                            "Risks, Test strategy) instead of the diff")
     draft.add_argument("--runs", type=Path, default=Path(".agent-runs"))
     draft.add_argument("--allow-cloud", action="store_true")
     draft.add_argument("--data-class", choices=["restricted", "public", "synthetic"], default="restricted")
-    for name in ("review", "apply", "reopen", "rollback", "verify", "status"):
+    for name in ("review", "apply", "reopen", "rollback", "verify", "status", "diff"):
         command = sub.add_parser(name)
         command.add_argument("session", type=Path)
+        if name == "review":
+            command.add_argument("--plan", action="store_true",
+                                 help="Plan Mode: read-only view of the whole plan "
+                                      "(Goal, Affected files, Steps, Risks, Test strategy) "
+                                      "instead of the diff")
+        if name == "diff":
+            command.add_argument("--file", default="", metavar="PATH",
+                                 help="Show this file's hunks only; the summary otherwise covers all")
+            command.add_argument("--context", type=int, default=CONTEXT, metavar="N",
+                                 help=f"Context lines around each change (default {CONTEXT})")
         if name in {"apply", "reopen", "rollback"}:
             command.add_argument("--approve", help="Full proposal SHA256; otherwise asks interactively")
         if name == "verify":
@@ -108,6 +131,14 @@ def parser() -> argparse.ArgumentParser:
     curl_cmd.add_argument("--prompt", default="Hello! Please confirm you are working.", help="Prompt text")
     curl_cmd.add_argument("--run", action="store_true", help="Execute the request directly")
     sub.add_parser("demo", help="Run deterministic, offline synthetic demo without changing your repository")
+    command = sub.add_parser(
+        "command", aliases=("cmd",),
+        help="One unified session command — status, plan, changes, diff, tests, risks, stop, "
+             "steer, report, undo, memory, help — answered the way both windows answer it")
+    command.add_argument("session", help="Session id, a unique id prefix, its folder or file")
+    command.add_argument("line", nargs=argparse.REMAINDER, metavar="COMMAND [args]",
+                         help="The command to run over it, e.g. `diff app/calc.py --context 5`")
+    command.add_argument("--runs", type=Path, default=Path(".agent-runs"))
     export = sub.add_parser("export-session",
                             help="Write one session's record as JSON or as a readable report")
     export.add_argument("session", help="Session id, a unique id prefix, or its folder/file")
@@ -188,6 +219,27 @@ def app_dir() -> Path:
     are reading the same one.
     """
     return Path(__file__).resolve().parents[2]
+
+
+def external_providers(ws, say=print):
+    """The MCP servers this operator configured, as the providers a run can offer.
+
+    Read from the tool's own directory and never from the project folder, which is the whole
+    distinction between an outside tool the operator chose and one a repository arranged: a
+    `mcp.json` inside the workspace would let "open this folder" mean "run what it names". The import
+    is inside the function so a run with nothing configured never loads the client at all, and each
+    unreadable row is said rather than raised — a task that needs no outside tool must still plan.
+
+    Nothing here asks a server what it has: discovery belongs to the run that would use the answer,
+    and `engine.plan` records what a server advertised but this runtime could not contract on the
+    `tool_provider` event, where the person who configured it can read it back from the session.
+    """
+    from . import mcp
+    providers, problems = mcp.providers_from_config(app_dir() / mcp.CONFIG_NAME, cwd=ws.root)
+    for problem in problems:
+        say("MCP: " + (problem["server"] + ": " if problem["server"] else "")
+            + problem["reason"])
+    return providers
 
 
 def refuses_sealed(folder, what: str) -> None:
@@ -479,6 +531,139 @@ def run_setup(args, ask=input, interactive=None) -> int:
     return 1 if counts["bad"] else 0
 
 
+# ---------------------------------------------------------------------------
+# Keyboard shortcuts (Release 5 - Task 5.1)
+# ---------------------------------------------------------------------------
+
+STOP, TOGGLE, HELP = "stop", "toggle", "help"
+
+# The key prompt_toolkit names each shortcut by, and what one press answers. These are
+# the same three actions the window puts buttons on — stop, switch the detail view, help.
+SHORTCUT_KEYS = {STOP: "escape", TOGGLE: "tab", HELP: "?"}
+SHORTCUT_LABELS = {STOP: "Esc", TOGGLE: "Tab", HELP: "?"}
+SHORTCUT_MEANING = {
+    STOP: "stop - decide against the pending proposal now, the way the window's Stop ends a run",
+    TOGGLE: "toggle - switch the details between the plan view and the diff, deciding nothing",
+    HELP: "help - these shortcuts and the twelve unified commands",
+}
+
+
+def shortcut_help() -> str:
+    """The shortcut table, as one plain block every surface can print."""
+    lines = ["Keyboard shortcuts - the same actions the window's buttons make:", ""]
+    lines += [f"  {SHORTCUT_LABELS[token]:<4} {SHORTCUT_MEANING[token]}"
+              for token in (STOP, TOGGLE, HELP)]
+    return "\n".join(lines)
+
+
+def build_key_bindings(on_stop=None, on_toggle=None, on_help=None):
+    """A prompt_toolkit ``KeyBindings`` for the three shortcuts, or None without it.
+
+    Each press fires its callback and ends the current prompt with the shortcut's token, so
+    the reading code sees one decision per keystroke and never a half-typed line. ``escape``
+    binds eagerly: a lone Esc must answer now rather than wait to see whether an Alt chord
+    follows it.
+    """
+    try:
+        from prompt_toolkit.key_binding import KeyBindings
+    except ImportError:
+        return None
+    callbacks = {STOP: on_stop, TOGGLE: on_toggle, HELP: on_help}
+    kb = KeyBindings()
+
+    def _fire(token: str):
+        def handler(event):
+            callback = callbacks[token]
+            if callback is not None:
+                callback()
+            event.app.exit(result=token)
+        return handler
+
+    for token, key in SHORTCUT_KEYS.items():
+        kb.add(key, eager=(token == STOP))(_fire(token))
+    return kb
+
+
+def approval_prompt(ask=None):
+    """A callable that reads one answer, shortcuts included when the terminal carries them.
+
+    ``ask`` (a test or a wizard's own reader) always wins verbatim. Without it, a real TTY
+    with prompt_toolkit answers through the bound session — Ctrl-C arrives as the same stop
+    token Esc carries, because it means the same thing mid-decision. Anywhere else this is
+    plain ``input`` and only the typed keys answer.
+    """
+    def _read(call, text: str) -> str:
+        try:
+            return str(call(text) or "")
+        except EOFError:
+            return ""
+
+    if ask is not None:
+        return lambda text: _read(ask, text)
+    if not terminal.is_tty() or build_key_bindings() is None:
+        return lambda text: _read(input, text)
+    from prompt_toolkit import PromptSession
+    session = PromptSession(key_bindings=build_key_bindings())
+
+    def prompt(text: str) -> str:
+        try:
+            return str(session.prompt(text) or "")
+        except KeyboardInterrupt:
+            return STOP
+        except EOFError:
+            return ""
+    return prompt
+
+
+def one_key_approval(review_text: str, ask=None, plan_text: str = "") -> str:
+    """Ask the operator to decide on a pending proposal with one key.
+
+    A single keystroke replaces the hash that used to be retyped. The hash binding is not dropped:
+    approving returns to the caller, which reads the proposal's own `proposal_hash` and hands it to
+    `apply_proposal` — the same re-check against the pending proposal and the workspace as before. The
+    key only records that the person who has just read the review agrees. `d` reprints the review
+    without answering, so an operator who wants a second look does not have to restart the command.
+
+    The three shortcuts ride on the same keystroke seam (Release 5 - Task 5.1): Esc decides
+    exactly as `n` does — the stop the web button answers to, taken on the proposal rather than
+    on a running job there being none between the review and this prompt. Tab flips the details
+    between the plan view and the diff without deciding anything, and `?` prints the shortcuts
+    and the twelve unified commands. Where the terminal cannot carry prompt_toolkit, the
+    prompt degrades to plain input and only the typed keys answer.
+    """
+    prompt = approval_prompt(ask)
+    showing = review_text
+    while True:
+        safe_print("")
+        answer = prompt("Approve this proposal?  [y] approve   [n] reject   "
+                        "[d] details   Esc stop   Tab switch   ? help: ").strip().lower()
+        if answer in {"y", "yes", "ok", "نعم", "ايه", "أيوه"}:
+            return "approve"
+        if answer in {"n", "no", "كلا", "لا"}:
+            return "reject"
+        if answer == STOP:
+            return "reject"
+        if answer in {"d", "details", "detail"}:
+            safe_print(showing)
+            continue
+        if answer == TOGGLE:
+            if not plan_text:
+                safe_print("This proposal has no plan view to switch to.")
+                continue
+            showing = plan_text if showing != plan_text else review_text
+            safe_print(showing)
+            continue
+        if answer == HELP:
+            safe_print(shortcut_help())
+            try:
+                from . import commands as unified
+                safe_print(unified.handle("help").text)
+            except AgentError:
+                pass
+            continue
+        safe_print("Please answer y, n or d.")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -501,9 +686,18 @@ def main(argv: list[str] | None = None) -> int:
                 settings = replace(settings, model=args.model)
             validate(settings)
             ws = Workspace(args.repo)
+            startup_banner(project=ws.root.name, model=settings.model,
+                           mode="PLAN" if args.plan else "EXECUTE")
             provider = make_provider(settings, allow_cloud=args.allow_cloud, data_class=args.data_class)
-            path = plan(ws, args.task, provider, settings, args.runs, progress=safe_print, plan_file=args.plan_file)
-            safe_print(review(load_session(path)))
+            mcp_notes = external_providers(ws, safe_print)
+            with event_view(ux.global_bus) as view:
+                path = plan(ws, args.task, provider, settings, args.runs, progress=view.note,
+                            plan_file=args.plan_file, tool_providers=mcp_notes)
+            session = load_session(path)
+            if args.plan:
+                safe_print(plan_mode_text(session))
+            else:
+                safe_print(review(session))
             safe_print("\nSession: " + str(path))
             safe_print("No project files changed. Review this proposal before applying it.")
         elif args.command == "curl":
@@ -520,10 +714,25 @@ def main(argv: list[str] | None = None) -> int:
                 safe_print("Wrote " + str(args.out) + " (" + str(len(text)) + " characters)")
             else:
                 safe_print(text)
+        elif args.command in {"command", "cmd"}:
+            from . import commands as unified   # the twelve answers share one handler
+            where = Path(args.session)
+            path = where if where.is_file() else find_session(args.runs, args.session)
+            session = load_session(path)
+            result = unified.Commands(session, session_path=path,
+                                      plans=app_dir() / ".agent-plans").run(" ".join(args.line))
+            if result.renderables:
+                result.show()
+            else:
+                safe_print(result.text)
         else:
             session = load_session(args.session)
             if args.command == "review":
-                safe_print(review(session))
+                safe_print(plan_mode_text(session) if getattr(args, "plan", False)
+                           else review(session))
+            elif args.command == "diff":
+                from . import diff_view   # colour needs rich and pygments; only this command pays for them
+                diff_view.render(session, path=args.file, context=args.context)
             elif args.command == "status":
                 safe_print(json.dumps({"id": session["id"], "state": session["state"],
                                        "model": session["model"], "events": session["events"]}, indent=2))
@@ -536,14 +745,33 @@ def main(argv: list[str] | None = None) -> int:
                     # operator already reviewed, and refusing it would use a guard to block the way out.
                     refuses_policy(session.get("root", ""), session, interactive=sys.stdin.isatty())
                 approved = args.approve
-                if not approved:
+                arabic = is_arabic(asked_of(str(session.get("task", ""))))
+                if args.command == "apply" and not approved:
+                    # One key decides an approval, the way every other surface does. The proposal's own
+                    # hash is still what is handed to the write, so nothing about the guarantee is lost.
+                    review_text = review(session)
+                    safe_print(review_text)
+                    if not sys.stdin.isatty():
+                        raise AgentError("Non-interactive mode requires --approve with the full proposal SHA256.")
+                    # Tab has two views to switch between whenever the session carries a plan.
+                    decision = one_key_approval(review_text, plan_text=plan_mode_text(session))
+                    if decision == "reject":
+                        reject_proposal(args.session, str(session.get("proposal_hash") or ""))
+                        safe_print(rejected_note(arabic=arabic, count=len(session.get("changes") or [])))
+                        return 0
+                    approved = str(session.get("proposal_hash") or "")
+                    if not approved:
+                        raise AgentError("This proposal carries no pending hash to approve.")
+                elif not approved:
                     safe_print(review(session))
                     if not sys.stdin.isatty():
                         raise AgentError("Non-interactive mode requires --approve with the full proposal SHA256.")
                     approved = input("Type the full proposal SHA256 to " + args.command + ": ").strip()
                 operation = {"apply": apply_proposal, "reopen": reopen_proposal,
                              "rollback": rollback}[args.command]
-                safe_print("State: " + operation(args.session, approved)["state"])
+                with event_view(ux.global_bus):
+                    result = operation(args.session, approved)
+                safe_print("State: " + result["state"])
             elif args.command == "verify":
                 result = verify(args.session, args.recipe, args.image)
                 safe_print(json.dumps(result, indent=2))
@@ -553,7 +781,9 @@ def main(argv: list[str] | None = None) -> int:
         safe_print("Cancelled. Inspect session status before retrying an interrupted apply.")
         return 130
     except (AgentError, OSError) as exc:
-        safe_print("Error: " + str(exc))
+        # The three-part sentence, not the raw line: what went wrong, why, and what to do.
+        # The traceback stays behind --details, where the person who needs it for a report asks.
+        error_fmt.render(exc, details=args.details)
         return 1
 
 

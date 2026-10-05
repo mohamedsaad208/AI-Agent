@@ -15,7 +15,7 @@ const context = vm.createContext({
   DATA: {artifact: {state: 'Pending'}, banner: {}, messages: []},
   renderThread: () => {}, openFile: index => { context.opened = index; }, send: () => {},
 });
-for (const name of ['kindTag', 'diffStat', 'diffTotals', 'fileCaption', 'chipCard', 'changeActions', 'splitReply', 'replyTarget']) {
+for (const name of ['kindTag', 'diffStat', 'diffTotals', 'fileCaption', 'impactBlock', 'chipCard', 'changeActions', 'splitReply', 'replyTarget']) {
   const start = source.indexOf(`function ${name}(`);
   assert.ok(start >= 0, name);
   vm.runInContext(source.slice(start, source.indexOf('\n}', start) + 2), context);

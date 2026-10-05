@@ -1,0 +1,13 @@
+# LLM7: free hosted inference (no mandatory API key).
+# Optional key can be provided via LLM7_API_KEY from dash.llm7.io
+[model]
+provider = "llm7"
+name = "codestral-latest"
+endpoint = "https://api.llm7.io/v1"
+api_key_env = "LLM7_API_KEY"
+
+[limits]
+max_turns = 8
+timeout_seconds = 120
+context_chars = 32000
+output_tokens = 8192

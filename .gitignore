@@ -25,6 +25,12 @@
 .agent-plans/
 .agent-memory/
 
+# The project's own memory (memory_store.py): the compass the model is fed, the goal and the approval
+# recorded with it. Written into whichever folder the agent is working on, so it appears in this
+# repository when the tool is turned on itself - and a memory of one machine's work is not a source
+# file another machine should inherit.
+.agent/
+
 # WebView2 user-data folder handed to open_window() by webapp/launch.py.
 .agent-webview/
 
@@ -43,6 +49,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pkgcheck/
 build/
 dist/
 *.egg-info/

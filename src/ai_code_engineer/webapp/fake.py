@@ -12,7 +12,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import config, git_integration, intent, labels, modes, overrides, permissions, planbook, policy, repair, runner, setup
+from .. import (compass, config, git_integration, intent, labels, memory_store, modes, overrides,
+                permissions, planbook, policy, repair, runner, setup)
+from .. import memory_summarizer as brief
 from ..errors import PolicyError
 from .controller import PROJECT_ICONS as ICONS
 from . import uistate
@@ -171,6 +173,11 @@ class FakeController:
         self.view = "task"
         self.busy = False
         self.cancellable = False
+        # The scripted twins of the real controller's run-row fields: the top bar's elapsed face
+        # reads `job_started` and its steer box reads `steering_waiting`, and a control the preview
+        # never feeds renders as nothing — which is exactly what a design review must not miss.
+        self.job_started: float | None = None
+        self.steering_waiting = 0
         self.chained = True
         # The container switch is scripted as if this machine had Docker: on a machine without it the
         # preview would show one frozen sentence, and the four answers are the thing to review here.
@@ -234,6 +241,23 @@ class FakeController:
         self.memory = "Java 17, Spring Boot 3.2. Do not add dependencies. " \
                       "Keep controllers thin; put rules in the service layer."
         self.memory_info = "412 chars saved · demo2-8f2a.md · sent with every task here"
+        # The project's own memory, as the Memory tab shows it. Scripted as values, like everything
+        # else in this window — but laid out and measured by `compass`, the module the shipped window
+        # uses, so the section list, the token ceiling and the rank each part holds in the block are
+        # the real ones. What is reviewed here is the design, not an imitation of the rules.
+        self.mem_goal = "Ship the duplicate-email check before the release freeze"
+        self.mem_goal_source = "user"
+        self.mem_pending_goal = "Drop the release freeze and finish the validation refactor first"
+        self.mem_pending_at = "2026-10-05T09:12:00+00:00"
+        self.mem_project = {"constraints": ["Do not add dependencies",
+                                            "Never rename the package under src/main"],
+                            "decisions": ["Reuse the existing UserRepository query"],
+                            "open_issues": ["Does the controller map the conflict to 409?"],
+                            "progress": ["2026-10-05: applied — Add the typed conflict error (2 files)"
+                                         " — tests passed"]}
+        self.mem_chat = {"task": "Make create() reject a duplicate email",
+                         "steps": ["read UserService.java", "search \"findByEmail\""],
+                         "decisions": [], "open_issues": []}
         # The counts a provider reports for the scripted task, in the shape the real snapshot sends.
         # The numbers are the ones the context-window comment had to measure by hand.
         self.metrics = {"prompt_tokens": 2050, "completion_tokens": 180}
@@ -419,6 +443,7 @@ class FakeController:
     def snapshot(self) -> dict:
         return {
             "prefs": self.prefs, "busy": self.busy, "cancellable": self.cancellable, "pending": self.pending,
+            "job_started": self.job_started, "steering_waiting": self.steering_waiting,
             "status": self.status_line,
             "current": "s-1", "header": {"title": "Spring Boot authentication",
                                          "subtitle": "demo2 · step %d of 5 · %s" % (self.step, self.model)},
@@ -478,7 +503,7 @@ class FakeController:
             # The loop's budget, from the same constant the real controller reads it from: a field the
             # preview never sends is a field the window is never drawn with.
             "fixRounds": {"of": repair.MAX_FIX_ROUNDS, "spent": self.fix_round},
-            "memory": {"info": "412 chars saved"},
+            "memory": {"info": "412 chars saved", "goal_pending": self.mem_pending_goal},
             "settings": {"project": "D:\\AI\\AI-Agent\\examples\\demo2", "plan": "plan.md", "chained": self.chained, "auto_apply": self.auto_apply,
                          "timeout": self.timeout, "model_info": self._model_info(),
                          "memory": self.memory,
@@ -695,6 +720,112 @@ class FakeController:
             raise PolicyError("Unknown project.")
         return dict(PROJECT_INFO[key])
 
+    def memory_panel(self, chat_id: str = "") -> dict:
+        """The Memory tab's readout, in the shape `compass.readout` sends.
+
+        The values are scripted, like everything else in this window — but the section list, the
+        block and its token cost come from the same functions the shipped window calls, so what is
+        reviewed here is the design against the real rules rather than against an imitation of them.
+        """
+        wanted = str(chat_id or "") or "0" * 32
+        project = memory_store.MemoryDoc(memory_store.LAYER_PROJECT,
+                                         {"goal": self.mem_goal, **self.mem_project})
+        chat = memory_store.MemoryDoc(memory_store.LAYER_CHAT, dict(self.mem_chat))
+        made = compass.block(project, chat)
+        return {"available": True, "has_memory": True,
+                "root": "D:\\AI\\AI-Agent\\examples\\demo2",
+                "paths": {"dir": ".agent/memory", "project": ".agent/memory/project.md",
+                          "chats": ".agent/memory/chats", "meta": ".agent/memory/project.json"},
+                "goal": self.mem_goal, "pending_goal": self.mem_pending_goal,
+                "goal_source": self.mem_goal_source,
+                "goal_needs_review": bool(self.mem_pending_goal),
+                "constraints": list(self.mem_project.get("constraints", [])),
+                "decisions": list(self.mem_project.get("decisions", [])),
+                "open_issues": list(self.mem_project.get("open_issues", [])),
+                "progress": list(self.mem_project.get("progress", [])),
+                "chat": {"id": wanted, "task": self.mem_chat.get("task", ""),
+                         "steps": list(self.mem_chat.get("steps", [])),
+                         "decisions": list(self.mem_chat.get("decisions", [])),
+                         "open_issues": list(self.mem_chat.get("open_issues", [])),
+                         "file": ".agent/memory/chats/" + wanted + ".md"},
+                "chats": [wanted],
+                "sections": compass.editable_sections(project, chat, wanted),
+                "project_text": "", "chat_text": "",
+                "compass": made, "tokens": brief.estimate_tokens(made),
+                "limit": brief.COMPASS_TOKENS}
+
+    def memory_action(self, type: str, payload: dict) -> dict:
+        """The four writes the Memory tab posts, answered against the scripted layers.
+
+        Same rules the window enforces, applied to the values: a line lands in the section it names,
+        a goal a run proposed only moves when it is answered, and forgetting one layer leaves the
+        other standing. Nothing here is held on disk, because nothing in this file is.
+        """
+        if type == "memory_write":
+            section = str(payload.get("section") or "")
+            text = str(payload.get("text") or "").strip()
+            if section not in memory_store.SHAPE:
+                return {"error": "Nothing in the memory is called `" + section + "`.",
+                        "panel": self.memory_panel()}
+            if not text:
+                return {"error": "Write the line first.", "panel": self.memory_panel()}
+            if section == "goal":
+                self.mem_goal = text
+                self.mem_goal_source = "user"
+            elif section in ("task", "steps"):
+                rows = self.mem_chat.setdefault(section, [])
+                if section == "steps" and text not in rows:
+                    rows.append(text)
+                elif section == "task":
+                    self.mem_chat[section] = text
+            else:
+                rows = self.mem_project.setdefault(section, [])
+                if text not in rows:
+                    rows.append(text)
+            # The same line the shipped window prints under the same click, so the review shows the
+            # operator's own feedback and not just the record it changed.
+            self.status_line = labels.note("notes_saved")
+            return {"panel": self.memory_panel()}
+        if type == "memory_goal":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return {"error": "Write the goal first.", "panel": self.memory_panel()}
+            # A goal that was not there is opened, one that was gets replaced — and the reason code
+            # the preview sends back is the one the real window sends for the same click.
+            opened = not self.mem_goal
+            self.mem_goal, self.mem_goal_source, self.mem_pending_goal = text, "user", ""
+            self.status_line = labels.note("goal_opened" if opened else "goal_replaced")
+            return {"goal": text, "reason": "opened" if opened else "approved",
+                    "panel": self.memory_panel()}
+        if type == "memory_answer":
+            approve = str(payload.get("answer") or "").casefold() == "approve"
+            if not self.mem_pending_goal:
+                return {"error": "Nothing is waiting for approval.",
+                        "panel": self.memory_panel()}
+            if approve:
+                self.mem_goal, self.mem_goal_source = self.mem_pending_goal, "user"
+            taken, self.mem_pending_goal = self.mem_pending_goal if approve else self.mem_goal, ""
+            return {"reason": "approved" if approve else "rejected", "goal": taken,
+                    "panel": self.memory_panel()}
+        if type == "memory_reset":
+            # The layers go as codes and the sentence is named by one word, exactly as the window the
+            # operator is reviewing answers — the refusal included, so a layer that is not one of the
+            # three is the same dead click here as it is in the shipped window.
+            layer = str(payload.get("layer") or "chat")
+            if layer not in compass.RESET_TARGETS:
+                return {"error": labels.note("memory_reset_target", target=layer[:30]),
+                        "panel": self.memory_panel()}
+            if layer in ("chat", "all"):
+                self.mem_chat = {}
+            if layer in ("project", "all"):
+                self.mem_project = {}
+                self.mem_goal, self.mem_pending_goal, self.mem_goal_source = "", "", ""
+            said = "both" if layer == "all" else layer
+            self.status_line = labels.note("memory_reset_" + said)
+            return {"removed": [layer] if layer != "all" else ["chat", "project"],
+                    "said": said, "panel": self.memory_panel()}
+        return {}
+
     def list_dir(self, path: str, want_files=None) -> dict:
         root = Path(path or Path.home())
         if not root.is_dir():
@@ -795,9 +926,14 @@ class FakeController:
             self._note(emit, "verify", "Syntax checks finished. Project tests have not run.")
         elif type == "stop":
             self.busy = self.cancellable = False
+            self.job_started = None
             self.pending = None
             self.state = "CANCELLED"
             self._note(emit, "cancelled", "Task cancelled. No project files were changed.")
+        elif type == "steer":
+            # Nothing loops here, so the box can only say what the real window would do with it.
+            emit({"kind": "toast", "text": "Steering is read by a live engine loop at its next "
+                  "step — this scripted preview has no run in flight."})
         elif type == "set_style":
             self.prefs["style"] = payload.get("style", "claude")
         elif type == "set_theme":
@@ -925,6 +1061,8 @@ class FakeController:
             self.memory = str(payload.get("text", ""))
             self.memory_info = ("%d chars saved · demo2-8f2a.md · sent with every task here"
                                 % len(self.memory)) if self.memory else "Notes cleared for this folder."
+        elif type in ("memory_write", "memory_goal", "memory_answer", "memory_reset"):
+            return self.memory_action(type, payload)
         elif type == "apply_block":
             # The block button writes nothing here either: it opens a proposal, which is the state
             # the review cards are drawn for.
@@ -1051,6 +1189,7 @@ class FakeController:
         if self.reading_only:
             return self._analyse(emit)
         self.busy = self.cancellable = True
+        self.job_started = time.time()
         self.declined = False        # a new message means a new proposal, which is answerable again
         self.pending = "connecting to the model…"
         emit({"kind": "busy", "value": True, "cancellable": True})

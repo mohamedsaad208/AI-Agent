@@ -321,6 +321,8 @@ function parseCurlCommand(text) {
 }
 
 function openSettings(tab) {
+  // A caller wired straight to an onclick hands the event in where a tab name was meant.
+  if (typeof tab !== 'string') tab = 'project';
   const s = sheet('Settings', ''); s.classList.add('wide');
   const st = DATA.settings;
   const tabs = el('div', 'tabs');
@@ -373,6 +375,11 @@ function openSettings(tab) {
         ${an.verification_results ? `<div class="hint"><b>Verification:</b> ${esc(an.verification_results)}</div>` : ''}
       </div>`;
     },
+    memory: () => `
+      <div class="field"><label>Project memory — what this folder keeps between chats, and what the
+        model is shown before it reads a single file</label>
+        <div id="mem-panel" class="hint">${esc(st.project ? 'Reading ' + String(st.project).split(/[\\/]/).filter(Boolean).pop() + '…' : 'Choose a project folder first, under Project & plan.')}</div>
+      </div>`,
     overrides: () => {
       const o = DATA.overrides || {};
       const rows = (o.rows || []).map((r) => `
@@ -436,6 +443,127 @@ function openSettings(tab) {
     if (c.shape === 'ollama') return 'Ollama on this device. A model tagged "cloud" is still refused without approval.';
     if (c.consent) return 'Outside this device, so it needs your approval on every task and the address must be https.';
     return 'On this device. Nothing leaves it.';
+  }
+  /* The compass panel (Release 6 - Task 6.3). The record is read on the click — /api/memory, the way
+     the project drawer reads its folder — because rebuilding it opens three files and re-measures the
+     block, and a window watching a run has no use for that until somebody asks to see the memory.
+     Every write then goes to the same `compass` module the terminal's `memory` command answers with,
+     so a line added here is the same line under the same rules: the layer that owns it, the room left
+     in it, and the goal still asking for an approval a run cannot give itself. */
+  function loadMemory() {
+    const box = body.querySelector('#mem-panel');
+    if (!box) return;
+    api('/api/memory').then(paintMemory).catch((e) => {
+      box.innerHTML = `<div class="hint">${esc(String(e.message || e))}</div>`;
+    });
+  }
+  function memoryReply(promise) {
+    return promise.then((reply) => {
+      const result = (reply && reply.result) || {};
+      if (result.error) toast(result.error, 'bad');
+      if (reply && reply.state) render(reply.state);
+      if (result.panel) paintMemory(result.panel);
+    }).catch((e) => toast(String(e.message || e), 'bad'));
+  }
+  /* Each one names its action in a literal, the way the rest of the client does: the parity gate in
+     test_webapp reads these lines to prove the preview window answers what the page posts, and a type
+     assembled from a variable is invisible to it. */
+  const memoryWrite = (layer, section, text) =>
+    memoryReply(api('/api/action', { type: 'memory_write', layer, section, text }));
+  const memoryGoal = (text) => memoryReply(api('/api/action', { type: 'memory_goal', text }));
+  const memoryAnswer = (answer) => memoryReply(api('/api/action', { type: 'memory_answer', answer }));
+  const memoryReset = (layer) => memoryReply(api('/api/action', { type: 'memory_reset', layer }));
+  function memoryLines(panel, row) {
+    const holder = row.layer === 'project' ? panel : (panel.chat || {});
+    const value = holder[row.name];
+    return Array.isArray(value) ? value : (value ? [value] : []);
+  }
+  function memoryGroup(title, panel, rows) {
+    if (!rows.length) return '';
+    let out = `<div class="dsec"><h6>${esc(title)}</h6>`;
+    for (const row of rows) {
+      const items = memoryLines(panel, row);
+      out += `<div class="meta"><span>${esc(row.heading)}`
+        + (row.shape === 'list' ? ` · ${items.length} of ${row.cap}` : '') + '</span></div>';
+      for (const item of items) out += `<div class="pathline">• ${esc(item)}</div>`;
+      if (!row.ready) {
+        out += '<div class="hint">Nothing in this conversation to write into yet.</div>';
+        continue;
+      }
+      const key = row.layer + '|' + row.name;
+      out += `<div style="display:flex;gap:8px;margin:4px 0 10px">`
+        + `<input data-sec="${esc(key)}" placeholder="${row.shape === 'list' ? 'Add a line' : 'Replace this line'}" style="flex:1">`
+        + `<button class="line-btn" data-add="${esc(key)}">${row.shape === 'list' ? 'Add' : 'Save'}</button></div>`;
+    }
+    return out + '</div>';
+  }
+  function paintMemory(panel) {
+    const box = body.querySelector('#mem-panel');
+    if (!box) return;
+    if (!panel || !panel.available) {
+      box.innerHTML = `<div class="hint">${esc((panel || {}).why || 'This project has no memory to read.')}</div>`;
+      return;
+    }
+    const share = panel.limit ? Math.min(100, Math.round(100 * panel.tokens / panel.limit)) : 0;
+    const sections = panel.sections || [];
+    let html = `<div class="meter"><span class="t">Compass sent to the model</span>`
+      + `<span class="bar"><i style="width:${share}%"></i></span>`
+      + `<span class="v">${panel.tokens} of ${panel.limit} tokens</span></div>`;
+    html += `<div class="dsec"><h6>Goal</h6>`
+      + `<div class="pathline">${esc(panel.goal || 'Nothing has stated what this project is for.')}</div>`;
+    if (panel.goal_source) html += `<div class="meta"><span>recorded by ${esc(panel.goal_source)}</span></div>`;
+    if (panel.pending_goal) {
+      html += `<div class="hint"><b>A run proposed a different goal:</b> ${esc(panel.pending_goal)}</div>`
+        + `<div style="display:flex;gap:8px;margin-top:8px">`
+        + `<button class="solid" data-goal="approve">Approve it</button>`
+        + `<button class="line-btn" data-goal="reject">Keep the stored goal</button></div>`;
+    }
+    html += `<div style="display:flex;gap:8px;margin-top:10px">`
+      + `<input id="goal-text" placeholder="${esc(panel.goal || 'What is this project for?')}" style="flex:1">`
+      + `<button class="line-btn" id="goal-save">State it</button></div>`
+      + '<div class="hint">Typing it here is the approval the record asks for. A run can only propose.</div></div>';
+    html += memoryGroup('Project — kept between chats', panel,
+                        sections.filter((r) => r.project && r.name !== 'goal'));
+    html += memoryGroup('This chat', panel, sections.filter((r) => !r.project));
+    html += `<div class="dsec"><h6>The block as the model reads it</h6>`
+      + `<pre class="pathline" style="white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;margin:0">`
+      + esc(panel.compass || 'Nothing to send — this project has no memory yet.') + '</pre>'
+      + `<div class="meta"><span>${esc((panel.paths || {}).project || '')}</span></div>`
+      + `<div style="display:flex;gap:8px;margin-top:8px">`
+      + `<button class="line-btn" data-reset="chat">Forget this chat</button>`
+      + `<button class="line-btn" data-reset="project">Forget the project</button></div>`
+      + '<div class="hint">Neither can be undone; the goal and the approval recorded with it go with the project layer.</div></div>';
+    box.innerHTML = html;
+    box.querySelector('#goal-save')?.addEventListener('click', () => {
+      const field = box.querySelector('#goal-text');
+      const text = (field?.value || '').trim();
+      if (!text) { toast('Write the goal first', 'warn'); return; }
+      memoryGoal(text);
+    });
+    for (const button of box.querySelectorAll('[data-goal]')) {
+      button.addEventListener('click', () => memoryAnswer(button.dataset.goal));
+    }
+    for (const button of box.querySelectorAll('[data-add]')) {
+      button.addEventListener('click', () => {
+        const [layer, section] = button.dataset.add.split('|');
+        const field = box.querySelector(`[data-sec="${layer}|${section}"]`);
+        const text = (field?.value || '').trim();
+        if (!text) { toast('Write the line first', 'warn'); return; }
+        memoryWrite(layer, section, text);
+      });
+    }
+    // Destructive and unrecoverable, so the second click on the same button is the confirmation and
+    // not a dialog: the panel is repainted after any write, which clears the armed state on its own.
+    for (const button of box.querySelectorAll('[data-reset]')) {
+      button.addEventListener('click', () => {
+        if (button.dataset.armed !== '1') {
+          button.dataset.armed = '1';
+          button.textContent = 'Confirm — ' + button.textContent;
+          return;
+        }
+        memoryReset(button.dataset.reset);
+      });
+    }
   }
   function show(name) {
     for (const b of tabs.children) b.classList.toggle('on', b.dataset.tab === name);
@@ -528,8 +656,10 @@ function openSettings(tab) {
         send('unset_override', { target: target, key: key });
       });
     }
+    // The one tab whose content is not already in the snapshot: it asks for the record on opening.
+    if (name === 'memory') loadMemory();
   }
-  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['connection', 'Connection'], ['overrides', 'Overrides']]) {
+  for (const [name, label] of [['project', 'Project & plan'], ['models', 'Models'], ['notes', 'Notes'], ['memory', 'Memory'], ['connection', 'Connection'], ['overrides', 'Overrides']]) {
     const b = el('button', '', label); b.dataset.tab = name; b.onclick = () => show(name); tabs.appendChild(b);
   }
   const foot = el('footer');

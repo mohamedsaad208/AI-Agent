@@ -11,6 +11,6 @@ semantic_model_dir = "models"
 
 [limits]
 max_turns = 12
-timeout_seconds = 300
-context_chars = 24000
+timeout_seconds = 900
+context_chars = 64000
 output_tokens = 4096

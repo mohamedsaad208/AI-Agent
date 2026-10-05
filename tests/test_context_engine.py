@@ -151,7 +151,7 @@ class ExcerptTests(unittest.TestCase):
 
     def test_only_a_capped_number_of_files_arrive_as_fragments(self):
         files = {VAULT: big_file("Vault", "logout", "TWO")}
-        with patch("ai_code_engineer.engine.MAX_EXCERPTS", 1):
+        with patch("ai_code_engineer.context_builder.MAX_EXCERPTS", 1):
             script, _path = self.once("fix the login and logout methods",
                                       [{"action": "read_file", "path": APP},
                                        proposal("s", APP, SHORT)], files)

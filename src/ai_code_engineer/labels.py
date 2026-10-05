@@ -48,6 +48,7 @@ STATES = {
     "BLOCKED": "Task needs attention",
     "PARTIAL_APPLY": "Partially applied — review before continuing",
     "APPLYING": "Application interrupted — review the task",
+    "COMPLETED": "Completed — no changes were needed",
 }
 # The same sentences for a task written in Arabic. Keyed by state, so a state that gains an
 # English entry without one here still reads as its own name rather than as nothing.
@@ -63,6 +64,7 @@ STATES_AR = {
     "BLOCKED": "المهمة تحتاج انتباهك",
     "PARTIAL_APPLY": "تم التطبيق جزئيًا — راجع قبل المتابعة",
     "APPLYING": "انقطع التطبيق — راجع المهمة",
+    "COMPLETED": "اكتملت المهمة — لم يلزم أي تغيير",
 }
 # How far along the run is, which is a different question from what happened to it: the table above is the
 # outcome and decides which buttons work, this one is the position in the workflow and decides what a person
@@ -100,7 +102,7 @@ INTERRUPTED_STATES = {"PARTIAL_APPLY", "APPLYING"}
 TONE = {"CHECKS_PASSED": "ok", "WAITING_APPROVAL": "warn", "APPLIED_UNVERIFIED": "warn",
         "VERIFICATION_BLOCKED": "warn", "VERIFICATION_FAILED": "bad", "PARTIAL_APPLY": "bad",
         "APPLYING": "bad", "ROLLED_BACK": "idle", "CANCELLED": "idle", "BLOCKED": "bad",
-        "DISCOVERING": "idle"}
+        "COMPLETED": "ok", "DISCOVERING": "idle"}
 
 
 def state_label(value: str | None, *, arabic: bool = False) -> str:
@@ -490,6 +492,67 @@ NOTE_TEMPLATES = {
                     "حُفظت ملاحظات المشروع خارج مجلد المشروع، لذا لا يستطيع أي مقترح إعادة كتابتها."),
     "notes_in_request": ("Your saved project notes ({count} characters) are part of this request.",
                          "ملاحظاتك المحفوظة عن المشروع ({count} حرفًا) جزء من هذا الطلب."),
+    # The goal's own answers. Every window that moves a goal says one of these seven, so the reason a
+    # run cannot edit a goal is told in the operator's language rather than in whichever English a
+    # module happened to write into the outcome.
+    "goal_hand_edit": ("The goal in project.md was edited by hand; the record now matches what you "
+                       "typed.",
+                       "عُدِّل هدف المشروع في project.md يدويًا، فأصبح السجل مطابقًا لما كتبته."),
+    "goal_opened": ("The project goal was recorded.", "سُجِّل هدف المشروع."),
+    "goal_replaced": ("The goal was replaced on your instruction.", "استُبدل الهدف بأمر منك."),
+    "goal_pending": ("The goal is protected: your new wording is held for approval and the stored "
+                     "goal still stands.",
+                     "الهدف محمي: صياغتك الجديدة تنتظر موافقتك، والهدف المحفوظ يبقى قائمًا."),
+    "goal_none": ("Nothing is waiting for approval.", "لا شيء ينتظر الموافقة."),
+    "goal_same": ("That is already the goal, so nothing was written.",
+                  "هذا هو الهدف بالفعل، فلم يُكتب شيء."),
+    "goal_empty": ("Nothing was written to the goal — the words left nothing behind once a "
+                   "credential in them was removed.",
+                   "لم يُكتب شيء إلى الهدف — لم تبقَ الكلمات شيئًا بعد إزالة بيانات اعتماد منها."),
+    "goal_now": ("The goal now reads: {goal}", "أصبح الهدف الآن: {goal}"),
+    "goal_kept": ("Kept the stored goal: {goal}", "أُبقي الهدف المحفوظ: {goal}"),
+    # The two memory layers are forgotten apart, and the loss each one takes with it is a different
+    # amount of work — so each of the three answers says what went, and none of them is a string a
+    # window assembled out of the store's own words.
+    "memory_reset_empty": ("Nothing was reset — the memory was already empty.",
+                           "لم يُمسح شيء — كانت الذاكرة فارغة بالفعل."),
+    "memory_reset_chat": ("Reset the chat memory.", "مُسحت ذاكرة هذه المحادثة."),
+    "memory_reset_project": ("Reset the project memory and its goal record.",
+                             "مُسحت ذاكرة المشروع وسجل هدفه."),
+    "memory_reset_both": ("Reset the chat memory and the project memory with its goal record.",
+                          "مُسحت ذاكرة المحادثة وذاكرة المشروع وسجل هدفه."),
+    "memory_reset_kept": ("Here is what it said, in case you want any of it back:",
+                          "وإليك ما كانت تذكره، إن أردت استرجاع شيء منه:"),
+    "memory_written": ("Written to the {layer} memory:\n  {section}: {text}",
+                       "كُتب في ذاكرة {layer}:\n  {section}: {text}"),
+    # The refusals the memory engine gives both surfaces. They live in the table rather than in
+    # `compass` because an Arabic project deserves its refusal in Arabic too, and because a terminal
+    # and a window explaining the same rule in two different sets of words is the drift this table is
+    # the only thing standing against.
+    "memory_goal_protected": ("The goal is protected: state it with `memory edit goal <text>`, "
+                              "which records the approval it was written with.",
+                              "الهدف محمي: اكتبه بالأمر `memory edit goal <text>`، فسجله يُحفظ معه "
+                              "أثر موافقتك."),
+    "memory_no_section": ("Nothing in the memory is called `{name}`. The sections are: {sections}.",
+                          "لا شيء في الذاكرة يُسمى {name}. الأقسام هي: {sections}."),
+    "memory_two_layers": ("Memory comes in two layers: project and chat.",
+                          "الذاكرة طبقتان: المشروع والمحادثة."),
+    "memory_chat_layer": ("`{section}` belongs to the chat layer, and this session is not part of a "
+                          "chat. The project sections are: {sections}.",
+                          "قسم {section} يخصّ ذاكرة المحادثة، وهذه الجلسة ليست جزءًا من محادثة. "
+                          "أقسام المشروع هي: {sections}."),
+    "memory_needs_text": ("`memory edit {section}` needs the text to write.",
+                          "الأمر `memory edit {section}` يحتاج النص الذي يُكتب."),
+    "memory_section_full": ("`{section}` is full, and the rule you stated is not the one it gives "
+                            "up: reset the section first.",
+                            "قسم {section} ممتلئ، والقاعدة التي كتبتها ليست ما يتنازل عنه: أمسح "
+                            "القسم أولًا."),
+    "memory_reset_target": ("`memory reset` takes `project`, `chat` or `all` — not `{target}`.",
+                            "الأمر `memory reset` يقبل `project` أو `chat` أو `all`، لا {target}."),
+    "memory_reset_no_chat": ("This session belongs to no chat, so there is no chat memory to reset. "
+                             "`memory reset project` clears the project layer.",
+                             "هذه الجلسة ليست جزءًا من محادثة، فلا ذاكرة محادثة لتُمسح. الأمر "
+                             "`memory reset project` يمسح طبقة المشروع."),
     "new_chat_plain": ("New chat — it answers in prose and reads no project files. Choose a project "
                        "and it can read that folder too.",
                        "محادثة جديدة — تجيب بنثر ولا تقرأ ملفات مشروع. اختر مشروعًا ليُقرأ مجلده أيضًا."),
@@ -705,8 +768,10 @@ NOTE_TEMPLATES = {
                               "الكتابة تخضع لمراجعة المقترح وقواعد التطبيق التلقائي."),
     "policy_managed_delete": ("Every file deletion requires review, including with Auto-Apply.",
                               "كل حذف لملف يتطلب مراجعة، حتى مع التطبيق التلقائي."),
-    "policy_managed_execute_recipe": ("Recipes use the built-in allowlist and run only when you start them.",
-                                       "الوصفات تخضع للقائمة المسموح بها ولا تعمل إلا عند تشغيلك لها."),
+    "policy_managed_execute_recipe": ("Recipes come from the project's own build files, run for a task "
+                                      "on a copy, and are checked before they start.",
+                                      "الوصفات من ملفات بناء المشروع نفسها، وتعمل للمهمة على نسخة، "
+                                      "وتُفحص قبل أن تبدأ."),
     "policy_managed_git_local": ("Local Git actions use their own checks; this tool has no push action.",
                                   "عمليات Git المحلية لها فحوصها؛ ولا توجد في الأداة عملية دفع للمستودع."),
 }
@@ -861,7 +926,8 @@ STEP_MAX_FILES = 6
 # before the last write" are different claims — that difference is what a row opens to say. `label` is
 # the recipe name a build error came from: the rebuild in `display_session` filters the stored record
 # through this tuple, so a field left out of it makes a reopened task say less than the live row did.
-STEP_FIELDS = ("path", "query", "count", "names", "reason", "detail", "digest", "label")
+STEP_FIELDS = ("path", "query", "count", "names", "reason", "detail", "digest", "label",
+               "from_line", "to_line", "total_lines")
 
 
 def step_has_detail(action: str, fields: dict | None = None) -> bool:
@@ -882,6 +948,10 @@ def step_has_detail(action: str, fields: dict | None = None) -> bool:
     if action == "read_file":
         return bool(fields.get("digest"))
     if action == "model_reasoning":
+        return bool(fields.get("detail"))
+    if action in {"run_tests", "run_build", "git_diff", "complete"}:
+        # A run's verdict is read by opening its row; "complete" carries only the sentence that
+        # says why nothing needed to change.
         return bool(fields.get("detail"))
     return action in {"search_code", "list_files"}
 
@@ -935,7 +1005,8 @@ def graph_caption(arabic: bool, *, nodes: int, edges: int, cyclic: bool = False,
 
 def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", count: int = 0,
               names: list | None = None, reason: str = "", detail: str = "", digest: str = "",
-              label: str = "") -> str:
+              label: str = "", from_line: int | None = None, to_line: int | None = None,
+              total_lines: int | None = None, **_ignored) -> str:
     """One line for one thing the agent just did.
 
     These reach the chat as tool rows, so they are plain text by construction. An action this
@@ -946,6 +1017,11 @@ def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", cou
     it found is what opening the row answers.
     """
     if action == "read_file":
+        if from_line is not None and to_line is not None and total_lines:
+            if from_line > 1 or to_line < total_lines:
+                return say(arabic,
+                           en=f"\U0001f4d6 Reading file: {path} (lines {from_line}–{to_line} of {total_lines})",
+                           ar=f"\U0001f4d6 قراءة الملف: {path} (الأسطر {from_line}–{to_line} من إجمالي {total_lines})")
         return say(arabic, en=f"\U0001f4d6 Reading file: {path}", ar=f"\U0001f4d6 قراءة الملف: {path}")
     if action == "search_code":
         return say(arabic, en=f"\U0001f50d Searching code: {query}", ar=f"\U0001f50d البحث في الكود: {query}")
@@ -966,6 +1042,26 @@ def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", cou
     if action == "find_references":
         return say(arabic, en=f"\U0001f9ed Finding uses of: {query}",
                    ar=f"\U0001f9ed البحث عن استخدامات: {query}")
+    if action in {"run_tests", "run_build"}:
+        # The label names the fixed recipe the runtime chose (or "" when there was none); what the
+        # run printed is the row's detail, which opening the row answers. The action name stays in
+        # the line on purpose: a tool that vanishes from the thread under a paraphrase is a
+        # regression the operator cannot see.
+        doing = ("Running project tests" if action == "run_tests"
+                 else "Building the project")
+        doing_ar = ("تشغيل اختبارات المشروع" if action == "run_tests"
+                    else "بناء المشروع")
+        mark = "\U0001f9ea " if action == "run_tests" else "\U0001f528 "
+        body = say(arabic, en=f"{mark}{action}: {doing}", ar=f"{mark}{action}: {doing_ar}")
+        extra = label or detail
+        return f"{body} ({extra})" if extra else body
+    if action == "git_diff":
+        return say(arabic, en="\U0001f9fe Reading uncommitted changes...",
+                   ar="\U0001f9fe قراءة التعديلات غير الملتزمة...")
+    if action == "complete":
+        body = say(arabic, en="\u2705 Task complete — no changes needed",
+                   ar="\u2705 اكتملت المهمة — لم يلزم تغيير")
+        return f"{body}: {detail}" if detail else body
     if action == "context_files":
         # The reason travels as a code and a symbol, never as a finished sentence: which file was chosen
         # is the engine's decision, and how it is said belongs here with the rest of the thread's words.
@@ -992,6 +1088,11 @@ def step_line(arabic: bool, action: str, *, path: str = "", query: str = "", cou
         return f"{body}{where}: {detail}" if detail else f"{body}{where}"
     if action == "blocked":
         return say(arabic, en=f"\u26d4 Blocked: {reason}", ar=f"\u26d4 توقفت المهمة: {reason}")
+    if action == "steer":
+        # The instruction is the user's own words, said back verbatim: a steering line that paraphrases
+        # what a person asked for is how a constraint gets quietly weakened in front of them.
+        body = say(arabic, en="\U0001f4cc Steering applied", ar="\U0001f4cc تم تطبيق التوجيه")
+        return f"{body}: {detail}" if detail else body
     if action == "applied":
         return applied_line(arabic, count=count)
     if action == "executing":
@@ -1174,6 +1275,14 @@ def log_line(arabic: bool, entry: dict) -> str:
     if kind == "tool":
         name = str(entry.get("name", ""))
         if name == "read_file":
+            from_line = entry.get("from_line")
+            to_line = entry.get("to_line")
+            total_lines = entry.get("total_lines")
+            if from_line is not None and to_line is not None and total_lines:
+                if from_line > 1 or to_line < total_lines:
+                    return say(arabic,
+                               en=f"\U0001f4d6 Read {entry.get('path', '')} (lines {from_line}–{to_line} of {total_lines})",
+                               ar=f"\U0001f4d6 قراءة {entry.get('path', '')} (الأسطر {from_line} إلى {to_line} من أصل {total_lines} سطر)")
             return say(arabic, en=f"\U0001f4d6 Read {entry.get('path', '')}",
                        ar=f"\U0001f4d6 قراءة {entry.get('path', '')}")
         if name == "list_files":
@@ -1182,6 +1291,16 @@ def log_line(arabic: bool, entry: dict) -> str:
         if name == "search_code":
             return say(arabic, en=f"\U0001f50d {entry.get('matches', 0)} match(es) in the project",
                        ar=f"\U0001f50d {entry.get('matches', 0)} نتيجة في المشروع")
+        if name in {"run_tests", "run_build"}:
+            mark = "\U0001f9ea " if name == "run_tests" else "\U0001f528 "
+            return say(arabic, en=mark + f"{name} ({entry.get('recipe', '')}) — {entry.get('status', '')}",
+                       ar=mark + f"{name} ({entry.get('recipe', '')}) — {entry.get('status', '')}")
+        if name == "git_diff":
+            return say(arabic,
+                       en=f"\U0001f9fe git_diff — {entry.get('chars', 0)} character(s), "
+                          f"{entry.get('untracked', 0)} untracked",
+                       ar=f"\U0001f9fe git_diff — {entry.get('chars', 0)} حرف، "
+                          f"{entry.get('untracked', 0)} غير مُلتزم")
         if entry.get("query"):
             return say(arabic, en=f"\U0001f50d {name}: {entry['query']} — {entry.get('count', 0)} hit(s)",
                        ar=f"\U0001f50d {name}: {entry['query']} — {entry.get('count', 0)} نتيجة")
@@ -1217,6 +1336,9 @@ def log_line(arabic: bool, entry: dict) -> str:
                    ar=f"\U0001f6ab رفض إجراء: {entry.get('reason', '')}")
     if kind == "proposal":
         return say(arabic, en="\u270d\ufe0f Proposal recorded", ar="\u270d\ufe0f تسجيل المقترح")
+    if kind == "completed":
+        return say(arabic, en="\u2705 Completed — no file changes needed",
+                   ar="\u2705 اكتملت المهمة — لم يلزم تغيير ملفات")
     if kind == "approved":
         return say(arabic, en="\u2705 Approved for writing", ar="\u2705 الموافقة على الكتابة")
     if kind == "proposal_rejected":

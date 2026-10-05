@@ -1,13 +1,12 @@
-# Google Gemini: fast hosted inference via Google AI Studio (OpenAI-compatible endpoint).
-# The key is read from GEMINI_API_KEY (or GOOGLE_API_KEY).
+# Google Gemini: Generous free tier via Google AI Studio
 [model]
 provider = "gemini"
-name = "gemini-3.6-flash"
+name = "gemini-3.5-flash"
 endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"
 
 [limits]
-max_turns = 8
+max_turns = 10
 timeout_seconds = 120
-context_chars = 32000
+context_chars = 64000
 output_tokens = 8192

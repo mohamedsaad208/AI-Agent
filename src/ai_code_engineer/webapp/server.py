@@ -1,5 +1,9 @@
 """Local-only HTTP server: static UI, a JSON action endpoint, and one SSE stream.
 
+Two producers write on that one stream: the controller's own UI events and, through the agent's
+event bus, every structured event a run records. Each leaves numbered, and a window of the recent
+ones is kept, so a tab that blips its connection asks for what it missed instead of losing it.
+
 Binds to 127.0.0.1 on a random port and requires a per-launch token, because a browser
 page on the same machine can otherwise be reached by any other process or web page.
 
@@ -11,13 +15,16 @@ Content-Security-Policy. Nothing in this module writes to a project.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import secrets
 import threading
 import urllib.parse
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .. import events as ux
 from ..errors import AgentError
 from ..labels import friendly_error
 from ..redaction import redact
@@ -44,15 +51,40 @@ SAFE_HEADERS = (
 
 
 class Hub:
-    """Fan-out for the SSE stream; a slow client drops events instead of blocking the agent."""
+    """Fan-out for the SSE stream, one id per event and a window of them kept for a reconnect.
 
-    def __init__(self) -> None:
+    A slow client drops events instead of blocking the agent. Every event also leaves with a
+    sequence number and a copy stays in the replay window, because a tab that blips its
+    connection comes back a second later asking for what it missed — and the frames it missed
+    are the ones it was waiting for.
+    """
+
+    CLIENT_QUEUE = 256
+    REPLAY_WINDOW = 512
+
+    def __init__(self, replay_limit: int = REPLAY_WINDOW) -> None:
         self._clients: list[queue.Queue] = []
         self._lock = threading.Lock()
+        self._replay: deque = deque(maxlen=max(0, int(replay_limit)))
+        self._seq = 0
+        self._detach: list = []
 
-    def subscribe(self) -> queue.Queue:
-        client: queue.Queue = queue.Queue(maxsize=256)
+    def subscribe(self, last_id: int = 0) -> queue.Queue:
+        """A new listener, seeded with whatever it missed since `last_id` if it asked for that.
+
+        The replay is handed out under the same lock that publishes take, so an event that lands
+        between the two cannot be both buffered and live — delivered once, or not at all.
+        """
+        client: queue.Queue = queue.Queue(maxsize=self.CLIENT_QUEUE)
         with self._lock:
+            if last_id > 0:
+                for event_id, payload in self._replay:
+                    if event_id <= last_id:
+                        continue
+                    try:
+                        client.put_nowait((event_id, payload))
+                    except queue.Full:
+                        break            # missed more than a queue holds; the snapshot covers the rest
             self._clients.append(client)
         return client
 
@@ -61,14 +93,52 @@ class Hub:
             if client in self._clients:
                 self._clients.remove(client)
 
-    def publish(self, event: dict) -> None:
+    def publish(self, event) -> int:
+        """Send one event — a controller's dict, or a typed agent event — to every listener."""
+        payload = event if isinstance(event, dict) else ux.coerce(event).to_dict()
         with self._lock:
+            self._seq += 1
+            event_id = self._seq
+            if self._replay.maxlen:
+                self._replay.append((event_id, payload))
             clients = list(self._clients)
         for client in clients:
             try:
-                client.put_nowait(event)
+                client.put_nowait((event_id, payload))
             except queue.Full:
                 pass
+        return event_id
+
+    def attach(self, bus=None, min_level: "ux.EventLevel | None" = None):
+        """Stream the agent's own events through this hub until the returned call detaches it.
+
+        The engine's bus is a second producer on the same wire as the controller's `_emit`, and it
+        is the one that knows what a run is doing. The subscription is unplugged on shutdown, so a
+        window that has closed is not a listener the next run still pays for.
+        """
+        bus = ux.global_bus if bus is None else bus
+        level = min_level if min_level is not None else _verbosity_level()
+        bus.subscribe(self.publish, min_level=level)
+
+        def detach() -> None:
+            bus.unsubscribe(self.publish)
+
+        self._detach.append(detach)
+        return detach
+
+    def detach_all(self) -> None:
+        """Unplug every bus this hub was pointed at; safe to call more than once."""
+        for detach in self._detach:
+            detach()
+        self._detach = []
+
+
+def _verbosity_level() -> "ux.EventLevel":
+    """How much of the agent's notebook the browser is sent, the same dial the CLI reads."""
+    verbosity = (os.environ.get("AGENT_VERBOSITY") or "").strip().lower()
+    if verbosity in ("verbose", "debug"):
+        return ux.EventLevel(verbosity)
+    return ux.EventLevel.NORMAL
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -284,12 +354,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.controller.project_info(query.get("project", [""])[0]))
             except (AgentError, OSError, ValueError) as exc:
                 return self._fail(exc, 400)
+        if path == "/api/memory":
+            # The compass panel: both layers, and the block they build. Asked for on the click for the
+            # same reason as the project drawer — it reads the memory files and re-measures the block,
+            # and a window watching a run has no use for either until somebody opens the tab.
+            try:
+                return self._json(self.controller.memory_panel(query.get("chat", [""])[0]))
+            except (AgentError, OSError, ValueError) as exc:
+                return self._fail(exc, 400)
         if path == "/api/events":
-            return self._stream()
+            return self._stream(query)
         return self._text("Unknown endpoint.", 404)
 
-    def _stream(self):
-        client = self.hub.subscribe()
+    def _last_event_id(self, query: dict) -> int:
+        """What the listener says it has already seen.
+
+        A reconnect the *browser* makes names the last id it read in a header. The reconnect the
+        page makes itself is a new `EventSource`, which sends no header, so it names the same number
+        in the URL instead — either way, a 1.5 s blip costs no events. Neither is required: a tab
+        that says nothing gets the live stream and the snapshot it asks for.
+        """
+        raw = self.headers.get("last-event-id") or query.get("last", [""])[0]
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 0
+
+    def _stream(self, query: dict):
+        client = self.hub.subscribe(self._last_event_id(query))
         self.send_response(200)
         self._safe()
         self.send_header("content-type", "text/event-stream; charset=utf-8")
@@ -297,20 +389,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("x-accel-buffering", "no")
         self.end_headers()
         try:
-            self.wfile.write(b"retry: 1500\n\n")
-            self.wfile.flush()
+            self._sse(b"retry: 1500\n\n")
             while True:
                 try:
-                    event = client.get(timeout=15)
-                    chunk = f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+                    event_id, payload = client.get(timeout=15)
+                    data = json.dumps(payload, ensure_ascii=False, default=str)
+                    chunk = f"id: {event_id}\ndata: {data}\n\n".encode("utf-8")
                 except queue.Empty:
                     chunk = b": keep-alive\n\n"
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                self._sse(chunk)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
             self.hub.unsubscribe(client)
+
+    def _sse(self, chunk: bytes) -> None:
+        """One frame, out now: a buffered event stream is a page that stopped listening."""
+        self.wfile.write(chunk)
+        self.wfile.flush()
 
     def _static(self, path: str):
         name = "index.html" if path in {"/", ""} else path.lstrip("/")
@@ -329,7 +425,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(controller, host: str = "127.0.0.1", port: int = 0):
+class _Server(ThreadingHTTPServer):
+    """The listener, and the one place that knows the session's hub has to be unplugged.
+
+    Stopping the window ends the socket server; it must also end the bus subscription the hub took
+    on its behalf, or every run in this process keeps publishing into a window nobody is looking at.
+    """
+
+    daemon_threads = True
+    hub: Hub | None = None
+
+    def shutdown(self) -> None:
+        if self.hub is not None:
+            self.hub.detach_all()
+        super().shutdown()
+
+
+def serve(controller, host: str = "127.0.0.1", port: int = 0, bus=None):
     """Start serving and return (server, url, token). Call server.shutdown() to stop."""
     if host not in LOOPBACK:
         raise AgentError("The UI binds to loopback only.")
@@ -340,12 +452,14 @@ def serve(controller, host: str = "127.0.0.1", port: int = 0):
     # same process took over the first one's authentication: the first window would answer the
     # second's token and drive the second's controller. A subclass per server keeps two windows in
     # one process — which the desktop launcher can be asked for — apart in all four fields.
-    bound = type("SessionHandler", (Handler,), {"token": token, "controller": controller, "hub": Hub()})
-    server = ThreadingHTTPServer((host, port), bound)
-    server.daemon_threads = True
+    hub = Hub()
+    bound = type("SessionHandler", (Handler,), {"token": token, "controller": controller, "hub": hub})
+    server = _Server((host, port), bound)
+    server.hub = hub
     actual = server.server_address[1]
     # The Host check compares against the port this process actually owns, which is only knowable
     # after binding: a caller that asked for port 0 gets a random one.
     bound.port = actual
+    hub.attach(bus)
     threading.Thread(target=server.serve_forever, name="ui-http", daemon=True).start()
     return server, f"http://{host}:{actual}/?t={token}", token

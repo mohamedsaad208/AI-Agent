@@ -452,11 +452,20 @@ class OpenAICompatibleProvider:
         env_name = settings.api_key_env or self.kind.key_env
         self.key = api_key or (os.environ.get(env_name) if env_name else "")
         if not self.key and self.kind.key == "gemini":
-            self.key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+            self.key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not self.key and self.kind.key == "ovh":
+            self.key = os.environ.get("OVH_API_KEY") or os.environ.get("OVH_AI_ENDPOINTS_ACCESS_TOKEN") or ""
+        if not self.key and self.kind.key == "llm7":
+            self.key = os.environ.get("LLM7_API_KEY")
         # A custom endpoint may or may not want a key — that is the user's server to decide — so only
         # the rows that are known to require one refuse without it.
         if self.kind.needs_key and not self.key:
-            err_var = "GEMINI_API_KEY or GOOGLE_API_KEY" if self.kind.key == "gemini" else (env_name or "an API key")
+            if self.kind.key == "gemini":
+                err_var = "GEMINI_API_KEY or GOOGLE_API_KEY"
+            elif self.kind.key == "ovh":
+                err_var = "OVH_API_KEY or OVH_AI_ENDPOINTS_ACCESS_TOKEN"
+            else:
+                err_var = env_name or "an API key"
             raise ProviderError(f"Set {err_var} in your environment (never in a file).")
 
     def generate(self, messages: list[dict], json_mode: bool = True, on_token=None,
@@ -468,7 +477,7 @@ class OpenAICompatibleProvider:
             "model": self.settings.model, "messages": messages, "stream": on_token is not None,
             "temperature": 0 if json_mode else 0.2, "max_tokens": self.settings.output_tokens,
         }
-        if not json_mode:
+        if not json_mode and self.kind.key != "gemini":
             body["frequency_penalty"] = 0.2
             body["presence_penalty"] = 0.1
         if json_mode:

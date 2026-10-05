@@ -8,7 +8,7 @@ $('new-chat').onclick = () => send('new_chat');
 $('collapse').onclick = toggleSidebar;
 $('sidebar-expand').onclick = toggleSidebar;
 if ($('attach-top')) $('attach-top').onclick = () => send('pick_plan');
-if ($('app-settings-btn')) $('app-settings-btn').onclick = openSettings;
+if ($('app-settings-btn')) $('app-settings-btn').onclick = () => openSettings('project');
 
 const scroller = $('scroller');
 const jumpBtn = $('jump-latest');
@@ -60,6 +60,14 @@ addEventListener('keydown', (e) => {
   if (mod && key === 'k' && !e.shiftKey) { e.preventDefault(); palette(); }
   if (mod && key === 'k' && e.shiftKey) { e.preventDefault(); send('new_chat'); }
   if (mod && key === 'b' && !e.shiftKey) { e.preventDefault(); toggleSidebar(); }
+  /* One-key approvals. They fire only over a live proposal the window would let you Apply — the
+     same `canApply` the buttons read — and only with no modifier, so they never collide with the
+     Ctrl bindings above or with typing (the `handsBusy` guard at the top already holds for fields). */
+  if (!mod && !e.shiftKey && DATA.review && DATA.review.canApply) {
+    if (key === 'y') { e.preventDefault(); send('apply'); }
+    else if (key === 'n') { e.preventDefault(); send('reject'); }
+    else if (key === 'd') { e.preventDefault(); openFile(DATA.review.selected || 0); }
+  }
 });
 
 const PARAMS = new URLSearchParams(location.search);

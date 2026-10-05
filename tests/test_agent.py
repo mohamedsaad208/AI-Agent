@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer import engine, repair
+from ai_code_engineer import engine, policy, repair, tools
 from ai_code_engineer.cli import demo
 from ai_code_engineer.config import MIN_CONTEXT_CHARS, Settings, load_settings
 from ai_code_engineer.engine import (apply_proposal, atomic_json, chat_sessions, DEFAULT_CHECKS, diff_size,
@@ -85,6 +85,43 @@ class AgentTests(unittest.TestCase):
         session = load_session(self.draft())
         self.assertEqual(session["state"], "WAITING_APPROVAL")
         self.assertEqual((self.root / "app.py").read_text(), "answer = 1\n")
+
+    def test_complete_ends_the_run_without_writing_anything(self):
+        provider = ScriptedProvider([{"action": "complete",
+                                      "summary": "The answer is already 1."}])
+        path = plan(self.ws, "Make the answer 1", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "COMPLETED")
+        self.assertEqual(session["summary"], "The answer is already 1.")
+        self.assertEqual((self.root / "app.py").read_text(), "answer = 1\n")
+        self.assertNotIn("proposal_hash", session)
+
+    def test_complete_without_a_summary_is_still_a_result(self):
+        provider = ScriptedProvider([{"action": "complete"}])
+        path = plan(self.ws, "Make the answer 1", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "COMPLETED")
+        self.assertTrue(session["summary"])
+
+    def test_a_complete_with_a_non_sentence_summary_is_refused_and_the_loop_recovers(self):
+        provider = ScriptedProvider([{"action": "complete", "summary": 42},
+                                     {"action": "complete", "summary": "ok now"}])
+        path = plan(self.ws, "Make the answer 1", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "COMPLETED")
+        self.assertEqual(session["summary"], "ok now")
+
+    def test_a_completed_task_cannot_be_resumed(self):
+        provider = ScriptedProvider([{"action": "complete", "summary": "done"}])
+        path = plan(self.ws, "Make the answer 1", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        with self.assertRaises(PolicyError):
+            plan(self.ws, "Make the answer 1", ScriptedProvider([{"action": "complete"}]),
+                 Settings(), self.base / "runs", progress=lambda _: None,
+                 resume_run=load_session(path)["id"])
 
     def test_declined_proposal_requires_explicit_reopening(self):
         path = self.draft()
@@ -809,6 +846,95 @@ class AgentTests(unittest.TestCase):
         self.assertIn("short summary", refused[0]["reason"])
         self.assertIn("short summary", " ".join(m["content"] for m in provider.prompts[1]))
 
+    def test_an_asking_nested_under_args_is_obeyed_rather_than_charged_as_a_mistake(self):
+        """The function-calling dialect every model is tuned on: `read_file` with its path inside
+        `args` is the asking the prompt made, and refusing it on the envelope used to cost three
+        refusals and the run — the invalid-action budget — for a model that never got it wrong."""
+        provider = ScriptedProvider([
+            {"action": "read_file", "args": {"path": "app.py"}},
+            {"action": "propose", "parameters": {
+                "summary": "Update answer", "checks": ["unit tests"],
+                "changes": [{"path": "app.py", "content": "answer = 2\n"}]}}])
+        path = plan(self.ws, "Update answer", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "WAITING_APPROVAL")
+        self.assertEqual(session["summary"], "Update answer")
+        self.assertEqual([item["path"] for item in session["changes"]], ["app.py"])
+        self.assertFalse([item for item in session["events"]
+                          if item["kind"] == "rejected_action"], session["events"])
+
+    def test_a_decision_that_explains_itself_is_judged_on_the_asking_not_the_prose(self):
+        """A reasoning model writes its deliberation into the envelope it was asked for, under
+        `thought` where the prompt said `reason`. The prose is no part of the contract, so it comes
+        out before validation — and, being a raw reply, is recorded nowhere."""
+        provider = ScriptedProvider([
+            {"action": "read_file", "path": "app.py", "thought": "checking the current value"},
+            {"action": "propose", "summary": "Update answer", "checks": ["unit tests"],
+             "reason": "one line changes",
+             "changes": [{"path": "app.py", "content": "answer = 2\n"}]}])
+        path = plan(self.ws, "Update answer", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "WAITING_APPROVAL")
+        self.assertEqual(session["summary"], "Update answer")
+        recorded = json.dumps(session["events"])
+        self.assertNotIn("checking the current value", recorded)
+        self.assertNotIn("one line changes", recorded)
+
+    def test_a_check_the_policy_denies_is_an_observation_and_the_model_can_still_propose(self):
+        """The registry asks the loop's verdict before any handler runs, so a refused class costs
+        the model one turn and a sentence rather than a command — and a proposal without the check
+        is still a result. The verdict is the module's own function, peeked at here by answering it
+        differently: exactly the seam the boundary was built as."""
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_app.py").write_text(
+            "import unittest\n\n\nclass One(unittest.TestCase):\n"
+            "    def test_ok(self):\n        self.assertTrue(True)\n", encoding="utf-8")
+        provider = RecordingProvider([{"action": "run_tests"},
+                                      {"action": "read_file", "path": "app.py"},
+                                      self.proposal()])
+        answers = {policy.EXECUTE_RECIPE: policy.DENY, policy.READ: policy.ALLOW}
+
+        def decide(name, override=""):
+            return answers.get(name, policy.ALLOW)
+
+        with patch.object(policy, "decide", new=decide):
+            path = plan(self.ws, "Update answer", provider, Settings(), self.base / "runs",
+                        progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "WAITING_APPROVAL")
+        self.assertFalse([item for item in session["events"]
+                          if item["kind"] == "tool" and item["name"] == "run_tests"],
+                         "the denied class never reached its handler")
+        rejection = [item for item in session["events"] if item["kind"] == "rejected_action"]
+        self.assertTrue(rejection, session["events"])
+        self.assertIn("policy denies", rejection[0]["reason"])
+        told = " ".join(message["content"] for message in provider.prompts[1])
+        self.assertIn("policy denies", told)
+        self.assertIn("run_tests", told)
+
+    def test_a_failed_check_becomes_continuity_evidence_the_next_prompt_carries(self):
+        """The tool's own verdict is folded into the task state by the loop, not left to the model
+        to restate, so the turn after the failure reads it from the state block the way it reads
+        its own entries — the record keeps what the trimmed history would have dropped."""
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_app.py").write_text(
+            "import unittest\n\n\nclass One(unittest.TestCase):\n"
+            "    def test_bad(self):\n        self.assertTrue(False, \"boom\")\n", encoding="utf-8")
+        provider = RecordingProvider([{"action": "run_tests"},
+                                      {"action": "read_file", "path": "app.py"},
+                                      self.proposal()])
+        path = plan(self.ws, "Update answer", provider, Settings(), self.base / "runs",
+                    progress=lambda _: None)
+        session = load_session(path)
+        self.assertEqual(session["state"], "WAITING_APPROVAL")
+        evidence = session["task_state"]["evidence"]
+        self.assertTrue(any(item.startswith("run_tests (python-unittest): failed")
+                            for item in evidence), evidence)
+        told = " ".join(message["content"] for message in provider.prompts[1])
+        self.assertIn("run_tests (python-unittest): failed", told)
+
     def test_a_blocked_task_keeps_the_reason_that_blocked_it(self):
         provider = ScriptedProvider([self.UNKNOWN] * 5)
         runs = self.base / "runs"
@@ -857,6 +983,33 @@ class AgentTests(unittest.TestCase):
             plan(self.ws, "change", provider, Settings(), self.base / "runs",
                  progress=lambda _: None)
         self.assertIn("Model could not produce a proposal", str(caught.exception))
+
+    def test_a_block_that_explains_itself_in_thought_blocks_on_that_explanation(self):
+        """The reason is what a blocked run is read by afterwards, so the sentence has to survive
+        being sent under the other name — and the loop's judgement of it does not change with the key
+        it arrived in."""
+        provider = ScriptedProvider([
+            {"action": "read_file", "path": "app.py"},
+            {"action": "blocked", "thought": "The task needs a database this project cannot reach."}])
+        with self.assertRaises(AgentError) as caught:
+            plan(self.ws, "change", provider, Settings(), self.base / "runs",
+                 progress=lambda _: None)
+        self.assertIn("a database this project cannot reach", str(caught.exception))
+
+    def test_a_block_with_nothing_to_say_is_still_asked_to_say_something(self):
+        """Tolerating the second name is not tolerating the absence of one: an explanation that is
+        not a sentence leaves the loop with nothing to record, which is the refusal it always was."""
+        said = "The task needs a database this project cannot reach."
+        provider = RecordingProvider([{"action": "blocked", "reason": 42},
+                                      {"action": "blocked"},
+                                      self.blocked(said), self.blocked(said + " Now."),
+                                      self.blocked(said + " Please.")])
+        with self.assertRaises(AgentError) as caught:
+            plan(self.ws, "change", provider, Settings(), self.base / "runs",
+                 progress=lambda _: None)
+        self.assertIn("Model could not produce a proposal", str(caught.exception))
+        told = " ".join(message["content"] for message in provider.prompts[1])
+        self.assertIn("A blocked action requires a short reason", told)
 
     def test_persistent_blocked_still_ends_the_run(self):
         provider = ScriptedProvider([self.UNKNOWN]
@@ -1544,6 +1697,18 @@ class TheSymbolVerbs(unittest.TestCase):
         self.assertIn('"truncated": false', told)
         self.assertNotIn("truncated at", told)
 
+    def test_every_row_a_run_writes_is_keyed_by_an_id_no_other_row_uses(self):
+        """The id is the only handle a row clicked an hour later has for its details, and a tool's
+        row now takes the id the registry minted for the call — so the one thing that must survive
+        that handover is that no two rows share a key."""
+        session, _told = self.ask({"action": "find_symbol", "query": "add"},
+                                  {"action": "search_code", "query": "add"})
+        ids = [row["id"] for row in session["events"] if row["kind"] == "step"]
+        self.assertGreaterEqual(len(ids), 2, session["events"])
+        self.assertEqual(len(ids), len(set(ids)))
+        for one in ids:
+            self.assertRegex(one, r"^[0-9a-f]{8}$")
+
     def test_a_declaration_list_cut_at_the_cap_says_it_was_cut(self):
         for number in range(45):
             (self.ws.root / f"d{number}.py").write_text("def thing():\n    return 1\n",
@@ -1606,15 +1771,14 @@ class TheSymbolVerbs(unittest.TestCase):
         chain does not know costs a turn per attempt, and one the chain knows but the prompt never
         mentions is code no model will ever ask for."""
         root = Path(__file__).resolve().parents[1] / "src" / "ai_code_engineer"
-        # The menu and the chain live in different files now: `prompts.py` carries the prompt the
-        # engine sends, `engine.py` carries the loop that answers it. Reading one of the two for
-        # both sides is a guard that goes blind the day the prompt moves.
         offered = set(re.findall(r'\n- action="(\w+)":',
                                  (root / "prompts.py").read_text(encoding="utf-8")))
-        text = (root / "engine.py").read_text(encoding="utf-8")
-        # Only the handler chain's own comparisons: `name == "..."` also appears as `os.name == "nt"`,
-        # which is a platform check and not an action the model can ask for.
-        handled = set(re.findall(r'(?:elif|if) name == "(\w+)" and', text))
+        # The kitchen is asked rather than read out of a source file. It lives in two places now:
+        # the table in `tools.py`, and the two control actions `engine.py` keeps for itself because
+        # `propose` returns the session and `blocked` raises. A regex over either file goes blind
+        # the day one of them moves, and `names()` is the very list the refusal for an unknown
+        # action is built from — so it is the vocabulary the loop actually answers to.
+        handled = set(tools.default_registry().names())
         self.assertEqual(offered, handled, "the menu and the kitchen disagree")
         self.assertIn("find_symbol", offered)
         self.assertIn("find_references", offered)
