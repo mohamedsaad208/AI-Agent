@@ -7,11 +7,30 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tempfile
+import time
 
 from . import ignore, runner, symbols
 from .errors import MissingFileError, PolicyError
 
+
+def _resilient_replace(src: str | Path, dst: str | Path, max_tries: int = 15, delay: float = 0.05) -> None:
+    """Atomic replace with exponential backoff on Windows when files are held by scanners/watchers."""
+    for attempt in range(max_tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max_tries - 1:
+                raise
+            time.sleep(delay)
+
+
 MAX_FILE_BYTES = 128 * 1024
+# A windowed read pays for the whole decode but shows only its slice, so paging is allowed to
+# reach files a whole read never could: the ceiling is a memory bound, not a context one.
+MAX_PAGED_FILE_BYTES = 4 * 1024 * 1024
+# The page a bare `offset` gets when the caller names a starting line but no length.
+DEFAULT_WINDOW_LINES = 400
 # The read cache is a turn's worth of relief, not a second copy of the project in memory:
 # 2 MB of decoded text is dozens of typical source files, and the oldest entries go first.
 READ_CACHE_CHARS = 2_000_000
@@ -161,7 +180,13 @@ class Workspace:
             raise PolicyError("Instructions and policy files are read-only: " + relative)
         return current
 
-    def read(self, relative: str) -> dict:
+    def read(self, relative: str, offset: int | None = None,
+             limit: int | None = None) -> dict:
+        """One file's text, whole or as a line window.
+
+        A window (`offset` from 1, `limit` lines) reaches files above the whole-read ceiling;
+        the answer always says which lines it carries and whether more follow, because a model
+        that cannot tell where its view stopped will propose against lines it never saw."""
         path = self.path(relative)
         try:
             info = path.stat()
@@ -169,31 +194,51 @@ class Workspace:
             raise MissingFileError("File does not exist: " + relative) from None
         if not stat.S_ISREG(info.st_mode):
             raise PolicyError("Path is not a regular file: " + relative)
-        if info.st_size > MAX_FILE_BYTES:
-            raise PolicyError(f"File exceeds the {MAX_FILE_BYTES // 1024} KiB read limit: " + relative)
+        paged = offset is not None or limit is not None
+        ceiling = MAX_PAGED_FILE_BYTES if paged else MAX_FILE_BYTES
+        if info.st_size > ceiling:
+            raise PolicyError(
+                f"File exceeds the {ceiling // 1024} KiB read limit: " + relative
+                + ("" if paged else " — read it in windows with offset and limit."))
         cached = self._read_cache.get(relative)
         if cached and cached[0] == info.st_mtime_ns and cached[1] == info.st_size:
-            return dict(cached[2])
-        raw = path.read_bytes()
-        if len(raw) > MAX_FILE_BYTES or b"\x00" in raw:
-            raise PolicyError("File is too large or binary.")
-        try:
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            # The offset is the point: "not UTF-8" alone is not something anyone can act on, and a
-            # cp1252 `messages_ar.properties` is one byte per line away from a fix. There is no
-            # fallback decode here deliberately — this content can come back as a write, and
-            # re-encoding a file nobody chose to convert rewrites every non-ASCII byte in it.
-            raise PolicyError(
-                f"File '{relative}' is not valid UTF-8 (invalid byte 0x{raw[exc.start]:02x} at "
-                f"offset {exc.start}). Convert it to UTF-8, or keep it out of the task.") from exc
-        result = {"path": relative, "sha256": digest(raw), "content": content}
-        while self._read_cache and self._read_chars > READ_CACHE_CHARS:
-            self._read_cache.pop(next(iter(self._read_cache)))
-            self._read_chars = sum(len(row[2]["content"]) for row in self._read_cache.values())
-        self._read_cache[relative] = (info.st_mtime_ns, info.st_size, result)
-        self._read_chars += len(content)
-        return dict(result)
+            full = dict(cached[2])
+        else:
+            raw = path.read_bytes()
+            if len(raw) > MAX_PAGED_FILE_BYTES or b"\x00" in raw:
+                raise PolicyError("File is too large or binary.")
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # The offset is the point: "not UTF-8" alone is not something anyone can act on, and a
+                # cp1252 `messages_ar.properties` is one byte per line away from a fix. There is no
+                # fallback decode here deliberately — this content can come back as a write, and
+                # re-encoding a file nobody chose to convert rewrites every non-ASCII byte in it.
+                raise PolicyError(
+                    f"File '{relative}' is not valid UTF-8 (invalid byte 0x{raw[exc.start]:02x} at "
+                    f"offset {exc.start}). Convert it to UTF-8, or keep it out of the task.") from exc
+            lines = content.splitlines(keepends=True)
+            full = {"path": relative, "sha256": digest(raw), "content": content,
+                    "from_line": 1, "to_line": len(lines), "total_lines": len(lines),
+                    "truncated": False}
+            while self._read_cache and self._read_chars > READ_CACHE_CHARS:
+                self._read_cache.pop(next(iter(self._read_cache)))
+                self._read_chars = sum(len(row[2]["content"]) for row in self._read_cache.values())
+            self._read_cache[relative] = (info.st_mtime_ns, info.st_size, full)
+            self._read_chars += len(content)
+        if not paged:
+            return dict(full)
+        lines = full["content"].splitlines(keepends=True)
+        start = max((offset or 1) - 1, 0)
+        take = limit if limit is not None else DEFAULT_WINDOW_LINES
+        window = lines[start:start + take]
+        end = start + len(window)
+        found = dict(full)
+        found["content"] = "".join(window)
+        found["from_line"] = start + 1
+        found["to_line"] = end
+        found["truncated"] = end < len(lines)
+        return found
 
     def files(self, limit: int = 2000) -> list[str]:
         """Every path this tool is willing to look at, in one walk.
@@ -384,7 +429,7 @@ class Workspace:
             latest = self.read(relative)["sha256"] if path.exists() else None
             if latest != expected:
                 raise PolicyError("Concurrent edit detected; replacement cancelled.")
-            os.replace(tmp, path)
+            _resilient_replace(tmp, path)
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)

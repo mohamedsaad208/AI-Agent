@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 
 from .errors import AgentError, PolicyError
 
@@ -20,6 +21,19 @@ MAX_MEMORY = 4000
 LABEL = ("Project notes the user wrote for this folder. These are the user's own standing "
          "instructions, not model output and not observed code. Follow them unless the "
          "current task overrides one; say so in the summary if a note blocks you:\n")
+
+
+def _resilient_replace(src: str | Path, dst: str | Path, max_tries: int = 15, delay: float = 0.05) -> None:
+    """Atomic replace with exponential backoff on Windows when files are held by scanners/watchers."""
+    for attempt in range(max_tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max_tries - 1:
+                raise
+            time.sleep(delay)
+
 
 
 def key_for(root: str) -> str:
@@ -70,7 +84,7 @@ def write(memory_dir: Path, root: str, text: str) -> Path:
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
-        os.replace(staged, path)
+        _resilient_replace(staged, path)
     except OSError as exc:
         try:
             os.unlink(staged)
@@ -151,7 +165,7 @@ def write_auto_notes(memory_dir: Path, root: str, data: dict) -> Path:
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             json.dump(clean_data, stream, indent=2)
-        os.replace(staged, path)
+        _resilient_replace(staged, path)
     except OSError as exc:
         try:
             os.unlink(staged)

@@ -160,6 +160,13 @@ html.side-collapsed #sidebar-expand { display: grid }
 }
 .themepick button.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-ring) }
 
+/* ------------------------------ plan checklist (T3.2) ------------------------------
+   The run's workspace is three columns: conversation and event timeline in the centre, changes and
+   diffs in the rail, and the plan checklist on the rail's Tasks tab. The checklist once had a column
+   of its own; `renderRail()` and `planWide()` in ui-run.js are what settled where it lives, and it
+   lives in the rail at every width now. */
+.plan-col { display: none !important }
+
 /* -------------------------------- main -------------------------------- */
 /* min-height:0 is what keeps the conversation inside the window. A grid item's automatic minimum
    is its content height, so a long thread grew .main past 100vh and the composer — with whatever
@@ -171,7 +178,7 @@ html.side-collapsed #sidebar-expand { display: grid }
 }
 .top h1 { font-size: 14.5px; font-weight: 600; letter-spacing: -.2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
 .top .sub { font-size: 11.5px; color: var(--faint); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
-.seg { display: flex; gap: 2px; margin-left: auto; padding: 3px; background: var(--seg); border-radius: var(--r-m) }
+.seg { display: flex; gap: 2px; padding: 3px; background: var(--seg); border-radius: var(--r-m) }
 .seg button {
   padding: 5px 13px; border-radius: calc(var(--r-m) - 3px); font-size: 12.5px; color: var(--faint);
   font-weight: 500; transition: color var(--t-fast), background var(--t-fast);
@@ -183,6 +190,37 @@ html.side-collapsed #sidebar-expand { display: grid }
   color: var(--ink-2); background: var(--panel); transition: background var(--t-fast), border-color var(--t-fast);
 }
 .ghost:hover { background: var(--hover); border-color: var(--line-2) }
+
+/* ------------------------------ top bar run controls (T3.3) ------------------------------
+   The permanent run row: stage, elapsed, the Steer field and Stop. Task and subtitle already
+   live in the header itself, so this cluster carries only what changes while a run is in flight. */
+.runbar { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0 }
+.stage-badge {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600;
+  padding: 3px 9px; border-radius: 99px; background: var(--chip); color: var(--ink-2);
+  border: 1px solid var(--line); max-width: 190px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: none;
+}
+.elapsed {
+  font-family: var(--mono); font-size: 11.5px; color: var(--faint); flex: none; direction: ltr;
+  unicode-bidi: isolate; font-variant-numeric: tabular-nums;
+}
+.elapsed.running { color: var(--accent-text) }
+.steer-box { display: flex; align-items: center; gap: 6px; flex: 0 1 300px; min-width: 0 }
+.steer-box input {
+  flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--r-m);
+  background: var(--field); color: var(--ink); font-size: 12.5px; outline: 0;
+}
+.steer-box input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring) }
+.steer-box input:disabled { opacity: .55; cursor: not-allowed }
+.steer-box .line-btn { padding: 6px 11px; font-size: 12px; flex: none }
+.top-stop {
+  flex: none; padding: 6px 12px; font-size: 12px; font-weight: 600; border-radius: var(--r-m);
+  border: 1px solid var(--bad-line); background: var(--bad-bg); color: var(--bad-ink);
+  transition: background var(--t-fast);
+}
+.top-stop:hover:not(:disabled) { background: var(--hover) }
+.top-stop:disabled { opacity: .45; cursor: not-allowed }
 
 .view { flex: 1; min-height: 0; display: none; flex-direction: column }
 .view.on { display: flex; animation: fade var(--t-med) var(--ease) }
@@ -200,7 +238,7 @@ html.side-collapsed #sidebar-expand { display: grid }
   width: 22px; height: 22px; border-radius: var(--r-s); flex: none; display: grid; place-items: center;
   font-size: 10.5px; font-weight: 700; background: var(--pic); color: var(--pic-ink);
 }
-.msg.me { flex-direction: row-reverse }
+.msg.me { flex-direction: row }
 .msg.me .pic { background: var(--accent); color: var(--accent-ink) }
 .msg.sys .pic { background: var(--chip); color: var(--ink-2) }
 .body { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1) }
@@ -210,6 +248,9 @@ html.side-collapsed #sidebar-expand { display: grid }
 /* A prompt has no name line, so its icons share the bubble's line instead of opening one below it. */
 .bubline { display: flex; align-items: flex-end; gap: 2px; max-width: 100% }
 .bubline .bub { min-width: 0 }
+/* The prompt sits against the reading edge, so its actions come in on its far side: the avatar
+   stays first in the row and the copy/reply icons tuck in to the left of the bubble. */
+.msg.me .bubline { flex-direction: row-reverse }
 .who { font-size: 11.5px; color: var(--faint); font-weight: 550; white-space: nowrap }
 /* dir="auto" on the bubble picks the paragraph direction; plaintext extends that to each
    paragraph inside it, so an Arabic answer with an English code block reads correctly without
@@ -302,14 +343,16 @@ html.side-collapsed #sidebar-expand { display: grid }
    name leave each surface wearing the other's layout. */
 .steprow { display: flex; flex-direction: column; gap: 6px; max-width: 100% }
 .st-head {
-  display: flex; align-items: flex-start; gap: 8px; padding: 5px 11px; border-radius: 99px;
+  display: flex; align-items: flex-start; gap: 8px; padding: 5px 11px; border-radius: 10px;
   background: var(--chip); border: 1px solid var(--line); font-size: 12px; color: var(--ink-2);
-  /* Buttons default to nowrap; status text must wrap long file paths inside the chat. */
+  /* Buttons default to nowrap; status text must wrap long file paths inside the chat. A pill
+     radius on a row that wraps to several lines is an oval cut into the middle of the sentence. */
   white-space: normal; min-width: 0; max-width: 100%;
+  word-break: break-word; overflow-wrap: anywhere;
   text-align: start; cursor: pointer; transition: border-color var(--t-fast), background var(--t-fast);
 }
 .st-head:hover { border-color: var(--line-2) }
-.st-txt { min-width: 0; overflow-wrap: anywhere; unicode-bidi: plaintext }
+.st-txt { min-width: 0; word-break: break-word; overflow-wrap: anywhere; unicode-bidi: plaintext }
 .st-chev { flex: none; display: inline-flex; align-items: center; margin-inline-start: auto;
   color: var(--faint); transition: transform var(--t-fast) }
 .steprow.open .st-chev { transform: rotate(180deg) }
@@ -627,7 +670,13 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 .link.quiet { cursor: default; color: var(--faint) }
 .link.quiet:hover { color: var(--faint) }
 .link svg { flex: none; opacity: .6 }
-.link .r { margin-left: auto; color: var(--faint); font-size: 11.5px; font-weight: 400 }
+/* The counter is the part that gives way in a narrow rail: a row that cannot truncate its own
+   tail pushes the card wider than the column holding it. */
+.link .r {
+  margin-left: auto; color: var(--faint); font-size: 11.5px; font-weight: 400;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;
+}
+.card .link { min-width: 0; max-width: 100%; overflow: hidden }
 .state {
   display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; padding: 3px 9px;
   border-radius: 99px; background: var(--warn-bg); color: var(--warn-ink); border: 1px solid var(--warn-line);
@@ -1043,6 +1092,11 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
   .busybar::after { animation: none !important }
 }
 
+@media (max-width: 1080px) {
+  /* The Steer field is the first thing here that cannot shrink into legibility; Stop and the
+     counters stay, because they are the one row that answers "can I get out of this". */
+  .steer-box { display: none }
+}
 @media (max-width: 1180px) {
   .app { grid-template-columns: var(--side-w) minmax(0, 1fr) }
   .rail { display: none }
@@ -1154,15 +1208,16 @@ body.resizing, body.resizing * { user-select: none !important; cursor: col-resiz
 
 /* Custom Terminal Command */
 .custom-cmd-card { display: flex; flex-direction: column; gap: 7px; margin-top: 6px; }
-.custom-cmd-row { display: flex; gap: 6px; align-items: center; }
+.custom-cmd-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .custom-cmd-input {
-  flex: 1; padding: 6px 9px; font-size: 12px; font-family: var(--mono);
+  flex: 1 1 120px; min-width: 0; padding: 6px 9px; font-size: 12px; font-family: var(--mono);
   background: var(--field); color: var(--ink); border: 1px solid var(--line);
   border-radius: var(--r-s); outline: none;
 }
 .custom-cmd-input:focus { border-color: var(--accent); }
 .custom-cmd-sub {
-  width: 90px; padding: 6px 8px; font-size: 11.5px; font-family: var(--mono);
+  flex: 0 1 auto; min-width: 0; max-width: 80px; padding: 6px 8px; font-size: 11.5px;
+  font-family: var(--mono);
   background: var(--field); color: var(--ink-2); border: 1px solid var(--line);
   border-radius: var(--r-s);
 }

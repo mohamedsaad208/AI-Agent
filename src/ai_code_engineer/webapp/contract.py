@@ -1,9 +1,9 @@
 """The seam between the UI server and whatever drives it.
 
-The server knows nothing about planning, approvals or the file system: it only ever
-calls the five methods below and forwards whatever the controller emits. That keeps the
-front-end reviewable now (against ``fake.FakeController``) while the real controller is
-still being extracted from the Tk window.
+The server knows nothing about planning, approvals or the file system: it only ever calls the
+methods below and forwards whatever the controller emits. That keeps the front-end reviewable now
+(against ``fake.FakeController``) while the real controller is still being extracted from the Tk
+window.
 """
 from __future__ import annotations
 
@@ -26,6 +26,12 @@ class Controller(Protocol):
     def project_info(self, key: str) -> dict:
         """One granted folder, measured: its path, notes and size. Raises ``PolicyError`` for a
         key that was never granted — the server turns that into a 400 the browser can show."""
+        ...
+
+    def memory_panel(self, chat_id: str = "") -> dict:
+        """The project's own memory, as one readout: both layers, the block they build and its cost.
+        Asked for on the click rather than pushed with every snapshot, the same way ``project_info``
+        is. Says ``{"available": False, "why": ...}`` when there is no folder to remember for."""
         ...
 
     def list_dir(self, path: str, want_files: Iterable[str] | None = None) -> dict:

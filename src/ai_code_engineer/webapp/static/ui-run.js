@@ -1,6 +1,115 @@
-/* Execution and its results: the right rail's Changes/Tasks/Checks cards, the diff painter behind
-   them, the file viewer sheet, and the Activity log with the raw stream under it.
+/* Execution and its results: the plan checklist (its own column when wide, the rail's Tasks tab
+   when not), the right rail's Changes/Tasks/Checks cards, the diff painter behind them, the file
+   viewer sheet, and the Activity log with the raw stream under it.
    Every command shown here was run by the server; nothing in this file executes or applies. */
+
+/* The checklist, built once and mounted on whichever surface the width gives it: the plan column
+   beside the conversation, or the rail's Tasks tab. Same card, so the sequential controls, the
+   goal block and the per-step Run buttons cannot drift apart between the two layouts. */
+function planCard() {
+  if (!DATA || !DATA.plan) return null;
+  const p = el('div', 'card tasks-card');
+  const total = DATA.plan.total || 0;
+  const verified = DATA.plan.verified || 0;
+  const steps = DATA.plan.steps || [];
+  const needingAttention = steps.filter(s => s.status === 'failed' || s.status === 'rejected' || s.status === 'needs_review' || (s.current && DATA.artifact && DATA.artifact.state === 'VERIFICATION_FAILED')).length;
+  const pct = Math.round((verified / Math.max(1, total)) * 100);
+  p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${total} · ${verified} verified · ${needingAttention} needing attention</div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="meta"><span>${verified} verified</span><span>${needingAttention ? needingAttention + ' needing attention' : esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
+  const seqDiv = el('div', 'plan-seq-controls');
+  if (!state.sequential) {
+    const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
+    const complete = steps.length > 0 && steps.every(s => s.status === 'verified');
+    startBtn.disabled = complete || steps.length === 0;
+    startBtn.title = complete ? 'Plan complete — all steps are verified' : 'Run plan steps sequentially';
+    startBtn.onclick = () => startSequential();
+    seqDiv.appendChild(startBtn);
+  } else {
+    const stopBtn = el('button', 'line-btn plan-seq-btn running', '■ Stop sequential');
+    stopBtn.title = 'Stop sequential execution';
+    stopBtn.onclick = () => stopSequential();
+    seqDiv.appendChild(stopBtn);
+  }
+  p.appendChild(seqDiv);
+  (DATA.resume || []).slice(0, 3).forEach(row => {
+    const strip = el('div', 'plan-resume');
+    strip.appendChild(el('span', 'quiet', '⏸ ' + esc(row.task)
+                            + (row.turn ? ` · turn ${row.turn}` : '')));
+    const btn = el('button', 'line-btn', 'Resume');
+    btn.title = 'Continue this task from where it stopped';
+    btn.onclick = () => send('resume_task', { run_id: row.run_id });
+    strip.appendChild(btn);
+    p.appendChild(strip);
+  });
+  if (DATA.plan.goal) {
+    const strings = DATA.plan.strings || {};
+    const goal = el('div', 'plan-goal');
+    goal.appendChild(el('div', 't', '🎯 ' + esc(strings.goal || 'Goal') + ': ' + esc(DATA.plan.goal)));
+    const crit = DATA.plan.verdicts || [];
+    if (crit.length) {
+      goal.appendChild(el('div', 't quiet', esc(strings.criteria || 'Acceptance criteria')));
+      const shown = el('div', 'plan-criteria');
+      crit.forEach((row) => {
+        const line = el('div', 'plan-criterion ' + esc(row.verdict));
+        // The words are the server's, in the language the task was asked in, and the row opens with a
+        // criterion number — a weak character that cannot decide a paragraph direction. Without this an
+        // Arabic criterion sits in an LTR line and its punctuation ends up on the wrong side.
+        line.dir = 'auto';
+        line.innerHTML = `<b>${esc(String(row.number))}</b> ${esc(row.text)}`
+          + ` <span class="crit-v v-${esc(row.verdict)}">${esc(row.word)}</span>`
+          + (row.steps.length ? ` <span class="quiet">· steps ${esc(row.steps.join(', '))}</span>` : '')
+          + (row.why ? ` <span class="quiet">· ${esc(row.why)}</span>` : '');
+        shown.appendChild(line);
+      });
+      goal.appendChild(shown);
+      if (DATA.plan.verdictNote) {
+        const note = el('div', 'quiet plan-verdict-note', esc(DATA.plan.verdictNote));
+        note.dir = 'auto';
+        goal.appendChild(note);
+      }
+    }
+    p.appendChild(goal);
+  }
+  const list = el('div', 'tasks-list');
+  for (const s of DATA.plan.steps) {
+    const isDone = s.status === 'verified';
+    const isNow = !isDone && (s.current || s.id === DATA.plan.step);
+    const row = el('div', 'task-item ' + (isDone ? 'done' : isNow ? 'now' : 'pending'));
+    row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
+    row.appendChild(el('span', 'task-title', esc(s.title)));
+    if ((s.accepts || []).length) {
+      row.appendChild(el('span', 'task-crit quiet', '▸ ' + s.accepts.join(',')));
+    }
+    if (s.unproven) {
+      const badge = el('span', 'task-unproven', '!');
+      badge.title = (DATA.plan.strings || {}).unproven || 'unproven';
+      row.appendChild(badge);
+    }
+    if (!isDone) {
+      const exec = el('button', 'step-exec-btn', 'Run step ▶');
+      exec.title = 'Run this step in chat';
+      exec.onclick = (e) => { e.stopPropagation(); runPlanStep(s); };
+      row.appendChild(exec);
+    }
+    list.appendChild(row);
+  }
+  p.appendChild(list);
+  return p;
+}
+
+function planEmptyCard() {
+  const empty = el('div', 'card empty-tasks-card');
+  empty.innerHTML = `<div class="empty-icon">📋</div>
+    <div class="t">No active plan</div>
+    <div class="d">Attach a markdown or text plan to execute steps one-by-one.</div>`;
+  const attachBtn = el('button', 'line-btn', '＋ Attach Plan');
+  attachBtn.style.marginTop = '12px';
+  attachBtn.onclick = () => send('pick_plan');
+  empty.appendChild(attachBtn);
+  return empty;
+}
+
 function renderRail() {
   const rail = $('rail'); rail.innerHTML = '';
   const a = DATA.artifact || {};
@@ -9,13 +118,16 @@ function renderRail() {
   if (!state.railSection) {
     state.railSection = (DATA.plan && (!r.files || !r.files.length)) ? 'tasks' : 'changes';
   }
+  /* The wide window keeps the checklist in its own column, so the rail has no Tasks tab to sit
+     on — the section falls back to Changes rather than pointing at a tab that does not exist. */
+  if (planWide() && state.railSection === 'tasks') state.railSection = 'changes';
 
-  const rtabs = el('div', 'rail-tabs');
   const sections = [
     ['changes', 'Changes', (r.files || []).length ? (r.files || []).length : ''],
-    ['tasks', 'Tasks', DATA.plan ? `${DATA.plan.step}/${DATA.plan.total}` : ''],
-    ['checks', 'Checks & Sources', ''],
   ];
+  if (!planWide()) sections.push(['tasks', 'Tasks', DATA.plan ? `${DATA.plan.step}/${DATA.plan.total}` : '']);
+  sections.push(['checks', 'Checks & Sources', '']);
+  const rtabs = el('div', 'rail-tabs');
   for (const [id, label, count] of sections) {
     const active = state.railSection === id;
     const btn = el('button', 'rail-tab' + (active ? ' on' : ''),
@@ -60,106 +172,7 @@ function renderRail() {
       rail.appendChild(art);
     }
   } else if (state.railSection === 'tasks') {
-    if (DATA.plan) {
-      const p = el('div', 'card tasks-card');
-      const total = DATA.plan.total || 0;
-      const verified = DATA.plan.verified || 0;
-      const steps = DATA.plan.steps || [];
-      const needingAttention = steps.filter(s => s.status === 'failed' || s.status === 'rejected' || s.status === 'needs_review' || (s.current && DATA.artifact && DATA.artifact.state === 'VERIFICATION_FAILED')).length;
-      const pct = Math.round((verified / Math.max(1, total)) * 100);
-      p.innerHTML = `<h5>Plan · step-by-step</h5><div class="t" style="font-size:12.5px">${esc(DATA.plan.name)} — Step ${DATA.plan.step} of ${total} · ${verified} verified · ${needingAttention} needing attention</div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="meta"><span>${verified} verified</span><span>${needingAttention ? needingAttention + ' needing attention' : esc(DATA.plan.note)}</span></div><div class="hr"></div>`;
-      const seqDiv = el('div', 'plan-seq-controls');
-      if (!state.sequential) {
-        const startBtn = el('button', 'solid plan-seq-btn', '▶ Start sequential');
-        const complete = steps.length > 0 && steps.every(s => s.status === 'verified');
-        startBtn.disabled = complete || steps.length === 0;
-        startBtn.title = complete ? 'Plan complete — all steps are verified' : 'Run plan steps sequentially';
-        startBtn.onclick = () => startSequential();
-        seqDiv.appendChild(startBtn);
-      } else {
-        const stopBtn = el('button', 'line-btn plan-seq-btn running', '■ Stop sequential');
-        stopBtn.title = 'Stop sequential execution';
-        stopBtn.onclick = () => stopSequential();
-        seqDiv.appendChild(stopBtn);
-      }
-      p.appendChild(seqDiv);
-      (DATA.resume || []).slice(0, 3).forEach(row => {
-        const strip = el('div', 'plan-resume');
-        strip.appendChild(el('span', 'quiet', '⏸ ' + esc(row.task)
-                                + (row.turn ? ` · turn ${row.turn}` : '')));
-        const btn = el('button', 'line-btn', 'Resume');
-        btn.title = 'Continue this task from where it stopped';
-        btn.onclick = () => send('resume_task', { run_id: row.run_id });
-        strip.appendChild(btn);
-        p.appendChild(strip);
-      });
-      if (DATA.plan.goal) {
-        const strings = DATA.plan.strings || {};
-        const goal = el('div', 'plan-goal');
-        goal.appendChild(el('div', 't', '🎯 ' + esc(strings.goal || 'Goal') + ': ' + esc(DATA.plan.goal)));
-        const crit = DATA.plan.verdicts || [];
-        if (crit.length) {
-          goal.appendChild(el('div', 't quiet', esc(strings.criteria || 'Acceptance criteria')));
-          const shown = el('div', 'plan-criteria');
-          crit.forEach((row) => {
-            const line = el('div', 'plan-criterion ' + esc(row.verdict));
-            // The words are the server's, in the language the task was asked in, and the row opens with a
-            // criterion number — a weak character that cannot decide a paragraph direction. Without this an
-            // Arabic criterion sits in an LTR line and its punctuation ends up on the wrong side.
-            line.dir = 'auto';
-            line.innerHTML = `<b>${esc(String(row.number))}</b> ${esc(row.text)}`
-              + ` <span class="crit-v v-${esc(row.verdict)}">${esc(row.word)}</span>`
-              + (row.steps.length ? ` <span class="quiet">· steps ${esc(row.steps.join(', '))}</span>` : '')
-              + (row.why ? ` <span class="quiet">· ${esc(row.why)}</span>` : '');
-            shown.appendChild(line);
-          });
-          goal.appendChild(shown);
-          if (DATA.plan.verdictNote) {
-            const note = el('div', 'quiet plan-verdict-note', esc(DATA.plan.verdictNote));
-            note.dir = 'auto';
-            goal.appendChild(note);
-          }
-        }
-        p.appendChild(goal);
-      }
-      const list = el('div', 'tasks-list');
-      for (const s of DATA.plan.steps) {
-        const isDone = s.status === 'verified';
-        const isNow = !isDone && (s.current || s.id === DATA.plan.step);
-        const row = el('div', 'task-item ' + (isDone ? 'done' : isNow ? 'now' : 'pending'));
-        row.appendChild(el('span', 'task-status-icon', isDone ? '✓' : isNow ? '⏳' : String(s.id)));
-        row.appendChild(el('span', 'task-title', esc(s.title)));
-        if ((s.accepts || []).length) {
-          row.appendChild(el('span', 'task-crit quiet', '▸ ' + s.accepts.join(',')));
-        }
-        if (s.unproven) {
-          const badge = el('span', 'task-unproven', '!');
-          badge.title = (DATA.plan.strings || {}).unproven || 'unproven';
-          row.appendChild(badge);
-        }
-        if (!isDone) {
-          const exec = el('button', 'step-exec-btn', 'Run step ▶');
-          exec.title = 'Run this step in chat';
-          exec.onclick = (e) => { e.stopPropagation(); runPlanStep(s); };
-          row.appendChild(exec);
-        }
-        list.appendChild(row);
-      }
-      p.appendChild(list);
-      rail.appendChild(p);
-    } else {
-      const empty = el('div', 'card empty-tasks-card');
-      empty.innerHTML = `<div class="empty-icon">📋</div>
-        <div class="t">No active plan</div>
-        <div class="d">Attach a markdown or text plan to execute steps one-by-one.</div>`;
-      const attachBtn = el('button', 'line-btn', '＋ Attach Plan');
-      attachBtn.style.marginTop = '12px';
-      attachBtn.onclick = () => send('pick_plan');
-      empty.appendChild(attachBtn);
-      rail.appendChild(empty);
-    }
+    rail.appendChild(planCard() || planEmptyCard());
   } else if (state.railSection === 'checks') {
     const rs = DATA.runStatus || {};
     const cfg = DATA.runConfig || {};
@@ -498,9 +511,11 @@ function renderRail() {
     s.innerHTML = `<h5>Sources</h5>
       <div class="link quiet">${ICON.file} ${esc(DATA.project ? 'Project: ' + DATA.project.name : 'This chat has no project')}</div>
       <button class="link" id="notes">🧾 Project notes <span class="r">${esc(DATA.memory.info || '')}</span></button>
+      <button class="link" id="memory">🧭 Project memory <span class="r">${esc(DATA.memory.goal_pending ? 'a goal needs your answer' : '›')}</span></button>
       <div class="hr"></div>
       <button class="link" id="settings">${ICON.gear} Settings <span class="r">›</span></button>`;
     s.querySelector('#notes').onclick = () => openSettings('notes');
+    s.querySelector('#memory').onclick = () => openSettings('memory');
     s.querySelector('#settings').onclick = () => openSettings();
     if ((DATA.branch || {}).key) {
       const group = (DATA.projects || []).find((g) => g.key === DATA.branch.key);
@@ -957,7 +972,9 @@ function switchView(view) {
 
 function setBusy(busy, cancellable) {
   state.busy = busy;
+  state.cancellable = !!cancellable;
   paintStatus();
+  paintRunBar();
   // The counter belongs to the in-flight request alone: started when one is, stopped when it is not.
   // A window that opens onto a running job reaches here through the first snapshot, so it counts too.
   if (busy) startClock(); else stopClock();
@@ -970,3 +987,103 @@ function setBusy(busy, cancellable) {
     renderComposer();
   }
 }
+
+/* ------------------------------ the plan checklist (T3.2) ------------------------------
+   The checklist belongs to the rail's Tasks tab at every width: the run's centre column is the
+   conversation, and a fourth strip cost more screen than it returned. `planWide()` is the one
+   question a surface asks to learn that, and app.css keeps the retired column hidden. */
+function planWide() {
+  return false;
+}
+
+function renderPlanColumn() {
+  const col = $('plan-col');
+  if (!col || !planWide()) return;
+  col.innerHTML = '';
+  col.appendChild(el('div', 'plan-col-head', 'Plan checklist'));
+  col.appendChild(planCard() || planEmptyCard());
+}
+
+/* ------------------------------ the top bar run row (T3.3) ------------------------------
+   Task and subtitle are already permanent header content; this is the rest of what an operator
+   asks a run that is in flight: which stage it is in, how long it has been going, one more
+   instruction, and the way out. The elapsed clock is measured from `job_started`, which the
+   server stamps when the job claims the window — so a page opened (or reloaded) onto a running
+   job counts the real wait rather than the seconds since this browser arrived. The seconds tick on
+   the app's one repeating timer (ui-chat.js): while a job runs, both faces move off the same beat. */
+function topElapsed() {
+  const started = DATA && DATA.job_started;
+  return started ? Math.max(0, Math.floor(Date.now() / 1000 - started)) : 0;
+}
+
+function paintRunBar() {
+  if (!DATA) return;
+  const st = DATA.stage || {};
+  const badge = $('top-stage');
+  if (badge) {
+    const cur = (st.steps || []).find((s) => s.code === st.current);
+    badge.textContent = cur ? cur.label : '';
+    badge.title = st.line || '';
+    badge.classList.toggle('hidden', !st.current);
+  }
+  const face = $('top-elapsed');
+  if (face) {
+    face.textContent = '⏱ ' + clockFace(topElapsed());
+    face.classList.toggle('hidden', !DATA.job_started);
+    face.classList.toggle('running', !!state.busy);
+  }
+  const box = $('steer-text');
+  const go = $('steer-go');
+  const stop = $('top-stop');
+  if (box) {
+    box.disabled = !state.busy;
+    const waiting = DATA.steering_waiting || 0;
+    box.placeholder = waiting ? `Steer the run… (${waiting} waiting)` : 'Steer the run…';
+  }
+  if (go) go.disabled = !state.busy || !(box && box.value.trim());
+  if (stop) {
+    stop.classList.toggle('hidden', !state.busy);
+    stop.disabled = !state.cancellable;
+  }
+}
+
+/* A `stage_changed` event arrives between snapshots, and the badge's words are the server's: the
+   labels of DATA.stage.steps are taken as they are, and only the position is recomputed here —
+   the same `reached = index < where` rule `stage_block` applies server-side. */
+function applyStageCode(code) {
+  const st = DATA && DATA.stage;
+  if (!st || !Array.isArray(st.steps)) return;
+  const where = st.steps.findIndex((s) => s.code === code);
+  if (where < 0) return;
+  st.current = code;
+  st.steps.forEach((s, i) => { s.reached = i < where; });
+  paintRunBar();
+  const strip = $('stagestrip');
+  if (strip && !strip.classList.contains('hidden') && typeof paintStage === 'function') paintStage();
+}
+
+/* One sentence to the loop that is already running. The instruction never restarts finished work:
+   the engine reads the box at its next turn checkpoint. Shift+Enter marks it urgent — the engine
+   then cuts short the ask in flight, rather than waiting out a slow model. */
+function sendSteer(urgent) {
+  const box = $('steer-text');
+  const text = ((box && box.value) || '').trim();
+  if (!text) { toast('Write one sentence to steer the run.', 'warn'); return; }
+  send('steer', { text, urgent: !!urgent });
+  box.value = '';
+  paintRunBar();
+}
+
+(() => {
+  const form = $('steer-form');
+  const box = $('steer-text');
+  const stop = $('top-stop');
+  if (form) form.addEventListener('submit', (ev) => { ev.preventDefault(); sendSteer(false); });
+  if (box) {
+    box.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); sendSteer(ev.shiftKey); }
+    });
+    box.addEventListener('input', () => paintRunBar());
+  }
+  if (stop) stop.onclick = () => send('stop');
+})();

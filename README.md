@@ -196,6 +196,43 @@ to a private service, requests to hostnames require an explicit `network = allow
 Private and link-local numeric addresses have the same requirement. Do not use that rule for folders
 whose code or configuration you do not trust.
 
+### External tools (MCP)
+
+A run can offer tools supplied by an external Model Context Protocol server, in addition to the eight
+built-in ones. Servers are declared by the operator, never by the project, in `.agent-mcp.json` beside
+`.agent-permissions.json`:
+
+```json
+{
+  "servers": [
+    {
+      "id": "files",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+      "env": ["MCP_FILES_ROOT"],
+      "tools": ["read_file"],
+      "enabled": true,
+      "max_side_effect": "read"
+    }
+  ]
+}
+```
+
+`enabled` defaults to `false`, so a row a model or a cloned repository added offers nothing. `env`
+holds variable **names**, never values, and the server process is started with `runner`'s allowlist
+plus exactly those names, without a shell and with an argv taken only from the row. `tools` is an
+allowlist of the server's own tool names; `max_side_effect` is this operator's ceiling on what an
+outside tool may even be offered for (`none`, `read`, `write`, `execute`, `network`).
+
+An outside tool is judged by the same gate as a built-in, with one extra rule: whatever class the
+server declares for itself, the runtime also asks the class that its side-effect level implies, and
+the stricter answer wins. A server describing a network call as a read is therefore refused under both
+names, and an unannotated tool lands at the top of the ladder — which the policy table answers `ask`,
+so a task run declines it until the folder grants it. Tools arrive namespaced as
+`mcp_<server>_<tool>`, and a server's own description of a tool is shown to the model capped and
+labelled as untrusted data, never as an instruction. A server that will not start, or a tool whose
+schema this runtime cannot check, costs a line of output and a note in the session — not the run.
+
 ---
 
 # 🧠 Offline Extras, Google Gemini & Structured Planning
@@ -280,6 +317,10 @@ python agent.py curl --provider gemini --model gemini-3.8-flash --prompt "Ping" 
 
 # Review proposed diff
 python agent.py review "<session_id>"
+
+# Colored diff view: per-file summary plus hunks with three context lines
+python agent.py diff "<session_id>"
+python agent.py diff "<session_id>" --file app/calc.py --context 1
 
 # Apply approved proposal (cryptographically verified by SHA-256)
 python agent.py apply "<session_id>" --approve "<sha256_hash>"
@@ -388,6 +429,9 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 | `src/ai_code_engineer/repo_scanner.py` | **Architectural Repository Scanner:** 13-layer parser, 200+ annotation detectors, dependency graph extractor, `project-index.json`, and `index_boost`. |
 | `src/ai_code_engineer/repair.py` | **Autonomous Repair Loop:** `execute_verification`, `verification_from_run`, `handle_fix_evaluation`, and bounded 3-round repair logic. |
 | `src/ai_code_engineer/engine.py` | **Core Orchestration Loop:** Planning, diff creation, architecture-boosted context selection, and session persistence. |
+| `src/ai_code_engineer/gate.py` | **Unified Security Gate:** One admission decision per call — shape, contract judgeability, folder policy, run posture, and the tool's provenance. |
+| `src/ai_code_engineer/tool_provider.py` | **Tool Providers:** The native registry, external sources, and the composite router that judges each call under its own provider's gate. |
+| `src/ai_code_engineer/mcp.py` | **Optional MCP Provider:** Line-framed JSON-RPC stdio client, schema-to-contract translation, and the operator's `.agent-mcp.json`. |
 | `src/ai_code_engineer/runner.py` | **Command Execution & Sandbox:** Safe process spawning, real-time log streaming, instant cancellation (`kill_tree`), and Docker container isolation. |
 | `src/ai_code_engineer/workspace.py` | **Filesystem Sandbox:** Path traversal prevention, symlink protection, Windows device name defense, and rollback managers. |
 | `src/ai_code_engineer/redaction.py` | **Zero-Trust Secret Redaction:** Real-time scrubbing of API keys, PEM private keys, JWT tokens, and connection strings. |

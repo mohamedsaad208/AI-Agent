@@ -26,7 +26,7 @@ from . import overrides
 # The request timeout is the one number a user can set in either window, and the saved registry,
 # the browser's number input and Tk's spinbox all disagree about it by construction. The range
 # lives here once; the widgets advertise these and every setter clamps through this function.
-REQUEST_TIMEOUT_DEFAULT = 300
+REQUEST_TIMEOUT_DEFAULT = 900
 REQUEST_TIMEOUT_LOW = 30
 REQUEST_TIMEOUT_HIGH = 900
 
@@ -103,7 +103,7 @@ KINDS = (
     Kind("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "openai", True, True,
          "OPENROUTER_API_KEY", routing=True, free_only=True, url_env="OPENROUTER_BASE_URL"),
     Kind("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "openai", True, True,
-         "GEMINI_API_KEY", verified=("gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"),
+         "GEMINI_API_KEY", verified=("gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-flash-lite-latest"),
          url_env="GEMINI_BASE_URL"),
     Kind("llm7", "LLM7 (Free)", "https://api.llm7.io/v1", "openai", True, False,
          "LLM7_API_KEY", verified=("codestral-latest", "mistral-Nemo-Instruct-2407", "nemotron-3-nano:30b"),
@@ -272,7 +272,7 @@ def check_endpoint(kind: Kind, endpoint) -> str:
 # fixed by choosing a smaller repository -- every task fails on the first turn. It is refused where it
 # is set, with a range in the message, rather than failing later with a sentence that blames the
 # project. `test_the_smallest_budget_still_starts` keeps the two numbers from drifting apart.
-MIN_CONTEXT_CHARS = 6000
+MIN_CONTEXT_CHARS = 6400
 
 # The number ranges, written once. `overrides.py` prints these into the file it creates and judges a
 # row against them through ``validate``, so a limit cannot be restated in the module that stores them —
@@ -291,7 +291,7 @@ class Settings:
     endpoint: str = ""
     max_turns: int = 12
     timeout_seconds: int = 120
-    context_chars: int = 24000
+    context_chars: int = 64000
     output_tokens: int = 4096
     # The *name* of the variable that holds a key, never a key. A profile that carried a value would
     # put a credential in a file that is meant to be committed.

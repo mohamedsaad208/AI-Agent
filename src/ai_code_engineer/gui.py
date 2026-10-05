@@ -138,6 +138,22 @@ class Tooltip:
             self.window = None
 
 
+def mcp_providers(app_dir: Path, folder: Path, say) -> list:
+    """The outside tools this operator configured, for a run pointed at `folder`.
+
+    `mcp` is imported here rather than at the top so a window that never configured a server never
+    loads a stdio client. `say` is the caller's own progress sink because this runs inside the job's
+    thread, where Tk's widgets may not be touched — the same reason the plan call hands the loop a
+    queued line rather than `self.say`. A row that cannot be read is said and skipped, never raised:
+    a task that needs no outside tool must still plan.
+    """
+    from . import mcp
+    providers, problems = mcp.providers_from_config(app_dir / mcp.CONFIG_NAME, cwd=folder)
+    for problem in problems:
+        say("MCP: " + (problem["server"] + ": " if problem["server"] else "") + problem["reason"])
+    return providers
+
+
 class AgentWindow:
     def __init__(self, root: tk.Tk, app_dir: Path):
         self.root = root
@@ -1627,8 +1643,10 @@ class AgentWindow:
             provider = make_provider(settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
+            say = lambda line: self.events.put(("progress", line))
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
-                        progress=lambda line: self.events.put(("progress", line)),
+                        progress=say,
+                        tool_providers=mcp_providers(self.app_dir, Path(repo), say),
                         cancelled=self.cancel_event.is_set, plan_file=plan_file,
                         chat_id=stored.get("chat_id"), plan_step=stored.get("plan_step"),
                         memory=notes, resume_run=run_id,
@@ -2018,8 +2036,10 @@ class AgentWindow:
             goal = planbook.goal_line(current_book) if current_book else ""
             criteria = planbook.criteria_of(current_book) if current_book else None
             accepts = (current_row.get("accepts") or []) if current_row else None
+            say = lambda line: self.events.put(("progress", line))
             return plan(Workspace(Path(repo)), run_task, provider, settings, self.runs,
-                        progress=lambda line: self.events.put(("progress", line)), cancelled=self.cancel_event.is_set,
+                        progress=say, tool_providers=mcp_providers(self.app_dir, Path(repo), say),
+                        cancelled=self.cancel_event.is_set,
                         plan_file=plan_file, chat_id=chat_id, plan_step=step_id, memory=notes,
                         goal=goal, criteria=criteria, accepts=accepts)
 
@@ -2685,8 +2705,10 @@ class AgentWindow:
             provider = make_provider(settings, allow_cloud=cloud,
                                      data_class="public" if cloud else "restricted",
                                      api_key=key, allow_paid=paid)
+            say = lambda line: self.events.put(("progress", line))
             return plan(Workspace(Path(repo)), task, provider, settings, self.runs,
-                        progress=lambda line: self.events.put(("progress", line)),
+                        progress=say,
+                        tool_providers=mcp_providers(self.app_dir, Path(repo), say),
                         cancelled=self.cancel_event.is_set, chat_id=chat_id, extra_context=context,
                         plan_file=plan_file, plan_step=step_id if plan_file else None, memory=notes,
                         fix_round=self._fix_round)

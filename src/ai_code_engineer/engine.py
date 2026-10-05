@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 import uuid
 from xml.etree import ElementTree
@@ -15,14 +16,19 @@ from xml.etree import ElementTree
 from .config import Settings
 from .errors import AgentError, Cancelled, MissingFileError, PolicyError
 from . import core
+from . import compass
+from . import context_builder
+from . import events as ux
 from . import impact
 from . import labels
 from . import memory as memory_module
+from . import policy
 from . import prompts
 from . import refusals
-from . import semantic
-from . import symbols
+from . import risk_policy
 from . import taskstate
+from . import tool_provider
+from . import contracts, tools
 from .providers import ModelProvider, metrics_of
 from .redaction import redact
 from .workspace import Workspace, digest
@@ -60,6 +66,9 @@ def atomic_json(path: Path, value: dict) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".session-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
+            # The bus marker is live memory; a serialized session must never carry it.
+            if isinstance(value, dict):
+                value = json_safe(value)
             json.dump(value, out, ensure_ascii=False, indent=2)
             out.flush()
             os.fsync(out.fileno())
@@ -243,31 +252,6 @@ DEFAULT_CHECKS = ["Run the project's own command"]
 # separate rules and keep their own numbers.
 MAX_TASK_CHARS = 4000
 
-# How many files the ranked context may carry. Three was the old cap, chosen because the rule that
-# filled it was "the operator named this file" and a person rarely names four; a score can put five
-# plausible files in front of a model, and a sixth costs budget for a guess. The real limit stays the
-# budget, not this number.
-MAX_CONTEXT_FILES = 5
-
-# The actions that are fetching, not deciding: a turn whose previous step was one of these only needs
-# a well-shaped next envelope, which is the task the optional fast local model is chosen for. Reading
-# the shortlist is not planning; proposing and recovering from a refusal are, and those stay strong.
-GATHER_ACTIONS = frozenset({"list_files", "read_file", "search_code", "find_symbol",
-                            "find_references"})
-
-# How many of those five slots a *partial* file may take. A budget too small for a whole file used to
-# mean the model never saw that file at all; an excerpt gives it the declarations around the symbol the
-# task named instead. Three is the ceiling because an excerpt is a hint, not a read — it cannot carry a
-# proposal on its own (`prepare_changes` still refuses a file that was never read whole), and a prompt
-# made of four half-files reads like a repository nobody finished showing.
-MAX_EXCERPTS = 3
-
-# How much of the plan a step's retrieval is allowed to read as a bag of names. The task is capped at
-# MAX_TASK_CHARS because it is a document the model has to answer; the seed is only scored for the
-# words it contains, and a goal tree of that length would name every file in the repository at the
-# weakest score and crowd out the one the step is about.
-SEED_CHARS = 1200
-
 # The route that works at any file size, added to every "your content is broken" refusal. Without it
 # the only advice a large file gets is "send the whole file", which is the thing that just failed.
 ANCHORED_ROUTE = (", or send one anchored edit: search for a line unique to this file and replace it "
@@ -280,6 +264,78 @@ ANCHORED_ROUTE = (", or send one anchored edit: search for a line unique to this
 # blocked after one is bounced back with that hint instead of being believed.
 MAX_BLOCKED_RETRIES = 2
 
+# A steering instruction is one sentence the operator adds while the run is working, and it is not a
+# new task: the run keeps its turns, its history and its budget. Capped well below the task limit so
+# the instruction stays an instruction, and the waiting queue is capped so a keyboard held down cannot
+# bury a run in instructions it has to fold into one prompt.
+MAX_STEER_CHARS = 600
+STEER_QUEUE_LIMIT = 32
+
+
+class SteeringInbox:
+    """What the operator says to a run that is already going, and where the run comes to read it.
+
+    A view calls :meth:`submit` from whichever thread owns its input; the loop reads the queue only at
+    its own checkpoints, between turns, so an instruction never lands inside a tool call and never
+    restarts the work already done. That is the whole contract: what has been said is applied to the
+    steps that remain, not to the step in flight.
+
+    ``urgent`` is the one ask that reaches into the step in flight. :meth:`interrupt_requested` is what
+    the loop hands the provider as its cancel predicate, so an ask that watches its predicate is cut
+    short and the instruction is read on the ask that follows — and because a queue the loop has drained
+    clears the flag, an interrupt is always a message that was actually waiting, never a stale wish. A
+    provider that only reads its predicate between requests is not broken by this: it simply takes the
+    instruction at the next checkpoint, which is what a non-urgent one always does.
+    """
+
+    def __init__(self, limit: int = STEER_QUEUE_LIMIT) -> None:
+        self._limit = max(1, int(limit))
+        self._lock = threading.Lock()
+        self._pending: list[dict] = []
+        self._applied: list[dict] = []
+        self._interrupt = threading.Event()
+
+    def submit(self, instruction, *, urgent: bool = False) -> dict:
+        """Say one thing to the running loop, from outside it.
+
+        Newlines are flattened: an instruction is a line the thread reads, and a pasted paragraph would
+        otherwise arrive in the prompt as a block the model has to re-parse.
+        """
+        text = redact(" ".join(str(instruction or "").split()))[:MAX_STEER_CHARS]
+        if not text:
+            raise PolicyError("A steering instruction needs something to say.")
+        row = {"id": uuid.uuid4().hex[:8], "at": now(), "text": text, "urgent": bool(urgent)}
+        with self._lock:
+            if len(self._pending) >= self._limit:
+                raise PolicyError("Too many instructions are waiting; the run has not read them yet.")
+            self._pending.append(row)
+            if row["urgent"]:
+                self._interrupt.set()
+        return row
+
+    def drain(self) -> list[dict]:
+        """Every waiting instruction, oldest first, read and kept as applied."""
+        with self._lock:
+            rows, self._pending = self._pending, []
+            self._applied.extend(rows)
+        self._interrupt.clear()
+        return rows
+
+    def waiting(self) -> list[dict]:
+        """What has been said and not yet read — the queue a view shows before the loop takes it."""
+        with self._lock:
+            return list(self._pending)
+
+    def applied(self) -> list[dict]:
+        """What the loop has already folded into the run, oldest first."""
+        with self._lock:
+            return list(self._applied)
+
+    def interrupt_requested(self) -> bool:
+        """Whether an urgent instruction is waiting that no ask has yet been cut short for."""
+        with self._lock:
+            return self._interrupt.is_set() and any(row["urgent"] for row in self._pending)
+
 
 def proposal_hash(session: dict) -> str:
     payload = {k: session[k] for k in ("id", "root", "task", "summary", "checks", "changes")}
@@ -288,19 +344,6 @@ def proposal_hash(session: dict) -> str:
     if "chat_id" in session:
         payload["chat_id"] = session["chat_id"]
     return digest(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode())
-
-
-def chosen_reason(entry: dict) -> str:
-    """Why retrieval picked this file, as the code `labels` turns into a sentence.
-
-    Both paths — the whole file that fitted and the block that did not — must write this the same way,
-    or the same file is explained one way in one project and another way in a bigger one. The layer the
-    project index supplied qualifies the code in brackets; nothing else may be appended there, because
-    `labels` looks the code up as a key and an unrecognised key speaks no reason at all.
-    """
-    why = str(entry.get("why", ""))
-    layer = str(entry.get("layer", ""))
-    return f"{why} [{layer}]" if layer else why
 
 
 def read_plan_reference(ws: Workspace, plan_file: str, settings: Settings) -> dict:
@@ -377,7 +420,216 @@ def chat_context(runs: Path, root: str | Path, chat_id: str, budget: int) -> tup
 
 
 def event(session: dict, kind: str, **values) -> None:
+    """Record one raw event on the session and broadcast its structured twin.
+
+    The session stays the audit record in its own dialect; the bus is what live views
+    (CLI status line, web SSE, memory) subscribe to. A broadcast failure never fails a
+    run: a view that broke is not a reason to lose the proposal already on disk.
+    """
     session["events"].append({"at": now(), "kind": kind, **values})
+    bus = bus_of(session)
+    if bus is None:
+        return
+    try:
+        bus.emit(structured_event(session, kind, values))
+    except Exception:
+        pass
+
+
+def structured_event(session: dict, kind: str, values: dict):
+    """The session's raw event, translated into the typed vocabulary views consume."""
+    return EVENT_ADAPTER.translate(session, kind, values)
+
+
+# The engine's lifecycle walks lowercase stage codes; the shared Stage enum is the UI's vocabulary
+# for the same walk, and the two must stay one story — the code is kept in the event either way.
+STAGE_TO_UI = {
+    "understand": ux.Stage.UNDERSTANDING, "plan": ux.Stage.PLANNING,
+    "implement": ux.Stage.EXECUTING, "impact": ux.Stage.EXECUTING,
+    "review": ux.Stage.PLANNING, "approve": ux.Stage.EXECUTING,
+    "build_test": ux.Stage.VALIDATING, "verify": ux.Stage.VALIDATING,
+}
+
+# How loud each recorded kind is. NORMAL is what a watching person must see; VERBOSE is a
+# tool's working detail; DEBUG is context plumbing that only diagnostic views want.
+EVENT_LEVELS = {
+    "stage": ux.EventLevel.NORMAL, "step": ux.EventLevel.NORMAL,
+    "proposal": ux.EventLevel.NORMAL, "proposal_reopened": ux.EventLevel.NORMAL,
+    "proposal_rejected": ux.EventLevel.NORMAL, "approved": ux.EventLevel.NORMAL,
+    "written": ux.EventLevel.NORMAL, "removed": ux.EventLevel.NORMAL,
+    "rolled_back": ux.EventLevel.NORMAL, "rolled_back_file": ux.EventLevel.NORMAL,
+    "completed": ux.EventLevel.NORMAL, "stopped": ux.EventLevel.NORMAL,
+    "steer": ux.EventLevel.NORMAL,
+    "impact": ux.EventLevel.NORMAL, "rejected_action": ux.EventLevel.NORMAL,
+    "verification": ux.EventLevel.NORMAL, "test_result": ux.EventLevel.NORMAL,
+    "error": ux.EventLevel.NORMAL, "final_report": ux.EventLevel.NORMAL,
+    "tool": ux.EventLevel.VERBOSE, "run": ux.EventLevel.VERBOSE,
+    "blocked_retried": ux.EventLevel.VERBOSE, "file_not_found": ux.EventLevel.VERBOSE,
+    "context_file": ux.EventLevel.DEBUG, "context_excerpt": ux.EventLevel.DEBUG,
+    "auto_read": ux.EventLevel.DEBUG, "auto_notes_attached": ux.EventLevel.DEBUG,
+    "evidence_attached": ux.EventLevel.DEBUG, "memory_attached": ux.EventLevel.DEBUG,
+    "compass_attached": ux.EventLevel.DEBUG,
+    "plan_attached": ux.EventLevel.DEBUG, "block_chosen": ux.EventLevel.DEBUG,
+    "tool_provider": ux.EventLevel.DEBUG, "session": ux.EventLevel.DEBUG,
+}
+
+
+class EventAdapter:
+    """Translates the session dialect (`kind` + flat fields) into the 8 typed UX events.
+
+    Kinds with a dataclass go through it; the rest still travel as validated `Event`
+    objects so no subscriber loses a row to a kind the adapter has not met.
+    """
+
+    def translate(self, session: dict, kind: str, values: dict):
+        level = EVENT_LEVELS.get(kind, ux.EventLevel.DEBUG)
+        body = {**values, "run_id": str(session.get("id") or ""), "level": level.value}
+        maker = getattr(self, "_make_" + kind, None)
+        if maker is not None:
+            return maker(session, body, level)
+        return ux.Event(kind=kind, data=body, level=level)
+
+    def _make_stage(self, session, values, level):
+        # A stage the table does not know is passed through rather than renamed: an orientation
+        # line that guesses is worse than one that says what the engine said.
+        to_code = str(values.get("to") or "")
+        previous_code = str(values.get("previous_stage") or "")
+        return ux.StageChanged(stage=self._ui_stage(to_code),
+                               previous_stage=self._ui_stage(previous_code),
+                               message=to_code, level=level)
+
+    @staticmethod
+    def _ui_stage(code: str) -> str:
+        return STAGE_TO_UI[code].value if code in STAGE_TO_UI else code.upper()
+
+    def _make_step(self, session, values, level):
+        details = {k: v for k, v in values.items() if k not in ("run_id", "level", "id", "action")}
+        return ux.StepUpdated(step_id=str(values.get("id") or ""),
+                              action=str(values.get("action") or ""),
+                              status="done", details=details, level=level)
+
+    def _make_tool(self, session, values, level):
+        rest = {k: v for k, v in values.items()
+                if k not in ("run_id", "level", "name", "duration_ms", "status")}
+        return ux.ToolCall(tool_name=str(values.get("name") or ""), args=rest,
+                           output_summary=str(values.get("detail") or "")[:300],
+                           duration_ms=float(values.get("duration_ms") or 0.0),
+                           status=str(values.get("status") or "ok"), level=level)
+
+    def _make_written(self, session, values, level):
+        return ux.FileChanged(path=str(values.get("path") or ""),
+                              change_type=self._change_type(session, values),
+                              diff_summary=str(values.get("sha256") or "")[:16], level=level)
+
+    def _make_removed(self, session, values, level):
+        return ux.FileChanged(path=str(values.get("path") or ""), change_type="deleted",
+                              level=level)
+
+    def _make_rolled_back_file(self, session, values, level):
+        return ux.FileChanged(path=str(values.get("path") or ""), change_type="reverted",
+                              level=level)
+
+    def _make_test_result(self, session, values, level):
+        return self._run_to_test_result(values, level)
+
+    def _make_run(self, session, values, level):
+        if "status" not in values:
+            return self._generic("run", values, level)
+        return self._run_to_test_result(values, level)
+
+    def _make_verification(self, session, values, level):
+        return self._run_to_test_result(values, level)
+
+    def _make_proposal(self, session, values, level):
+        # The band is read off the files in this proposal at the moment the ask is made, rather than stored
+        # when it was written: a session that gained or lost a `pom.xml` since should ask with the risk it
+        # has now, and one number that comes from `risk_policy` is the same number the review card shows.
+        return ux.ApprovalRequested(
+            action=str(session.get("summary") or "Apply proposal"),
+            risk_level=risk_policy.assess_changes(session.get("changes") or [],
+                                                  str(session.get("task") or "")).risk.value,
+            reason=str(session.get("task") or "")[:300],
+            approval_id=str(values.get("hash") or ""), level=level)
+
+    def _make_completed(self, session, values, level):
+        return ux.FinalReport(task=str(session.get("task") or ""), success=True,
+                              files_changed=self._changed_paths(session),
+                              verification_status=ux.VerificationStatus.NOT_CHECKED.value,
+                              test_summary=str(values.get("summary") or ""), level=level)
+
+    def _make_stopped(self, session, values, level):
+        return self._make_error(session, {"message": values.get("reason", ""),
+                                          "error_type": "stopped",
+                                          "recoverable": False}, level)
+
+    def _make_rejected_action(self, session, values, level):
+        return self._make_error(session, {"message": values.get("reason", ""),
+                                          "error_type": "rejected_action"}, level)
+
+    def _make_error(self, session, values, level):
+        return ux.AgentProgressError(
+            error_type=str(values.get("error_type") or "error"),
+            message=str(values.get("message") or ""),
+            root_cause=str(values.get("root_cause") or ""),
+            suggested_action=str(values.get("suggested_action")
+                                 or values.get("next_action") or ""),
+            recoverable=bool(values.get("recoverable", True)), level=level)
+
+    def _run_to_test_result(self, values, level):
+        status = str(values.get("status") or "")
+        proof = values.get("proof") if isinstance(values.get("proof"), dict) else {}
+        total = int(proof.get("tests") or values.get("tests") or 0)
+        failed = int(proof.get("failures") or 0) + int(proof.get("errors") or 0)
+        return ux.TestResult(command=str(values.get("command") or values.get("label") or ""),
+                             passed=status in ("passed", "ok", "success") or (total > 0 and failed == 0),
+                             total_tests=total, failed_tests=failed,
+                             passed_tests=max(0, total - failed),
+                             output_tail=str(values.get("tail") or values.get("output") or "")[-1200:],
+                             level=level)
+
+    def _generic(self, kind, values, level):
+        return ux.Event(kind=kind, data=values, level=level)
+
+    @staticmethod
+    def _change_type(session, values):
+        for change in session.get("changes", []):
+            if change.get("path") == values.get("path"):
+                if change.get("delete"):
+                    return "deleted"
+                return "created" if change.get("before") is None else "modified"
+        return "modified"
+
+    @staticmethod
+    def _changed_paths(session):
+        return tuple(str(change.get("path", "")) for change in session.get("changes", [])
+                     if change.get("path"))
+
+
+EVENT_ADAPTER = EventAdapter()
+
+# The session dict is written to disk as JSON, so the run's bus rides under a key the
+# writers strip and the loaders never produce: an in-memory marker, not stored state.
+_BUS_KEY = "_event_bus"
+
+
+def bus_of(session: dict) -> "ux.EventBus | None":
+    """The emitter bus for this run, defaulting to the process-wide one views subscribe to."""
+    if _BUS_KEY in session:
+        return session[_BUS_KEY]
+    return ux.global_bus
+
+
+def attach_bus(session: dict, bus: "ux.EventBus | None") -> dict:
+    """Point one run's events at `bus` (None silences the broadcast for this run)."""
+    session[_BUS_KEY] = bus
+    return session
+
+
+def json_safe(session: dict) -> dict:
+    """The session as it may be serialized: the bus marker is memory, not record."""
+    if _BUS_KEY not in session:
+        return session
+    return {key: value for key, value in session.items() if key != _BUS_KEY}
 
 
 def record_stage(session: dict, code: str) -> str:
@@ -393,7 +645,7 @@ def record_stage(session: dict, code: str) -> str:
     if current == code or not core.stage_allowed(current, code):
         return current
     session["stage"] = code
-    event(session, "stage", to=code)
+    event(session, "stage", to=code, previous_stage=current)
     return code
 
 
@@ -486,16 +738,6 @@ JAVA_DECLARATION = re.compile(r"\b(?:package|import|public|protected|private|cla
 JAVA_PACKAGE = re.compile(r"^[ \t]*package[ \t][\w.]*[ \t]*;", re.M)
 JAVA_TYPE = re.compile(r"\b(?:class|interface|record|enum)\b")
 DOCTYPE = re.compile(r"<!\s*DOCTYPE", re.IGNORECASE)
-
-
-def action_shape(action: dict) -> str:
-    """A model's action object described by its *shape*: which action it names and the field names it
-    carries — never their values. Raw replies are deliberately not recorded anywhere in a session;
-    field names are the part of a refusal that can be echoed back, and kept in the history, without
-    turning the record into a copy of the model's output. `parse_action` has already required a JSON
-    object with string keys by the time this runs."""
-    return ("action " + str(action.get("action")) + " with fields "
-            + (", ".join(sorted(action)) or "no fields"))
 
 
 def shape_mismatch(name: str, content: str) -> str:
@@ -723,13 +965,20 @@ def propose_block(ws: Workspace, task: str, name: str, content: str, runs: Path,
 
 
 def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
-         runs: Path, progress=print, cancelled=None, plan_file: str | None = None,
+         runs: Path, progress=None, cancelled=None, plan_file: str | None = None,
          chat_id: str | None = None, extra_context: str | None = None,
          plan_step: int | None = None, memory: str | None = None, step=None,
          on_token=None, goal: str = "", criteria: list[str] | None = None,
          accepts: list[int] | None = None, resume_run: str | None = None,
-         fix_round: int = 0, fast_provider=None, strong_provider=None) -> Path:
+         fix_round: int = 0, fast_provider=None, strong_provider=None,
+         tool_providers=(), event_bus=None, steering=None) -> Path:
     """Run the tool loop until the model proposes a change.
+
+    `tool_providers` are the *external* sources this run offers beside the built-ins — normally
+    `mcp.McpToolProvider`s, and normally nothing. The loop always runs on one merged vocabulary: the
+    eight native tools plus whatever these supply, each judged by the gate belonging to the provider
+    that supplied it. An empty default is what keeps an unconfigured run exactly the run it was
+    before providers existed: same menu, same prompt, same single policy question per call.
 
     `progress` receives every line the loop has to say; `step`, when the caller passes one,
     receives only the lines that announce a tool action as `step(line, step_id, action, fields)`, so a
@@ -749,31 +998,69 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     proposal_hash on purpose, since the number proves sequencing rather than content.
     memory is the user's own standing note for this project, kept on the session for
     audit but outside the hash, which covers what the proposal changes.
+    steering is a `SteeringInbox` the view submits to while this run is in flight. Each instruction is
+    read at a turn boundary, folded into the run's binding constraints and its conversation, and
+    recorded on the session — the work already done is kept, not restarted, and an instruction still
+    waiting when the run ends is left in the box for the next step. `urgent` asks are the exception:
+    they ask the in-flight provider to stop, so the instruction is read on the next one rather than
+    after a slow model finishes. Left out, the loop is exactly the run it was before steering existed.
     resume_run picks up a run that stopped before it reached a result: the stored turns come back, a
     file whose content moved since is dropped from the read set instead of trusted, and the failure
     counters carry over so a resumed run does not quietly get a second full budget for one mistake.
+
+    `event_bus` is the structured-event channel views share (see `events.py`): every session event is
+    translated by the `EventAdapter` and broadcast there, so a CLI status line, the web SSE hub and the
+    memory engine subscribe to one stream instead of wrapping `progress`. Left out, the run broadcasts
+    on the process-wide bus; passing a bus of your own isolates the run. `progress` is a pure sink —
+    the core never prints; with no sink given, prose lines are dropped.
     """
     if not task.strip() or len(task) > MAX_TASK_CHARS:
         raise AgentError(f"Task must contain 1-{MAX_TASK_CHARS} characters.")
+    if progress is None:
+        def progress(_line):
+            pass
     # The task decides the language the loop announces in, exactly as it decides the language the
     # model answers in — a window that has been used for both must not switch halfway through.
     # The reference block is stripped first: it is written in the language of the *quoted* message,
     # and an English question quoting an Arabic reply would otherwise announce itself in Arabic.
     arabic = labels.is_arabic(labels.asked_of(task))
+    # Built below, once per run: `announce` reads the in-flight call's id off it, so the row written
+    # while a tool runs and the outcome that tool hands back are keyed by the same value.
+    tool_context: "tools.ToolContext | None" = None
 
     def announce(action: str, **fields) -> None:
         """One thing the loop just did, said three ways: the strip, the conversation, the record.
 
         The id is what ties the three together. A sentence is not a key — it repeats, it changes with
         the language the task was asked in, and it is the only handle a row clicked an hour later has
-        for finding its details again, so the id rides on the stored event as well as the live one.
+        for finding its details again, so the id rides on the stored event as well as the live one. A
+        tool call already has that id, minted by the registry, and takes it from the context; anything
+        else the loop announces mints its own.
         """
         line = labels.step_line(arabic, action, **fields)
-        step_id = uuid.uuid4().hex[:8]
+        step_id = (tool_context.take_call_id() if tool_context is not None
+                   else "") or uuid.uuid4().hex[:8]
         event(session, "step", id=step_id, action=action, **fields)
         progress(line)
         if step is not None:
             step(line, step_id, action, fields)
+
+    def stopped() -> bool:
+        """Whether the person watching asked this run to end — as opposed to interrupting to steer."""
+        return cancelled is not None and bool(cancelled())
+
+    def stop_or_steer() -> bool:
+        """The predicate a provider ask is cut short by: a stop, or an urgent instruction unread yet.
+
+        Handing the loop's own question to `generate` rather than the caller's is what makes a steer
+        arrive inside the run rather than after the current ask: an urgent instruction is waiting only
+        until the first checkpoint that reads it, and an ask cut short for a stop still ends the run.
+        """
+        if stopped():
+            return True
+        waiter = getattr(steering, "interrupt_requested", None)
+        return bool(waiter()) if waiter is not None else False
+
     # Evidence is captured from a command the project itself defines; whatever it
     # printed is stored on the session and re-sent to the provider on the next turn.
     extra_context = redact(extra_context) if extra_context else extra_context
@@ -795,11 +1082,18 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         path = runs.resolve() / run_id / "session.json"
         session = {"schema": 1, "id": run_id, "root": str(ws.root), "task": task,
                    "state": "DISCOVERING", "created": now(), "events": [], "model": provider.model}
+    # Everything the loop broadcasts goes through one bus, decided before the first recorded event.
+    attach_bus(session, ux.global_bus if event_bus is None else event_bus)
     # The continuity record lives on the session, not in the history: trimming a turn must never
     # take with it the constraints and decisions that turn established.
     if not isinstance(session.get("task_state"), dict):
         session["task_state"] = taskstate.new_state(session.get("task") or task)
     state = session["task_state"]
+    # What the operator said mid-run, kept beside the record of the run rather than inside the task
+    # text: an instruction that changed the remaining turns must be readable afterwards, and it must
+    # not change the number a person typed to approve the proposal the run ends with.
+    if not isinstance(session.get("steering"), list):
+        session["steering"] = []
     record_stage(session, "understand")
     run_dir = path.parent
     acquire_run_lock(run_dir)
@@ -858,11 +1152,39 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     # is no longer shown. Empty on a first task, and that is the correct answer to send.
     auto_notes = memory_module.auto_block(memory_module.auto_notes_context(
         memory_module.memory_dir_for(runs), str(ws.root)))
+    memory_block = memory_module.block(session["memory"]) if session.get("memory") else ""
+    # The vocabulary this run offers, built before the first request rather than at the first tool
+    # call: the menu the model is shown and the dispatcher that judges its answers have to be one
+    # object's answer, or a advertised tool the router will not name costs a turn to discover and a
+    # router that admits a tool nobody was told exists is a rule nobody was shown. External providers
+    # discover their tools here, so a server that will not start is recorded before any request is
+    # paid for rather than halfway through one.
+    registry = tool_provider.CompositeToolProvider(
+        tool_provider.default_providers(tool_providers), control=tools.CONTROL_ACTIONS)
+    addendum = registry.addendum()
+    for supplied in registry.providers:
+        if supplied.provenance.external:
+            event(session, "tool_provider", provider=supplied.id,
+                  tools=len(supplied.contracts()),
+                  skipped=len(getattr(supplied, "skipped", []) or []),
+                  problem=str(getattr(supplied, "problem", "") or "")[:180])
+    # The compass: this project's own goal, rules and progress, read out of the two memory files it
+    # keeps in `.agent/memory`. Its ceiling is a token count because the thing it protects is a local
+    # model's window, and the room it is offered is what this base still has — task, map, notes and
+    # history charged first, so a memory that would push the request out of the prompt says nothing.
+    compass_tokens_used = context_builder.compass_tokens(
+        settings, used_chars=len(prompts.SYSTEM) + len(task) + len(repo_map) + len(addendum)
+        + len(memory_block) + len(auto_notes) + len(prior_context) + len(extra_context or ""))
+    compass_block = compass.for_prompt(ws.root, chat_id or "", tokens=compass_tokens_used)
     base = prompts.base_messages(
         task=task, repo_map=repo_map, settings=settings,
-        memory_block=memory_module.block(session["memory"]) if session.get("memory") else "",
+        memory_block=memory_block,
         reference=reference, open_errors=open_errors, prior_context=prior_context,
-        evidence=extra_context or "", auto_notes=auto_notes)
+        evidence=extra_context or "", auto_notes=auto_notes, tool_addendum=addendum,
+        compass=compass_block)
+    if compass_block:
+        event(session, "compass_attached", characters=len(compass_block),
+              tokens=compass_tokens_used)
     if auto_notes:
         event(session, "auto_notes_attached", characters=len(auto_notes))
     if extra_context:
@@ -896,111 +1218,40 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     # already-read snapshots, and the reason each was chosen is said in the thread. The old rule was
     # "the file's name must appear in the task", which answered a person who types paths and no one
     # else; the boundary test that keeps the named case first is kept verbatim.
-    # What it may spend is `prompts.retrieval_budget` -- the cap and the remainder are explained there.
-    used = sum(len(item["content"]) for item in base)
-    remaining = prompts.retrieval_budget(settings, used)
+    # What it may spend is `prompts.retrieval_budget`, and `context_builder` is what spends it.
+    used = context_builder.total_chars(base)
     _visible, rows = ws.index()
     named = []
-    excerpts = 0
-    # Architecture-aware file selection: if the project has been scanned and
-    # project-index.json is present, index_boost re-ranks the symbol rows so
-    # that files whose architectural layer matches the task intent surface first.
-    # If the index is absent (scanner not run yet) we fall back silently to the
-    # baseline symbols.rank — the planning loop is never worse than before.
-    from .repo_scanner import get_or_create_index, index_boost, project_facts
+    # Architecture-aware input: the project index, when the scanner has run, is what re-ranks the
+    # symbol rows by layer. Its facts are measured now and read from the next turn on -- the build
+    # files the scan opened hold the versions a later proposal has to respect, and they are kept
+    # outside the folder so no proposal can edit the facts it is being checked against.
+    from .repo_scanner import get_or_create_index, project_facts
     _proj_index = get_or_create_index(ws.root)
-    # Measured now, read from the next turn on: the build files the scan opened hold the versions a
-    # later proposal has to respect, and they are kept outside the folder so no proposal can edit the
-    # facts it is being checked against.
     if _proj_index is not None:
         memory_module.record_facts(memory_module.memory_dir_for(runs), str(ws.root),
                                    project_facts(_proj_index))
-    # Step-aware seeds. A run that implements step four of a plan is not the same question as the plan,
-    # and the sentence the operator typed is often only "step 4" — the names the files live in are in
-    # the goal and in the criteria that step accepts. Same rule as the ledger: only what was recorded
-    # on the session is read back, so a run with no step seeded from the task alone. Deterministic text,
-    # no second model call, and the budget does not move — only what is scored against it.
-    seed = task
-    if plan_step is not None:
-        wanted = [str(item) for item in (criteria or [])]
-        accepted = [wanted[number - 1] for number in (accepts or [])
-                    if isinstance(number, int) and 1 <= number <= len(wanted)]
-        seed = " ".join([task, str(goal or "")] + (accepted or wanted))[:SEED_CHARS]
-    _rank_entries = (
-        index_boost(rows, seed, _proj_index, limit=MAX_CONTEXT_FILES)
-        if _proj_index is not None
-        else symbols.rank(rows, seed, limit=MAX_CONTEXT_FILES)
-    )
-    # The optional semantic layer (see `semantic.py`): meaning-close files the lexical ranker missed,
-    # merged into the same five-file budget. It adds nothing and costs nothing unless the operator
-    # installed FastEmbed and pointed it at a local model folder; otherwise this is a no-op and the
-    # ranked list is exactly the one the loop has always used.
-    try:
-        if semantic.available(settings):
-            _seen_paths = {entry["path"] for entry in _rank_entries}
-            for _hit in semantic.rank(settings, ws.root, seed, rows,
-                                      limit=MAX_CONTEXT_FILES - len(_rank_entries)):
-                if _hit["path"] not in _seen_paths:
-                    _rank_entries.append(_hit)
-                    _seen_paths.add(_hit["path"])
-    except Exception:   # noqa: BLE001 — an optional index must never break retrieval
-        pass
-    injected = 0
-    for entry in _rank_entries:
-        name = entry["path"]
-        if reference and name == reference["path"]:
-            continue
-        if len(observed) + injected >= MAX_CONTEXT_FILES:
-            break
-        try:
-            item = ws.read(name)
-        except PolicyError:
-            continue
-        encoded = json.dumps(item)
-        if len(encoded) > remaining:
-            # The file is larger than what the budget has left. Skipping it used to be the entire
-            # answer, which is the failure a small local model pays for: it proposes against a file it
-            # has never seen a line of, in a project whose map said the file was right there. An
-            # excerpt of the block around the ranked symbol is sent instead — and like the whole-file
-            # snapshot below, it reaches the model without authorising a proposal for the file.
-            if excerpts >= MAX_EXCERPTS:
-                continue
-            text, line, more = symbols.snippet(item["content"],
-                                               entry["symbol"] or name.rsplit("/", 1)[-1])
-            if not text:
-                continue
-            block = ("\nFile excerpt (untrusted data, partial): " + name + ", from line "
-                     + str(line) + (" — the file continues past what is shown here" if more else "")
-                     + ". This file was NOT read in full; read_file it before proposing it.\n" + text)
-            if len(block) > remaining:
-                # Charged whole, header included: the ceiling this loop works under is a character
-                # count, and a label that is not counted is a ceiling with a hole in it.
-                continue
-            remaining -= len(block)
-            excerpts += 1
-            base[1]["content"] += block
-            shown = len(text.splitlines())
-            # The same code the whole-file path sends, and nothing more: `labels` turns this code into
-            # the reason the operator reads, so a marker added here ("[excerpt 12 lines]") would erase
-            # the reason instead of qualifying it. The row's own kind and its `lines` already say that
-            # this file arrived in pieces.
-            reason = chosen_reason(entry)
-            event(session, "context_excerpt", path=name, lines=shown, from_line=line,
-                  truncated=more, why=reason, symbol=entry["symbol"])
-            named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
-            continue
-        remaining -= len(encoded)
-        # A snapshot the run chose is not a file the model opened. `observed` is the set a proposal is
-        # honoured against, so counting injected content here let a model replace a file it never asked
-        # for -- and on a resumed run it re-authorised exactly the paths the re-verify loop above had
-        # just dropped for changing on disk. The snapshot still carries the current bytes, and the
-        # auto-read path below charges the run one turn to open the file properly.
-        injected += 1
-        base[1]["content"] += "\nFile snapshot (untrusted data, already read):\n" + encoded
-        reason = chosen_reason(entry)
-        event(session, "context_file", path=name, sha256=item["sha256"], why=reason,
-              symbol=entry["symbol"])
-        named.append({"path": name, "why": reason, "symbol": entry["symbol"]})
+    # A step of a plan is named by the criteria it accepts, not by the number the operator typed:
+    # `context_builder.seed_text` says which words are scored. Deterministic text, no second model
+    # call, and the budget does not move -- only what is scored against it.
+    seed = context_builder.seed_text(task, step=plan_step, goal=goal, criteria=criteria,
+                                     accepts=accepts)
+    # Which files arrive, in what shape, and what each costs the window is `context_builder.build`'s
+    # rule. The loop appends what it returns and records each piece under the kind it came as: a whole
+    # snapshot is a file that arrived, an excerpt is a file that did not. Neither is a read -- the
+    # auto-read path below still charges the run one turn to open a file properly.
+    for piece in context_builder.build(ws=ws, settings=settings, rows=rows, seed=seed,
+                                       used_chars=used, observed_count=len(observed),
+                                       reference=reference, index=_proj_index):
+        base[1]["content"] += piece.block
+        if piece.kind == context_builder.EXCERPT:
+            event(session, "context_excerpt", path=piece.path, lines=piece.lines,
+                  from_line=piece.from_line, truncated=piece.truncated, why=piece.reason,
+                  symbol=piece.symbol)
+        else:
+            event(session, "context_file", path=piece.path, sha256=piece.sha256,
+                  why=piece.reason, symbol=piece.symbol)
+        named.append({"path": piece.path, "why": piece.reason, "symbol": piece.symbol})
     if named:
         announce("context_files", count=len(named), names=named)
     counters = resumed.get("counters") if isinstance(resumed.get("counters"), dict) else {}
@@ -1008,6 +1259,10 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     blocked_retries = int(counters.get("blocked_retries") or 0)
     recoverable = str(counters.get("recoverable") or "")
     last_error = str(counters.get("last_error") or "")
+    # The action name is read by the fast/strong choice at the top of every turn, and an ask this loop
+    # cut short for a steering instruction never reaches the line that normally sets it. Started here so
+    # the interrupted turn asks the same question as a resumed one: nothing gathered yet.
+    name = ""
     # The identical-reply guard restarts on a resumed run: it counts answers seen in one sitting, and a
     # person who closed the app and came back is in a new sitting by definition.
     repeated = {}
@@ -1020,20 +1275,55 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
     # snapshots have been appended. The task state rides at the end and is rewritten each turn:
     # a record that went stale after turn one would just re-create the drift it exists to fix.
     base_template = base[1]["content"]
-    state_budget = min(3000, max(600, settings.context_chars // 8))
-    # The state block rides inside the base, so it can never be the thing that pushes `base + history`
-    # past the window it shares — that is the drift it exists to prevent, and a raised "Initial context
-    # exceeds" at the smallest legal budget is that bug made fatal. `taskstate.block` spends its whole
-    # 283-character header the moment it writes anything, so a room smaller than that buys no block: the
-    # honest answer is none, and the task still fits. Otherwise the block is capped to the room left.
-    room = settings.context_chars - len(base[0]["content"]) - len(base_template)
-    if room < 300:
-        state_budget = 0
-    else:
-        state_budget = min(state_budget, room)
+    state_budget = context_builder.state_budget(settings, len(base[0]["content"]),
+                                                len(base_template) + 4)
+    # Built once per run, not per turn. The context carries this loop's own `observed` dict, so a
+    # read a tool performs is the same read that later authorises a proposal against that file, and
+    # `rows` is handed in rather than re-indexed because the retrieval above has just paid for it
+    # and the two must start from one answer. The verdict is named here, not left to the context's
+    # default, because this loop is the task-originated execution boundary `policy` asks to have
+    # checked: every tool call below passes the gate with it, and the table is the answer the classes
+    # these tools run under carry — no folder declares them, and none can.
+    tool_context = tools.ToolContext(ws=ws, settings=settings, observed=observed, rows=rows,
+                                     verdict=policy.decide, trace_id=run_id,
+                                     record=lambda kind, **fields: event(session, kind, **fields),
+                                     announce=announce, progress=progress)
+
+    def take_steering(turn: int) -> None:
+        """Read what the operator said since the last checkpoint, and make it part of this run.
+
+        Said three times on purpose, because each is read by a different party. It joins the history, so
+        the model is asked with the instruction in front of it in its own words; it joins the continuity
+        record's binding constraints, so a turn the context later trims cannot take the instruction with
+        it; and it joins the session's own steering list and the event stream, so the person who typed it
+        can see the run obey it and find the row again after the fact. Nothing here renumbers the turns,
+        clears the history or re-reads the repository: the run continues where it stood.
+        """
+        drainer = getattr(steering, "drain", None)
+        if drainer is None:
+            return
+        for row in drainer():
+            text = str(row.get("text") or "").strip()[:MAX_STEER_CHARS]
+            if not text:
+                continue
+            row["text"] = text
+            row["turn"] = turn + 1
+            row["read"] = now()
+            session["steering"].append(row)
+            taskstate.merge(state, {"constraints": [text]})
+            history.append({"role": "user",
+                            "content": "Operator steering (binding instruction from the user, "
+                                       "given mid-run): " + text})
+            event(session, "steer", id=str(row.get("id") or ""), text=text, turn=turn + 1,
+                  urgent=bool(row.get("urgent")))
+            announce("steer", detail=text, count=turn + 1)
+            # Written down as it is taken: an instruction read mid-run is a fact about the run, and a
+            # process that dies on the ask that followed must not take the record of it with it.
+            atomic_json(path, session)
+
     try:
         for turn in range(start_turn, settings.max_turns):
-            if cancelled is not None and cancelled():
+            if stopped():
                 raise Cancelled("Planning cancelled; no project files changed.")
             # One reading per turn: the budget check and the turn's own record must agree about how
             # long the run has been going, and a second clock call per turn is a second tick in tests
@@ -1041,9 +1331,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             elapsed = time.monotonic() - started
             if elapsed > budget_seconds:
                 raise AgentError("Task time budget exhausted.")
+            # The steering checkpoint: everything said while the last ask was in flight is read here,
+            # before this turn's prompt is assembled, so it arrives as an instruction and not a retry.
+            take_steering(turn)
             taskstate.note_files(state, observed)
-            base[1]["content"] = (base_template + "\n"
-                                  + taskstate.block(state, state_budget)).rstrip()
+            task_block = taskstate.block(state, state_budget)
+            base[1]["content"] = (base_template + ("\n" + task_block if task_block else "")).rstrip()
             while history and sum(len(m["content"]) for m in base + history) > settings.context_chars:
                 for dropped in history[:2]:
                     taskstate.fold_turn(state, dropped)
@@ -1056,7 +1349,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             # rejection, and repair rounds stay on the strong one. Nothing configured → today's
             # behaviour, one model for everything.
             active = provider
-            if (turn > start_turn and not last_error and name in GATHER_ACTIONS
+            if (turn > start_turn and not last_error and name in tools.GATHER_ACTIONS
                     and fast_provider is not None):
                 active = fast_provider
             elif ((turn == start_turn or last_error or int(session.get("fix_round") or 0) > 0)
@@ -1067,9 +1360,20 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
             if on_token is not None and getattr(active, "supports_stream", False):
                 gen_kwargs["on_token"] = on_token
             try:
-                raw = active.generate(base + history, cancelled=cancelled, **gen_kwargs)
+                raw = active.generate(base + history, cancelled=stop_or_steer, **gen_kwargs)
             except TypeError:
                 raw = active.generate(base + history, **gen_kwargs)
+            except Cancelled:
+                # The provider cuts its own ask short on the predicate it was handed, so the whole
+                # question is who asked for it. A stop ends the run as it always did; an ask broken by
+                # an urgent instruction nobody has read yet is an interruption this loop caused on
+                # purpose, and the half answer it left is worth nothing. The instruction is taken now
+                # and the run re-asks: steering that made the person wait for a slow model to finish
+                # would have arrived after the run rather than during it.
+                if stopped() or not stop_or_steer():
+                    raise
+                take_steering(turn)
+                continue
             # A reasoning model answered twice and only one of the two is the action. The thought is
             # shown, capped and redacted, as its own collapsible row — never folded into the envelope and
             # never sent back as history, because the next turn does not need to re-read the deliberation.
@@ -1084,7 +1388,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 spent = session.setdefault("metrics", {})
                 for field, value in counted.items():
                     spent[field] = spent.get(field, 0) + value
-            if cancelled is not None and cancelled():
+            if stopped():
                 raise Cancelled("Planning cancelled; no project files changed.")
             repeated[raw] = repeated.get(raw, 0) + 1
             if repeated[raw] >= 3:
@@ -1096,9 +1400,15 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                                  + "; try another model or a narrower task.")
             last_error = ""
             session["model"] = active.model
-            state_delta, name = None, ""
+            state_delta, name, rationale = None, "", ""
             try:
-                action = parse_action(raw)
+                # The dialects a decision arrives in are settled before a field of it is read: what
+                # the model nested under `args` is lifted into the envelope, and the sentence that
+                # explains the choice is taken out from under `reason` or `thought`. Each is the
+                # asking the prompt made, said the way a function-calling model says it, and refusing
+                # one teaches nothing — three refusals of it end the run on the invalid-action budget.
+                action = contracts.unwrap_args(parse_action(raw))
+                rationale = contracts.pop_rationale(action)
                 # The optional continuity envelope: taken out before validation so the strict
                 # per-action field checks never see it, and a malformed one is ignored rather
                 # than charged — the state aids continuity, it is not part of the contract.
@@ -1106,108 +1416,7 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 if isinstance(state_delta, dict):
                     taskstate.merge(state, state_delta)
                 name = action.get("action")
-                if name == "list_files" and set(action) == {"action"}:
-                    names = ws.files(limit=301)
-                    result = {"files": names[:300], "truncated": len(names) > 300}
-                    recoverable = "" if names else (
-                        "An empty project is expected for a first task. Propose the new files the "
-                        "plan calls for instead of blocking: " + refusals.PROPOSE_SHAPE)
-                    event(session, "tool", name=name, count=len(result["files"]))
-                    # The count goes to the record, not the sentence: "Scanning project files..." is
-                    # what the row says, and how many it found is what opening it answers.
-                    announce("list_files", count=len(result["files"]))
-                elif name == "read_file" and set(action) == {"action", "path"}:
-                    try:
-                        result = ws.read(action["path"])
-                    except MissingFileError:
-                        relative = action["path"]
-                        observed.pop(relative, None)
-                        try:
-                            ws.path(relative, writable=True)
-                            can_create = True
-                        except PolicyError:
-                            can_create = False
-                        result = {"path": relative, "status": "not_found", "exists": False,
-                                  "can_create": can_create,
-                                  "next_step": ("If the task requires this new file, propose its complete content; "
-                                                "do not read it again. Otherwise list/search existing files."
-                                                if can_create else "This path cannot be created under the current policy.")}
-                        event(session, "file_not_found", path=relative, can_create=can_create)
-                        recoverable = ("A missing file is not a failure: propose it as a new file at "
-                                       + relative + " with its complete content. Do not return "
-                                       'action="blocked" for a file you are allowed to create.'
-                                       if can_create else "")
-                        progress("File not found: " + relative + (" — a new-file proposal is allowed." if can_create else " — creation is protected."))
-                    else:
-                        if len(result["content"]) > settings.context_chars // 2:
-                            raise PolicyError("File exceeds model context budget; use a smaller task.")
-                        observed[result["path"]] = result["sha256"]
-                        recoverable = ""
-                        event(session, "tool", name=name, path=result["path"], sha256=result["sha256"])
-                        # The digest goes to the row, not the sentence: which *version* the model read
-                        # is the one thing that explains a write that undid something it could not have
-                        # seen, and it is what opening a read row answers with.
-                        announce("read_file", path=result["path"], digest=result["sha256"][:8])
-                elif name == "search_code" and set(action) == {"action", "query"}:
-                    result = {"matches": ws.search(action["query"])}
-                    recoverable = "" if result["matches"] else (
-                        "Nothing matched, which is normal for a new project. Propose the files the "
-                        "plan calls for instead of blocking: " + refusals.PROPOSE_SHAPE)
-                    event(session, "tool", name=name, matches=len(result["matches"]))
-                    announce("search_code", query=action["query"], count=len(result["matches"]))
-                elif name == "find_symbol" and set(action) == {"action", "query"}:
-                    _files, rows = ws.index()
-                    # One more than the cap, the way `list_files` learns it truncated. An answer that
-                    # filled 40 and an answer that is 40 arrive identical otherwise, and a small model
-                    # reads the first one as "this project declares this name 40 times".
-                    found = symbols.find_symbol(rows, action["query"], limit=symbols.MAX_HITS + 1)
-                    hits = found[:symbols.MAX_HITS]
-                    result = {"declarations": hits, "truncated": len(found) > len(hits)}
-                    if result["truncated"]:
-                        result["note"] = (f"Only the first {symbols.MAX_HITS} are shown; more "
-                                          "declarations exist in the repository. Name the file or "
-                                          "narrow the identifier before reading.")
-                    if not hits:
-                        # An empty answer with nothing after it is the shape a small model replies to by
-                        # asking the same question again. `read_file` does this already via `next_step`.
-                        result["next_step"] = ("Nothing declares that name, which is an answer: the "
-                                               "project does not define it. Propose the file the plan "
-                                               "calls for instead of searching again.")
-                    recoverable = "" if hits else (
-                        "No declaration of that name is in the index, which is an answer: the project "
-                        "does not define it. Propose the files the plan calls for instead of blocking: "
-                        + refusals.PROPOSE_SHAPE)
-                    event(session, "tool", name=name, query=action["query"], count=len(hits),
-                          truncated=result["truncated"])
-                    announce("find_symbol", query=action["query"], count=len(hits))
-                elif name == "find_references" and set(action) == {"action", "query"}:
-                    _files, rows = ws.index()
-                    found = symbols.find_references(action["query"], ws.sources(rows), rows,
-                                                    limit=symbols.MAX_HITS + 1)
-                    sites = found[:symbols.MAX_HITS]
-                    result = {"sites": sites,
-                              "truncated": len(found) > len(sites),
-                              # The per-file ceiling is a rule the answer always obeys, not something
-                              # this call can detect after the fact, so it is stated rather than
-                              # inferred: one file with twenty uses reports six and looks complete.
-                              "caps": {"total": symbols.MAX_HITS,
-                                       "per_file": symbols.PER_FILE_LIMIT},
-                              "summary": {kind: sum(1 for row in sites if row["kind"] == kind)
-                                          for kind in sorted({row["kind"] for row in sites})},
-                              "files": sorted({row["path"] for row in sites})}
-                    if result["truncated"]:
-                        result["note"] = (f"(truncated at {symbols.MAX_HITS} matches; more references "
-                                          "exist in the repository)")
-                    if not sites:
-                        result["next_step"] = ("No code names it. search_code answers text, including "
-                                               "configuration and comments; or propose if it is new.")
-                    recoverable = "" if sites else (
-                        "Nothing in the indexed code names it. Try search_code for text, or propose: "
-                        + refusals.PROPOSE_SHAPE)
-                    event(session, "tool", name=name, query=action["query"], count=len(sites),
-                          truncated=result["truncated"])
-                    announce("find_references", query=action["query"], count=len(sites))
-                elif name == "propose" and {"action", "changes"} <= set(action) <= {
+                if name == "propose" and {"action", "changes"} <= set(action) <= {
                         "action", "summary", "checks", "changes"}:
                     summary = action.get("summary", "")
                     checks = action.get("checks", [])
@@ -1242,9 +1451,12 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                     # row that says what was offered.
                     atomic_json(path, session)
                     return path
-                elif name == "blocked" and set(action) == {"action", "reason"}:
-                    reason = action["reason"]
-                    if not isinstance(reason, str) or not 1 <= len(reason) <= 1000:
+                elif name == "blocked" and set(action) == {"action"}:
+                    # The explanation was lifted out of the envelope before validation, so a model
+                    # that gave it as `thought` blocked as properly as one that used the name the
+                    # prompt asked for. What is left to judge is the sentence, not the key it came in.
+                    reason = rationale
+                    if not 1 <= len(reason) <= 1000:
                         raise PolicyError("A blocked action requires a short reason.")
                     if recoverable and blocked_retries < MAX_BLOCKED_RETRIES:
                         blocked_retries += 1
@@ -1257,20 +1469,56 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                         # remedy. Both read from the same string.
                         progress(labels.step_line(arabic, "blocked", reason=reason))
                         raise AgentError("Model could not produce a proposal: " + reason)
+                elif name == "complete" and set(action) <= {"action", "summary"}:
+                    # The third way a run ends: nothing to write. The task was already satisfied on
+                    # disk, or it was never a code change; the summary is the whole artifact, so it
+                    # is validated the way a blocked reason is and stored the way a proposal summary
+                    # is. No stage past "review" is walked — there is no change to implement or
+                    # verify, and a record that claims otherwise would lie about an empty diff.
+                    summary = action.get("summary", "")
+                    if not isinstance(summary, str) or len(summary) > 1000:
+                        raise PolicyError("A complete action takes at most a short summary.")
+                    session["summary"] = summary or "The task needs no file changes."
+                    session["state"] = "COMPLETED"
+                    event(session, "completed", summary=session["summary"][:200])
+                    announce("complete", detail=session["summary"])
+                    record_stage(session, "review")
+                    state["status"] = "task complete — no changes needed"
+                    atomic_json(path, session)
+                    return path
                 else:
-                    # The one refusal a model cannot fix without seeing itself: "invalid fields" is
-                    # true of eight different mistakes, and the shape example alone does not say which
-                    # of *its* keys was the problem. Field names are the half of the reply that carries
-                    # no project content, so they are what can be echoed and recorded.
-                    raise PolicyError("Unknown action or invalid fields: " + action_shape(action) +
-                                      ". Allowed: list_files, read_file, search_code, find_symbol, "
-                                      "find_references, propose, blocked. Each of those takes exactly "
-                                      "action plus the one field named for it.")
-            except (ValueError, TypeError, PolicyError, OSError) as exc:
+                    # The fetching actions are defined in `tools`, which also owns this
+                    # refusal: an envelope that names one of them with the wrong fields lands here
+                    # too, and "invalid fields" is true of a dozen different mistakes, so the shape
+                    # the model actually sent is echoed back beside the whole vocabulary. The policy
+                    # verdict is asked inside the same call, before any handler runs, so a class the
+                    # table refuses arrives at the rejection path below like any other refusal.
+                    outcome = registry.run(action, tool_context)
+                    result, recoverable = outcome.data, outcome.advice
+                    # What the tool's own run established — a suite's verdict, a tree's cleanliness —
+                    # is folded into the continuity record here, not only into the history. The
+                    # trim drops the turn that carried the full output; the record keeps the fact,
+                    # and the model's next prompt reads it from the state block the way it reads
+                    # its own entries. Merged through the same `taskstate.merge` as the model's
+                    # optional state envelope, so the caps and the redactor are the ones already
+                    # spent on model-written lists.
+                    if outcome.state:
+                        taskstate.merge(state, outcome.state)
+                    # A symbol tool rebuilt the index in order to answer, and `propose` reads those
+                    # same rows for its impact report. Taking the copy back is what stops a proposal
+                    # from reasoning over the index the turn started with.
+                    rows = tool_context.rows
+            except (ValueError, TypeError, PolicyError, contracts.ContractError,
+                    OSError) as exc:
                 failures += 1
                 if failures > 3:
                     raise AgentError("Model exceeded the invalid-action budget.") from exc
                 result = {"error": str(exc)[:300]}
+                # The taxonomy code rides beside the sentence so a reader can colour the row — or
+                # decide whether a retry could ever land differently — without matching prose.
+                code = getattr(exc, "code", "")
+                if code:
+                    result["code"] = code
                 last_error = result["error"]
                 recoverable = refusals.advice_for(result["error"], task)
                 stale = STALE_READ.match(result["error"])
@@ -1320,6 +1568,11 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
         atomic_json(path, session)
         raise
     finally:
+        # A provider that started a process for this run closes it here, whatever ended the run — a
+        # proposal, a refusal, or a cancelled turn. The loop never owns an outside child beyond the
+        # run that asked for its tools, and a child that outlives the task that spawned it is a
+        # process nobody can attribute to anything in the session record.
+        registry.shutdown()
         release_run_lock(run_dir)
 
 
@@ -1476,6 +1729,90 @@ def review(session: dict) -> str:
     return "\n".join(rows)
 
 
+_RISK_REASON_TEXT = {
+    "risk_reason_address_limited": "the target address is in a limited range",
+    "risk_reason_address_public": "the target address is a public endpoint",
+    "risk_reason_runs_later": "a changed file runs later, not just now",
+    "risk_reason_configuration": "a changed file is configuration",
+    "risk_reason_leaves_machine": "the action sends something outside this machine",
+    "risk_reason_irreversible": "the action is destructive and hard to reverse",
+    "risk_reason_sensitive_domain": "the task or a changed file belongs to a sensitive domain",
+    "risk_reason_many_files": "the proposal changes many files at once",
+}
+
+
+def plan_mode_view(session: dict) -> dict:
+    """The whole plan as five read-only sections: goal, files, steps, risks, checks.
+
+    Every section is derived from the session record alone — nothing here opens a write or asks a
+    provider. `review()` shows *what the bytes change* (the diff); this shows *what the run intends*
+    (the plan a person approves before any diff matters), which is why the risk band and the proposed
+    checks are re-read from `risk_policy` and the session's own ledger rather than stored twice.
+    """
+    state = session.get("task_state") or {}
+    goal = str(session.get("goal") or state.get("goal") or session.get("task") or "")
+    changes = [row for row in (session.get("changes") or []) if isinstance(row, dict)]
+    affected = [{"path": str(row.get("path") or ""),
+                 "action": ("delete" if row.get("delete")
+                            else "create" if not row.get("before") else "modify")}
+                for row in changes]
+    steps: list[str] = []
+    reference = session.get("plan_reference") or {}
+    if reference.get("path"):
+        steps.append("Attached plan (read-only): " + str(reference["path"]))
+    if isinstance(session.get("plan_step"), int):
+        steps.append(f"Implementing step {session['plan_step']} of the attached plan.")
+    # What the operator said while the run was already going is part of the plan the remaining steps
+    # follow, so the read-only view says it back in their words rather than leaving it in the log.
+    for row in session.get("steering") or []:
+        if isinstance(row, dict) and row.get("text"):
+            steps.append(f"Steered at turn {row.get('turn', '?')}: {row['text']}")
+    steps.extend(str(item) for item in state.get("decisions") or [])
+    if session.get("summary"):
+        steps.append(str(session["summary"]))
+    if state.get("next_step"):
+        steps.append("Next: " + str(state["next_step"]))
+    assessment = risk_policy.assess_changes(changes, str(session.get("task") or ""))
+    risks = ["Risk level: " + assessment.risk.value]
+    if assessment.verdict in (policy.ASK, policy.DENY):
+        risks.append(f"Approval is {assessment.verdict.upper()}-controlled for this class of change.")
+    risks.extend(_RISK_REASON_TEXT.get(code, code) for code in assessment.reasons)
+    for row in changes:
+        warning = shrink_warning(row)
+        if warning:
+            risks.append("Removal to check: " + warning)
+    risks.extend(labels.impact_lines(session.get("impact") or {}))
+    checks = list(session.get("checks") or [])
+    checks.extend(str(item) for item in state.get("acceptance") or [])
+    return {"goal": goal, "affected_files": affected, "steps": steps,
+            "risks": risks, "test_strategy": checks}
+
+
+def plan_mode_text(session: dict) -> str:
+    """Plan Mode as one printed block: the five sections, and the way out of reading."""
+    view = plan_mode_view(session)
+
+    def counted(title: str, lines: list[str], empty: str) -> list[str]:
+        return [title, *(lines or ["  • " + empty]), ""]
+
+    rows = ["PLAN MODE — read-only view of the full plan. Nothing has been written.", ""]
+    rows.append("Goal:")
+    rows.append("  " + (view["goal"] or "(none recorded)"))
+    rows.append("")
+    files = [f"  • {row['action']}  {row['path']}" for row in view["affected_files"]]
+    rows.extend(counted(f"Affected files ({len(files)}):", files, "(none — no proposal yet)"))
+    steps = ["  • " + line for line in view["steps"]]
+    rows.extend(counted(f"Steps ({len(steps)}):", steps, "(none recorded yet)"))
+    risks = ["  • " + line for line in view["risks"]]
+    rows.extend(counted(f"Risks ({len(risks)}):", risks, "nothing the policy flags"))
+    checks = ["  • " + line for line in view["test_strategy"]]
+    rows.extend(counted("Test strategy:", checks,
+                        "no checks proposed — the proposal will claim nothing was verified"))
+    rows.append("Proposal SHA256: " + session.get("proposal_hash", "none"))
+    rows.append("No project files changed. Approve this plan, then apply it with: agent apply <session>.")
+    return "\n".join(rows)
+
+
 def proposal_rejected(session: dict) -> bool:
     """The latest decision for this exact proposal, shared by every surface."""
     wanted = session.get("proposal_hash")
@@ -1497,6 +1834,23 @@ def reopen_proposal(path: Path, approved_hash: str) -> dict:
     if not proposal_rejected(session):
         raise PolicyError("This proposal has not been declined.")
     event(session, "proposal_reopened", hash=approved_hash)
+    atomic_json(path, session)
+    return session
+
+
+def reject_proposal(path: Path, approved_hash: str) -> dict:
+    """Decline a pending proposal: record the refusal, write nothing.
+
+    The mirror of `reopen_proposal`. A decline belongs to one proposal hash and must be a pending
+    answer, so the same guards that let a real approval through also keep a stale or forged hash from
+    quietly marking some other proposal as refused.
+    """
+    session = load_session(path)
+    if session["state"] != "WAITING_APPROVAL" or approved_hash != session.get("proposal_hash"):
+        raise PolicyError("Rejecting requires the matching pending proposal hash.")
+    if proposal_rejected(session):
+        raise PolicyError("This proposal has already been declined.")
+    event(session, "proposal_rejected", hash=approved_hash)
     atomic_json(path, session)
     return session
 
@@ -1560,6 +1914,7 @@ def apply_proposal(path: Path, approved_hash: str) -> dict:
     # one that is neither: `note_task` swallows its own failures for exactly that reason.
     memory_module.note_task(memory_module.memory_dir_for(path.parent.parent),
                             session["root"], session)
+    compass.note_run_for(session["root"], session)
     atomic_json(path, session)
     return session
 
@@ -1600,5 +1955,6 @@ def rollback(path: Path, approved_hash: str) -> dict:
     # The memory of the change is corrected rather than left claiming work that is no longer on disk.
     memory_module.note_task(memory_module.memory_dir_for(path.parent.parent),
                             session["root"], session, status="rolled_back")
+    compass.note_run_for(session["root"], session, status="rolled_back")
     atomic_json(path, session)
     return session

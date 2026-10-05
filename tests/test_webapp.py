@@ -73,6 +73,10 @@ class Stub:
             raise PolicyError("Unknown project.")
         return {"key": key, "name": Path(str(key)).name}
 
+    def memory_panel(self, chat_id=""):
+        self.received.append(("memory_panel", chat_id))
+        return {"available": True, "root": "demo2"}
+
     def set_reply(self, request_id, reply):
         self.answer = reply
         self.reply.set()
@@ -370,7 +374,10 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.get("/api/bootstrap")[0], 200)
         self.assertEqual(self.get("/api/fs", query="&path=C%3A")[0], 200)
         self.assertEqual(self.get("/api/project", query="&project=demo2")[0], 200)
-        # /api/options was the endpoint no client called; a fourth route would be the same drift.
+        self.assertEqual(self.get("/api/memory")[0], 200)
+        # The client asks for it by name, in a literal the parity gate reads.
+        self.assertIn("api('/api/memory')", ui_script())
+        # /api/options was the endpoint no client called; a route nobody asks for is the same drift.
         self.assertEqual(self.get("/api/options")[0], 404)
 
     def test_the_timeout_the_browser_widget_advertises_is_the_one_the_server_clamps_to(self):
@@ -587,6 +594,85 @@ class ControllerSurfaceTests(unittest.TestCase):
             self.assertEqual(set(info["toolchain"]), set(first["toolchain"]))
         with self.assertRaises(PolicyError):
             controller.project_info("never-granted")
+
+    def test_the_preview_memory_panel_answers_the_tab_with_the_fields_the_real_one_sends(self):
+        """One tab, two windows, one shape.
+
+        A key only the shipped controller sends is a control that renders as nothing in the window the
+        design gets reviewed in, and the drift stays invisible until somebody ships it. The preview
+        builds its answer with `compass.editable_sections` and `compass.block` rather than a copy of
+        the layout, so what is compared here is the payload the real files produce.
+        """
+        import tempfile
+        from ai_code_engineer import compass
+        from ai_code_engineer.memory_store import MemoryStore
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as where:
+            root = Path(where).resolve() / "repo"
+            root.mkdir()
+            store = MemoryStore(root)
+            store.set_goal("Ship the duplicate-email check before the freeze")
+            store.add_items("constraints", ["Do not add dependencies"], "project")
+            store.set_text("task", "Make create() reject a duplicate email", "chat", "0" * 32)
+            real = set(compass.readout(store, "0" * 32))
+        scripted = FakeController().memory_panel()
+        self.assertEqual(sorted(real - set(scripted)), [],
+                         "the Memory tab is shown a field by the real window that the preview omits")
+        self.assertTrue(scripted["available"])
+        self.assertEqual(sorted({row["name"] + "/" + row["layer"] for row in scripted["sections"]}),
+                         sorted(["goal/project", "constraints/project", "decisions/project",
+                                 "open_issues/project", "progress/project", "task/chat",
+                                 "steps/chat", "decisions/chat", "open_issues/chat"]))
+        self.assertLessEqual(scripted["tokens"], scripted["limit"])
+        self.assertIn("Project compass", scripted["compass"])
+
+    def test_the_preview_refuses_a_layer_that_is_not_one_of_the_three(self):
+        """A click the shipped window refuses has to be refused here too.
+
+        The preview is what the design gets reviewed in, so a dead button that reads as working in the
+        preview teaches a behaviour the product does not have — worse than an empty panel. The refusal
+        is the same sentence the real compass raises, because neither window writes its own.
+        """
+        from ai_code_engineer import labels
+        reply = FakeController().action("memory_reset", {"layer": "everything"}, lambda row: None)
+        self.assertEqual(reply["error"], labels.note("memory_reset_target", target="everything"))
+        self.assertTrue(reply["panel"]["available"],
+                        "a refused reset left the preview with no panel to redraw")
+
+    def test_the_memory_panel_calls_only_helpers_the_bundle_defines(self):
+        """A browser script has no import that fails, so a call to a helper nobody wrote is silent.
+
+        The Memory tab's reset button once answered its own click by naming a function that did not
+        exist in any of the seven files. Nothing in Python could see it: the parity gate reads the
+        action names the page posts, and the broken line never reached one. This reads the block that
+        paints the panel and asks, of every bare call in it, that some script in the bundle wrote it.
+        """
+        import re
+        whole = ui_script()
+        panel = whole.split("function loadMemory()", 1)[1].split("\n  function show(name)", 1)[0]
+        self.assertTrue(panel.strip(), "the memory panel moved out of the block this guard reads")
+        called = set(re.findall(r"(?<![\w$.])([a-z][A-Za-z0-9_$]*)\s*\(", panel))
+        declared = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", whole))
+        declared |= set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", whole))
+        # `if`/`for` are the panel's own control flow, and `var(--mono)` is a CSS function inside a
+        # style attribute -- neither is a call the client makes on a helper.
+        self.assertEqual(sorted(called - declared - {"if", "for", "while", "switch", "var"}), [],
+                         "the Memory tab calls a helper no script in the bundle defines")
+
+    def test_a_helper_the_panel_invents_is_found_by_the_guard_that_reads_it(self):
+        """The guard above has to fail on the bug it exists for, or it is a sentence about a regex.
+
+        The name is planted inside the real block, so the split that finds the panel still works and
+        only the missing definition is new.
+        """
+        import re
+        planted = ui_script().replace("function loadMemory() {",
+                                      "function loadMemory() { memoryNoSuchHelper();", 1)
+        panel = planted.split("function loadMemory()", 1)[1].split("\n  function show(name)", 1)[0]
+        called = set(re.findall(r"(?<![\w$.])([a-z][A-Za-z0-9_$]*)\s*\(", panel))
+        declared = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", planted))
+        declared |= set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", planted))
+        self.assertIn("memoryNoSuchHelper", called - declared,
+                      "a helper the page invented would pass the guard that reads the panel")
 
     def test_the_preview_projects_are_the_ones_the_sidebar_lists(self):
         listed = {group["key"] for group in FakeController().snapshot()["projects"]}
@@ -1113,6 +1199,7 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
         package = Path(__file__).resolve().parents[1] / "src/ai_code_engineer"
         cls.servers = "".join((package / name).read_text(encoding="utf-8") for name in
                               ("host.py", "webapp/controller.py", "webapp/fake.py", "webapp/server.py"))
+        cls.engine = (package / "engine.py").read_text(encoding="utf-8")
 
     def test_every_event_kind_the_page_listens_for_is_one_a_server_can_send(self):
         import re
@@ -1122,6 +1209,12 @@ class AnAnswerThatArrivesWhileYouWait(unittest.TestCase):
         # alone would call them dead: the shared stream sink, and the ask helper that blocks on them.
         sent |= set(re.findall(r"self\._stream\([^)]*\"([a-z_]+)\"", self.servers))
         sent |= set(re.findall(r"_ask\(\"([a-z_]+)\"", self.servers))
+        # The bus is the fourth producer on the same wire: `Hub.publish` forwards what the engine
+        # records, either as the session kind itself or as the typed event the EventAdapter rewrites
+        # it into (`stage` → `StageChanged`). Neither is a `"kind":` literal in a webapp file.
+        sent |= set(re.findall(r'event\(session, "([a-z_]+)"', self.engine))
+        sent |= {re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+                 for name in re.findall(r"return ux\.([A-Z]\w+)\(", self.engine)}
         self.assertEqual(sorted(heard - sent), [],
                          "the page handles an event nothing emits, which is a silent feature")
 

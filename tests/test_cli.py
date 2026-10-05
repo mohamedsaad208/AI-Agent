@@ -40,7 +40,7 @@ api_key_env = "GROQ_API_KEY"
 [limits]
 max_turns = 4
 timeout_seconds = 30
-context_chars = 6000
+context_chars = 6400
 output_tokens = 1000
 """
 

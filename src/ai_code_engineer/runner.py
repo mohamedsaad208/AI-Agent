@@ -408,23 +408,37 @@ def kill_tree(process: subprocess.Popen) -> None:
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                           capture_output=True, stdin=subprocess.DEVNULL, timeout=30,
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
                            creationflags=flags)
             if result.returncode == 0:
+                try:
+                    if hasattr(process, "wait") and callable(process.wait):
+                        process.wait(timeout=1.0)
+                except (subprocess.TimeoutExpired, OSError, AttributeError):
+                    pass
                 return
         except (OSError, subprocess.SubprocessError):
             pass                       # taskkill absent or wedged: fall back to the direct child
     else:
         import signal
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            return
-        except (ProcessLookupError, OSError):
+            pgid = os.getpgid(process.pid)
+            # Only kill process group if distinct from the host daemon's own group
+            if pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
+                return
+        except (ProcessLookupError, OSError, AttributeError):
             pass
     try:
         process.kill()
-    except (ProcessLookupError, OSError):
+    except (ProcessLookupError, OSError, AttributeError):
         pass                           # already gone; there is nothing left for us to stop
+    try:
+        if hasattr(process, "wait") and callable(process.wait):
+            process.wait(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError, AttributeError):
+        pass
+
 
 
 # Deliberately bounded alternatives: an open-ended "[a-z]+error" pattern backtracks

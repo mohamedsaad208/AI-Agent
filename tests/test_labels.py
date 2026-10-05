@@ -681,5 +681,35 @@ class TheReferenceLine(unittest.TestCase):
                          "a message that merely starts with the marker is not a block")
 
 
+class TheWindowedReadSentences(unittest.TestCase):
+    def test_windowed_read_shows_line_range_and_total_in_both_languages(self):
+        en = labels.step_line(False, "read_file", path="src/App.java", from_line=10, to_line=50, total_lines=200)
+        ar = labels.step_line(True, "read_file", path="src/App.java", from_line=10, to_line=50, total_lines=200)
+        self.assertIn("lines 10–50 of 200", en)
+        self.assertIn("src/App.java", en)
+        self.assertTrue(is_arabic(ar))
+        self.assertIn("10", ar)
+        self.assertIn("50", ar)
+        self.assertIn("200", ar)
+        self.assertIn("src/App.java", ar)
+
+    def test_whole_file_read_omits_slice_information(self):
+        en = labels.step_line(False, "read_file", path="src/App.java", from_line=1, to_line=200, total_lines=200)
+        ar = labels.step_line(True, "read_file", path="src/App.java", from_line=1, to_line=200, total_lines=200)
+        self.assertEqual(en, "📖 Reading file: src/App.java")
+        self.assertEqual(ar, "📖 قراءة الملف: src/App.java")
+
+    def test_windowed_log_line_reports_line_slice_accurately(self):
+        entry = {"kind": "tool", "name": "read_file", "path": "src/App.java",
+                 "from_line": 10, "to_line": 50, "total_lines": 200}
+        en = labels.log_line(False, entry)
+        ar = labels.log_line(True, entry)
+        self.assertIn("lines 10–50 of 200", en)
+        self.assertTrue(is_arabic(ar))
+        self.assertIn("10", ar)
+        self.assertIn("50", ar)
+        self.assertIn("200", ar)
+
+
 if __name__ == "__main__":
     unittest.main()

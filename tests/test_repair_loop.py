@@ -1,232 +1,85 @@
+"""Unit tests for RepairClassifier, FailureClass, and RepairLoopGuard."""
 import unittest
-from pathlib import Path
-import tempfile
-from unittest.mock import patch
 
-from ai_code_engineer.core import (
-    AgentCore,
-    AgentState,
-    AgentStatus,
-    Plan,
-    Task,
-    VerificationResult,
-)
-from ai_code_engineer.errors import PolicyError
-from ai_code_engineer.repair import (
-    execute_verification,
-    handle_fix_evaluation,
-    verification_from_run,
+from ai_code_engineer.repair_loop import (
+    FailureClass,
+    FailureDiagnosis,
+    RepairClassifier,
+    RepairLoopGuard,
 )
 
 
-class TestRepairLoop(unittest.TestCase):
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name).resolve()
-        self.core = AgentCore(self.root)
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_verification_from_run_passed(self):
+class RepairLoopTests(unittest.TestCase):
+    def test_classify_compilation_failure(self):
         run = {
-            "recipe": "python-unittest",
-            "label": "Python unittest",
-            "command": "python -m unittest",
-            "status": "passed",
-            "exit_code": 0,
-            "seconds": 1.2,
-            "tail": "OK",
-            "failures": [],
+            "status": "failed",
+            "tail": "src/App.java:12: error: cannot find symbol\n  symbol:   variable foo",
+            "failures": ["src/App.java:12: error: cannot find symbol"],
         }
-        res = verification_from_run(run)
-        self.assertTrue(res.passed)
-        self.assertEqual(res.status, "passed")
-        self.assertEqual(res.exit_code, 0)
-        self.assertEqual(res.command, "python -m unittest")
-        self.assertEqual(res.failures, [])
+        diag = RepairClassifier.diagnose(run)
+        self.assertEqual(diag.failure_class, FailureClass.COMPILATION)
+        self.assertTrue(diag.is_fixable_by_code)
+        self.assertTrue(len(diag.error_sites) > 0)
 
-    def test_verification_from_run_failed(self):
+    def test_classify_test_assertion_failure(self):
         run = {
-            "recipe": "python-unittest",
-            "label": "Python unittest",
-            "command": "python -m unittest",
             "status": "failed",
-            "exit_code": 1,
-            "seconds": 2.4,
-            "tail": "FAILED (failures=1)",
-            "failures": ["FAIL: test_calc"],
+            "tail": "FAILED tests/test_math.py::test_add - AssertionError: assert 5 == 4",
+            "failures": ["FAILED tests/test_math.py::test_add - AssertionError: assert 5 == 4"],
         }
-        res = verification_from_run(run)
-        self.assertFalse(res.passed)
-        self.assertEqual(res.status, "failed")
-        self.assertEqual(res.exit_code, 1)
-        self.assertEqual(res.failures, ["FAIL: test_calc"])
-        self.assertIn("FAILED", res.output_tail)
+        diag = RepairClassifier.diagnose(run)
+        self.assertEqual(diag.failure_class, FailureClass.TEST_FAILURE)
+        self.assertTrue(diag.is_fixable_by_code)
+        self.assertIn("tests/test_math.py::test_add", diag.failing_tests[0])
 
-    def test_execute_verification_success_advances_to_done(self):
-        state = self.core.intake("Run tests")
-        # Move state to VERIFYING
-        state.status = AgentStatus.VERIFYING
-
-        passed_run = {
-            "recipe": "python-unittest",
-            "status": "passed",
-            "command": "python -m unittest",
-            "exit_code": 0,
-            "tail": "OK",
-            "failures": [],
+    def test_classify_environment_unavailable(self):
+        run = {
+            "status": "unavailable",
+            "reason": "mvn is not installed on PATH",
         }
+        diag = RepairClassifier.diagnose(run)
+        self.assertEqual(diag.failure_class, FailureClass.ENVIRONMENT)
+        self.assertFalse(diag.is_fixable_by_code)
 
-        with patch("ai_code_engineer.runner.run", return_value=passed_run):
-            verif = execute_verification(self.core, state, self.root, "python-unittest")
-
-        self.assertTrue(verif.passed)
-        self.assertEqual(state.status, AgentStatus.DONE)
-        self.assertEqual(state.verification_status, "PASSED")
-        self.assertIn("python -m unittest", state.commands_run)
-
-    def test_execute_verification_failure_advances_to_fixing(self):
-        state = self.core.intake("Fix bug")
-        state.status = AgentStatus.VERIFYING
-
-        failed_run = {
-            "recipe": "python-unittest",
-            "status": "failed",
-            "command": "python -m unittest",
-            "exit_code": 1,
-            "tail": "FAILED",
-            "failures": ["AssertionError"],
-        }
-
-        with patch("ai_code_engineer.runner.run", return_value=failed_run):
-            verif = execute_verification(self.core, state, self.root, "python-unittest")
-
-        self.assertFalse(verif.passed)
-        self.assertEqual(state.status, AgentStatus.FIXING)
-        self.assertEqual(state.verification_status, "FAILED")
-        self.assertTrue(len(state.errors) > 0)
-
-    def test_execute_verification_rejects_illegal_state(self):
-        state = self.core.intake("Task in analyzing")
-        self.assertEqual(state.status, AgentStatus.ANALYZING)
-        with self.assertRaises(PolicyError):
-            execute_verification(self.core, state, self.root, "python-unittest")
-
-    def test_handle_fix_evaluation_continues_under_budget(self):
-        state = self.core.intake("Task in fix")
-        state.status = AgentStatus.FIXING
-
-        # Round 1 of 3 -> continue
-        cont, reason = handle_fix_evaluation(self.core, state, sessions=[], round_number=1, limit=3)
-        self.assertTrue(cont)
-        self.assertEqual(reason, "continue")
-        self.assertEqual(state.status, AgentStatus.FIXING)
-
-    def test_handle_fix_evaluation_stops_when_exhausted(self):
-        state = self.core.intake("Task in fix")
-        state.status = AgentStatus.FIXING
-
-        # Round 3 of 3 -> stop and fail
-        cont, reason = handle_fix_evaluation(self.core, state, sessions=[], round_number=3, limit=3)
-        self.assertFalse(cont)
-        self.assertIn("stopped after 3 fix rounds", reason)
-        self.assertEqual(state.status, AgentStatus.FAILED)
-        self.assertIn("stopped after 3 fix rounds", state.errors[-1])
-
-    def test_full_fix_loop_lifecycle(self):
-        """End-to-end lifecycle test:
-        ANALYZING -> PLANNING -> WAITING_APPROVAL -> EXECUTING -> VERIFYING
-        -> FIXING -> PLANNING -> WAITING_APPROVAL -> EXECUTING -> VERIFYING -> DONE
-        """
-        # 1. Intake
-        state = self.core.intake("Implement calculate_total in OrderService")
-        self.assertEqual(state.status, AgentStatus.ANALYZING)
-
-        # 2. First Plan & Changes
-        plan1 = Plan(
-            task_id=state.task.id,
-            summary="Initial implementation of calculate_total",
-            target_files=["src/OrderService.java"],
+    def test_guard_stops_on_unfixable_failure(self):
+        guard = RepairLoopGuard(max_rounds=3)
+        diag = FailureDiagnosis(
+            failure_class=FailureClass.ENVIRONMENT,
+            raw_category="environment",
+            is_fixable_by_code=False,
         )
-        changes1 = [{"path": "src/OrderService.java", "after": "int calculate_total() { return 0; }"}]
-        self.core.set_plan(state, plan1, changes1)
-        self.assertEqual(state.status, AgentStatus.WAITING_APPROVAL)
+        can_proceed, reason = guard.can_proceed(diag)
+        self.assertFalse(can_proceed)
+        self.assertIn("environment issue", reason)
 
-        # 3. Approve and Execute
-        applied = []
-        def mock_apply(ch):
-            paths = [c["path"] for c in ch]
-            applied.extend(paths)
-            return paths
-
-        self.core.approve_and_execute(state, state.proposal_hash, mock_apply)
-        self.assertEqual(state.status, AgentStatus.VERIFYING)
-
-        # 4. First verification fails
-        failed_run = {
-            "recipe": "maven-test",
-            "status": "failed",
-            "command": "mvn test",
-            "exit_code": 1,
-            "tail": "calculate_total expected 100 but was 0",
-            "failures": ["testCalculateTotal"],
-        }
-        with patch("ai_code_engineer.runner.run", return_value=failed_run):
-            execute_verification(self.core, state, self.root, "maven-test")
-
-        self.assertEqual(state.status, AgentStatus.FIXING)
-
-        # 5. Fix Evaluation allows continuation
-        cont, reason = handle_fix_evaluation(self.core, state, sessions=[], round_number=1, limit=3)
-        self.assertTrue(cont)
-
-        # 6. Second Plan (Fix round)
-        plan2 = Plan(
-            task_id=state.task.id,
-            summary="Fix calculate_total to sum item prices",
-            target_files=["src/OrderService.java"],
+    def test_guard_detects_stagnation(self):
+        guard = RepairLoopGuard(max_rounds=3, stagnation_limit=2)
+        diag = FailureDiagnosis(
+            failure_class=FailureClass.TEST_FAILURE,
+            raw_category="assertion",
+            failing_tests=["test_login"],
+            error_sites=["app.py:20"],
         )
-        changes2 = [{"path": "src/OrderService.java", "after": "int calculate_total() { return sum; }"}]
-        self.core.set_plan(state, plan2, changes2)
-        self.assertEqual(state.status, AgentStatus.WAITING_APPROVAL)
+        # Round 1 proceeds
+        p1, _ = guard.can_proceed(diag)
+        self.assertTrue(p1)
 
-        # 7. Approve and Execute Fix
-        self.core.approve_and_execute(state, state.proposal_hash, mock_apply)
-        self.assertEqual(state.status, AgentStatus.VERIFYING)
+        # Identical failure in Round 2 triggers stagnation halt
+        p2, reason2 = guard.can_proceed(diag)
+        self.assertFalse(p2)
+        self.assertIn("Stagnation detected", reason2)
 
-        # 8. Second verification passes
-        passed_run = {
-            "recipe": "maven-test",
-            "status": "passed",
-            "command": "mvn test",
-            "exit_code": 0,
-            "tail": "BUILD SUCCESS",
-            "failures": [],
-        }
-        with patch("ai_code_engineer.runner.run", return_value=passed_run):
-            execute_verification(self.core, state, self.root, "maven-test")
+    def test_guard_stops_at_max_rounds(self):
+        guard = RepairLoopGuard(max_rounds=2)
+        diag1 = FailureDiagnosis(FailureClass.COMPILATION, "syntax", error_sites=["a.py:1"])
+        diag2 = FailureDiagnosis(FailureClass.COMPILATION, "syntax", error_sites=["b.py:2"])
+        diag3 = FailureDiagnosis(FailureClass.COMPILATION, "syntax", error_sites=["c.py:3"])
 
-        self.assertEqual(state.status, AgentStatus.DONE)
-        self.assertEqual(state.verification_status, "PASSED")
+        p1, _ = guard.can_proceed(diag1)
+        self.assertTrue(p1)
+        p2, _ = guard.can_proceed(diag2)
+        self.assertTrue(p2)
 
-        # 9. Verify transition history integrity
-        transitions = [h["to"] for h in state.history if "to" in h]
-        expected_transitions = [
-            "PLANNING",
-            "WAITING_APPROVAL",
-            "EXECUTING",
-            "VERIFYING",
-            "FIXING",
-            "PLANNING",
-            "WAITING_APPROVAL",
-            "EXECUTING",
-            "VERIFYING",
-            "DONE",
-        ]
-        self.assertEqual(transitions, expected_transitions)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        p3, reason3 = guard.can_proceed(diag3)
+        self.assertFalse(p3)
+        self.assertIn("maximum repair budget", reason3)

@@ -77,7 +77,8 @@ const context = vm.createContext({
   railPreviewCard: () => new Element('div', 'preview')
 });
 
-for (const name of ['runPlanStep', 'startSequential', 'stopSequential', 'renderRail']) {
+for (const name of ['runPlanStep', 'startSequential', 'stopSequential', 'planWide',
+                    'planEmptyCard', 'planCard', 'renderRail']) {
   const start = source.indexOf(`function ${name}(`);
   assert.ok(start >= 0, name);
   vm.runInContext(source.slice(start, source.indexOf('\n}\n', start) + 2), context);

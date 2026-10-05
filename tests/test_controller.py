@@ -308,7 +308,8 @@ class ControllerTests(unittest.TestCase):
         carry that instead of the generic "tests have not run"."""
         self.controller.set_auto_apply(True)
         self.controller.recipes = []                       # what runner.detect() answers for a bare folder
-        with patch("ai_code_engineer.runner.run", return_value=run_result()) as run:
+        with patch("ai_code_engineer.runner.run", return_value=run_result()) as run, \
+             patch("ai_code_engineer.runner.targets", return_value=[]):
             self.plan_a_fix("Fix add in calculator.py")
             self.controller.join()
         self.assertFalse(run.called, "there is no command to run, so nothing may claim one ran")

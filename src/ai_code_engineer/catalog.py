@@ -132,8 +132,10 @@ def models_for(kind: Kind, endpoint: str = "",
     rather than a list of guesses.
     """
     base = check_endpoint(kind, endpoint)
+    if not api_key and kind.key == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key and kind.key == "llm7":
-        api_key = os.environ.get("LLM7_API_KEY") or "/ZoS6OIXWjr2zcutfYyBYjFmHujB7zbrLka5VFqHiAoHv7FysQgfMiBMGOBR89D/eejXFcyDktjZiYMC24r97N+YKpTKSbM89buxO9RiPG2YP0E9p5xIDUbxGMtpQ5Jilh7ttjzMgY8pZe+x05D6di809jMlCA=="
+        api_key = os.environ.get("LLM7_API_KEY")
     try:
         if kind.shape == "ollama":
             return ollama_models(base), LIVE

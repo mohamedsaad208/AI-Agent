@@ -186,11 +186,21 @@ class TheContractIsImplemented(unittest.TestCase):
         refusal that differs between the windows is still a bug this table could not hide. The eighth
         `events.put` in Tk is the same rule seen from the other side: a goal outcome and a resumed job
         both speak from a worker thread, and the pump only understands `progress` and `done`.
+
+        Release 6 moved six more, all of them the Memory tab: one line written into a layer, a goal
+        stated by hand, the answer given to a waiting proposal, a layer forgotten, and the two refusals
+        that come back when there is no folder open or the store argues. 104 `self.status`. None of the
+        six is a sentence written there: they are `notes_saved` and `need_folder_notes` from the tables,
+        `friendly_error(...)` for a refusal the store raised, and the goal outcome's own `message` —
+        which `memory_summarizer` now builds with `labels.note(...)` in the language the task was asked
+        in, so the window and the terminal read one line rather than two. The reset sentence went the
+        same way: the store answers with the layers that went as codes and a word naming which sentence
+        tells it, and the wording lives in the notes table with its Arabic twin beside it.
         """
         ceilings = {
             SRC / "gui.py": {"status.set(": 66, "self.chat_message(": 18, "messagebox.": 6,
                              "events.put(": 8},
-            SRC / "webapp" / "controller.py": {"self.status = ": 98, "self._add(": 37,
+            SRC / "webapp" / "controller.py": {"self.status = ": 104, "self._add(": 37,
                                                "self._emit(": 22, "self._note(": 9},
         }
         for path, limits in ceilings.items():

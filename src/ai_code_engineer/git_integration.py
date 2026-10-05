@@ -51,6 +51,9 @@ TIMEOUT = 4.0
 CACHE_TTL = 8.0
 # Porcelain is one line per path; a repo with 40 000 dirty files is a count, not a list.
 MAX_PATHS = 500
+# A diff is read as evidence by the planning loop, not archived: one screen of unified diff
+# settles "what is uncommitted", and a model that needs more can read the files themselves.
+DIFF_CHARS = 30000
 # A commit is a different job from a status read: a cold cache and an object write both
 # take longer than the second git needs to answer a question.
 COMMIT_TIMEOUT = 20.0
@@ -65,7 +68,8 @@ GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_ADVICE": 
            "GCM_INTERACTIVE": "never", "GIT_PAGER": "cat"}
 
 _EMPTY = {"known": False, "repo": False, "branch": "", "detached": False,
-          "head": "", "toplevel": "", "dirty": None, "paths": [], "reason": ""}
+          "head": "", "toplevel": "", "dirty": None, "paths": [], "untracked": [],
+          "reason": ""}
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, dict]] = {}
@@ -132,15 +136,19 @@ def _porcelain(root: Path) -> dict:
     if not result["ok"]:
         # None, not 0: a repo whose status timed out is not a clean repo, and the chip
         # would say so.
-        return {"dirty": None, "paths": [],
+        return {"dirty": None, "paths": [], "untracked": [],
                 "reason": result["reason"] or _first_line(result["err"])}
     lines = [line for line in result["out"].splitlines() if line.strip()]
     paths = []
+    untracked = []
     for line in lines[:MAX_PATHS]:
         # XY <path>, or "!! <path>" when ignored; the payload always starts at column 3.
         tail = line[3:] if len(line) > 3 else ""
-        paths.append(tail.split(" -> ")[-1].strip('"'))
-    return {"dirty": len(lines), "paths": paths, "reason": ""}
+        name = tail.split(" -> ")[-1].strip('"')
+        paths.append(name)
+        if line.startswith("?? "):
+            untracked.append(name)
+    return {"dirty": len(lines), "paths": paths, "untracked": untracked, "reason": ""}
 
 
 def inspect(root: str | Path) -> dict:
@@ -177,7 +185,8 @@ def inspect(root: str | Path) -> dict:
     else:
         info["detached"] = bool(info["head"])
     state = _porcelain(folder)
-    info.update({"dirty": state["dirty"], "paths": state["paths"]})
+    info.update({"dirty": state["dirty"], "paths": state["paths"],
+                 "untracked": state["untracked"]})
     info["reason"] = state["reason"]
     if not info["branch"] and not info["head"]:
         # A repository with no commits yet: real, and it has nothing to compare against.
@@ -207,6 +216,31 @@ def status(root: str | Path | None) -> dict:
             _cache.clear()
         _cache[key] = (now, info)
     return _copy(info)
+
+
+def diff(root: str | Path) -> dict:
+    """Uncommitted changes as one text, plus the untracked paths a diff can never show.
+
+    Read-only like `status`, with the same side doors closed: this runs `git diff` only,
+    never a network or pager command. Against HEAD when commits exist, against the empty
+    index on a fresh repository, where the honest content of the answer is the untracked
+    list rather than a diff hunk. A failure is an "ok": False result plus a reason, never
+    an exception, because the caller feeds it to a model as an observation.
+    """
+    info = inspect(root)
+    if not info["known"] or not info["repo"]:
+        return {"ok": False, "reason": info["reason"] or "not a git repository",
+                "against": "", "diff": "", "truncated": False, "untracked": []}
+    folder = Path(root).expanduser().resolve()
+    against = "HEAD" if info["head"] else ""
+    run = _done(folder, ["diff"] + ([against] if against else []), TIMEOUT)
+    if not run["ok"]:
+        return {"ok": False, "reason": run["reason"] or _first_line(run["err"]),
+                "against": against, "diff": "", "truncated": False, "untracked": []}
+    text = redact(run["out"])
+    return {"ok": True, "reason": "", "against": against or "the empty index (no commits yet)",
+            "diff": text[:DIFF_CHARS], "truncated": len(text) > DIFF_CHARS,
+            "untracked": list(info["untracked"])}
 
 
 def relative(name: str) -> str:
