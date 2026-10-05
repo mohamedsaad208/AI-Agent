@@ -1411,9 +1411,15 @@ def plan(ws: Workspace, task: str, provider: ModelProvider, settings: Settings,
                 rationale = contracts.pop_rationale(action)
                 # The optional continuity envelope: taken out before validation so the strict
                 # per-action field checks never see it, and a malformed one is ignored rather
-                # than charged — the state aids continuity, it is not part of the contract.
-                state_delta = action.pop("state", None) if isinstance(action, dict) else None
-                if isinstance(state_delta, dict):
+                # than charged — the state aids continuity, it is not part of the contract. The
+                # prompt asks for it nested under `state`; a model deep in its own working state
+                # writes the same fields flat beside the action, and the note a run keeps is the
+                # note, whichever nesting it arrived in. Nested wins where both say one thing.
+                nested = action.pop("state", None) if isinstance(action, dict) else None
+                flat = contracts.pop_task_state(action)
+                said = nested if isinstance(nested, dict) else {}
+                state_delta = {**flat, **said} or None
+                if state_delta:
                     taskstate.merge(state, state_delta)
                 name = action.get("action")
                 if name == "propose" and {"action", "changes"} <= set(action) <= {
