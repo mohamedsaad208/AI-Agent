@@ -111,10 +111,12 @@ _UNSAFE_COMMAND = re.compile(r"[&|<>^%;$`\n\r]")
 
 # The envelope keys the layers above this one consume before a contract ever sees them. A field named
 # like one of these would be silently eaten — `state` is popped by the loop, `args` unwrapped,
-# `reason` read as the sender's sentence — and a tool whose documented argument vanishes before the
+# `reason` read as the sender's sentence, and every `contracts.TASK_STATE_KEYS` name lifted out as
+# the model's working state — and a tool whose documented argument vanishes before the
 # handler is a tool that lies about its own contract.
 RESERVED_FIELDS = frozenset({"action", "args", "parameters", "reason", "thought",
-                             "state", "trace_id", "call_id", "changes", "content"})
+                             "state", "trace_id", "call_id", "changes", "content"}
+                            | set(contracts.TASK_STATE_KEYS))
 
 # The names that mean "this value is a place in the workspace", and so get `PATH` rather than
 # `STRING`. A guess from a name, and deliberately a guess that can only *tighten*: a `PATH` field is
