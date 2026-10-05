@@ -996,14 +996,6 @@ function planWide() {
   return false;
 }
 
-function renderPlanColumn() {
-  const col = $('plan-col');
-  if (!col || !planWide()) return;
-  col.innerHTML = '';
-  col.appendChild(el('div', 'plan-col-head', 'Plan checklist'));
-  col.appendChild(planCard() || planEmptyCard());
-}
-
 /* ------------------------------ the top bar run row (T3.3) ------------------------------
    Task and subtitle are already permanent header content; this is the rest of what an operator
    asks a run that is in flight: which stage it is in, how long it has been going, one more

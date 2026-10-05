@@ -223,6 +223,10 @@ def _asked_file_count(text: str) -> int | None:
 class AgentController:
     """One user, one window, one task at a time. ``busy`` is the lock that keeps it that way."""
 
+    # Until `__init__` reads the saved preference, this window pins nothing and every sentence
+    # follows the task it was given — which is English unless someone asked in Arabic.
+    language = "auto"
+
     def __init__(self, app_dir: Path) -> None:
         self.app_dir = Path(app_dir).resolve()
         # First run writes the override file and its signing key beside the other records; an existing
@@ -409,6 +413,11 @@ class AgentController:
         self.fast_model = str(self._saved_ui.get("fast_model", "qwen2.5-coder:1.5b"))
         self.strong_model = str(self._saved_ui.get("strong_model", "qwen2.5-coder:7b"))
         self.semantic_model_dir = str(self._saved_ui.get("semantic_model_dir", "models"))
+        # The machine's own say about language: "en" and "ar" pin every sentence this window writes,
+        # and anything else — the default — leaves it to the task in front of the window, which
+        # answers in English for a task not written in Arabic. See `arabic` below.
+        saved_language = str(self._saved_ui.get("language") or "").strip().lower()
+        self.language = saved_language if saved_language in ("en", "ar") else "auto"
         saved_auto = self._saved_ui.get("auto_apply")
         if isinstance(saved_auto, dict):
             self._auto_pref = {str(row): bool(flag) for row, flag in saved_auto.items()}
@@ -904,13 +913,18 @@ class AgentController:
 
     @property
     def arabic(self) -> bool:
-        """Was the task in front of the window asked in Arabic?
+        """Is the sentence this window owes the operator an Arabic one?
 
-        The model is already told to answer in the language it was asked in; this is the same rule
-        applied to the sentences we write. It reads the session's task first, then the last thing
-        the user typed, because a status line set before any session exists still answers to that
-        person. Anything with no text of theirs to look at stays English.
+        English is the answer, and the only two things that change it are decisions somebody took:
+        the machine's `language` preference pinning one tongue outright, or a task written in Arabic
+        — the model is told to answer in the language it was asked in, and this is the same rule
+        applied to the sentences we write. Nothing else flips it: a page of Arabic pasted into a
+        path, or a reply in another tongue, leaves this window speaking what the operator asked for.
+        It reads the session's task first, then the last thing the user typed, because a status line
+        set before any session exists still answers to that person.
         """
+        if self.language != "auto":
+            return self.language == "ar"
         task = asked_of((self.session or {}).get("task") or "")
         if not task:
             task = asked_of(next((m.get("text", "") for m in reversed(self.messages)
@@ -4587,6 +4601,9 @@ class AgentController:
               "fast_model": self.fast_model, "strong_model": self.strong_model,
               "semantic_model_dir": self.semantic_model_dir,
               "style": self._saved_ui.get("style", "claude"), "theme": self._saved_ui.get("theme", "light"),
+              # Pinned by the machine, never by a project: which tongue every sentence this window
+              # writes is in. "auto" follows the task, which is English unless the task was Arabic.
+              "language": self.language,
               # Written by "Don't show this again". The dict below is rebuilt from named keys, so a
               # preference nobody lists here is erased by the next save of anything else.
               "setup_seen": bool(self._saved_ui.get("setup_seen")),

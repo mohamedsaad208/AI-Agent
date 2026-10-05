@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ai_code_engineer import contracts
+from ai_code_engineer import contracts, taskstate
 
 
 class TraceIdTests(unittest.TestCase):
@@ -646,6 +646,62 @@ class ResultInvariantsTests(unittest.TestCase):
         """The helpers settle dialects before judgement; garbage in is handed back, not crashed."""
         self.assertEqual(contracts.unwrap_args(["not", "a", "dict"]), ["not", "a", "dict"])
         self.assertEqual(contracts.pop_rationale("not a dict"), "")
+
+
+class TaskStateScratchpadTests(unittest.TestCase):
+    """The working state written flat beside the action, and what that costs the field checks.
+
+    The prompt asks for the notes under one optional `state` object; a model that has been
+    reasoning over them all turn writes them next to `action` instead. Both spellings are the same
+    note, so the envelope gives them up before the exact-field judgement rather than being refused
+    for them — and every other unclaimed key is still refused by name, because a caller that
+    believes it set `limit` and was ignored reasons from a limit that never existed.
+    """
+
+    def setUp(self):
+        self.contract = contracts.ToolContract(
+            "list_files", (), purpose="list the workspace")
+        self.read_contract = contracts.ToolContract(
+            "read_file", (contracts.Field("path", contracts.PATH),))
+
+    def test_the_scratchpad_names_are_the_ones_the_loop_writes_out(self):
+        self.assertEqual(set(contracts.TASK_STATE_KEYS), set(taskstate.SECTION_ORDER),
+                         "a state section the loop prints must not be refused as an argument")
+
+    def test_a_flat_scratchpad_beside_the_action_is_not_refused(self):
+        call = self.contract.validate({
+            "action": "list_files", "acceptance": ["open: tests pass"],
+            "constraints": ["do not rename the public API"], "status": "gathering",
+            "decisions": ["read the config first"], "evidence": ["app.py:41"],
+            "open_issues": ["the cache is stale"], "next_step": "read api.py",
+            "files_examined": ["app.py"], "folded": ["user: keep the pom untouched"],
+            "goal": "Fix the login form"})
+        self.assertEqual(call.tool, "list_files")
+        self.assertEqual(call.args, {})
+
+    def test_a_scratchpad_wrapped_in_the_args_dialect_is_taken_out_too(self):
+        call = self.read_contract.validate({"action": "read_file",
+                                           "args": {"path": "app.py", "status": "gathering"}})
+        self.assertEqual(call.args, {"path": "app.py"})
+
+    def test_a_key_that_is_not_the_scratchpad_is_still_refused_by_name(self):
+        with self.assertRaises(contracts.MalformedCall) as raised:
+            self.read_contract.validate({"action": "read_file", "path": "app.py", "limites": 20})
+        self.assertIn("limites", str(raised.exception))
+
+    def test_pop_task_state_hands_back_what_it_took_out(self):
+        action = {"action": "list_files", "status": "gathering", "acceptance": ["open: tests"]}
+        self.assertEqual(contracts.pop_task_state(action),
+                         {"status": "gathering", "acceptance": ["open: tests"]})
+        self.assertEqual(action, {"action": "list_files"})
+
+    def test_pop_task_state_leaves_alone_an_envelope_that_kept_no_notes(self):
+        action = {"action": "list_files", "state": {"status": "gathering"}}
+        self.assertEqual(contracts.pop_task_state(action), {})
+        self.assertEqual(action, {"action": "list_files", "state": {"status": "gathering"}})
+
+    def test_pop_task_state_answers_empty_for_anything_that_is_not_an_envelope(self):
+        self.assertEqual(contracts.pop_task_state(["not", "a", "dict"]), {})
 
 
 if __name__ == "__main__":

@@ -16,23 +16,24 @@
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.x%20Ready-6DB33F?style=for-the-badge&logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
 [![Architecture](https://img.shields.io/badge/Repo%20Scanner-13--Layer%20AST-00F2FE?style=for-the-badge&logo=codereview&logoColor=black)]()
 [![State Machine](https://img.shields.io/badge/AgentCore-Deterministic%20FSM-10B981?style=for-the-badge&logo=diagram&logoColor=white)]()
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-10B981?style=for-the-badge&logo=linux&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/Tests-1740%2B%20Passing-8B5CF6?style=for-the-badge&logo=checkmarx&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml)
+[![Security Gate](https://img.shields.io/badge/Zero--Trust-Security%20Gate%20%26%20MCP-EF4444?style=for-the-badge&logo=auth0&logoColor=white)]()
+[![Tests](https://img.shields.io/badge/Tests-3100%2B%20Passing-8B5CF6?style=for-the-badge&logo=checkmarx&logoColor=white)](https://github.com/mohamedsaad208/AI-Agent/actions/workflows/ci.yml)
 [![Bilingual](https://img.shields.io/badge/Native%20Lang-English%20%7C%20العربية%20(RTL)-EC4899?style=for-the-badge&logo=googletranslate&logoColor=white)]()
 
 <br/>
 
-**AI Code Engineer** is an enterprise-grade autonomous software engineering agent equipped with deep architectural repo-scanning, a deterministic typed state machine, an autonomous build/test/fix repair loop, enterprise-grade zero-trust guardrails, and native bilingual (English & Arabic RTL) support. It runs 100% offline with local Ollama models or seamlessly connects to cloud providers (**Google Gemini**, OpenRouter, OpenAI, Groq, DeepSeek).
+**AI Code Engineer** is an enterprise-grade autonomous software engineering platform. Built with strict zero-trust guardrails, a deterministic Finite State Machine, and an offline-first philosophy, it pairs deep 13-layer architectural repository analysis with a self-healing build/test/fix repair loop. It works 100% offline with local Ollama models or seamlessly connects to cloud providers (**Google Gemini**, OVH, LLM7, OpenRouter, OpenAI, Groq, DeepSeek).
 
 <br/>
 
 [Key Highlights](#-key-highlights) •
 [Quick Start](#-quick-start) •
 [Core Architectural Pillars](#-core-architectural-pillars) •
-[Offline Extras & Planning](#-offline-extras) •
+[Unified Commands & CLI](#-12-unified-commands--terminal-power) •
+[Web & Desktop UX](#-web-app--visual-experience) •
+[Offline Extras & Model Gateway](#-offline-extras-model-gateway--planning) •
 [Platform Guide](#-platform-guide) •
 [Three Modes & Limits](#-three-modes-and-the-limits-that-go-with-them) •
-[Try These First](#-try-these-first) •
 [Project Architecture](#-project-architecture) •
 [Codebase Map](#-where-everything-lives) •
 [Contributing](#-contributing)
@@ -45,16 +46,18 @@
 
 | Capability | What It Delivers |
 | :--- | :--- |
-| ☕ **13-Layer Spring Boot & Polyglot Scanner** | Deeply inspects enterprise codebases across 13 distinct architectural layers (Controllers, Services, Repositories, Entities, DTOs, Mappers, Security, Configs, Exceptions, Events, Clients, Utils, Tests) with 200+ recognized annotations and inter-class dependency graph resolution. |
-| 📋 **Structured Planning & Requirement Grounding** | Validates proposed task steps against real repository symbols, tests, and build facts (`--plan-file`). Rejects hallucinated targets before any code is generated. |
-| ⚙️ **Deterministic State Machine (`AgentCore`)** | Replaces unconstrained agent loops with a formally bounded, typed Finite State Machine (`PENDING` ➔ `PLANNING` ➔ `REVIEWING` ➔ `EXECUTING` ➔ `VERIFYING` ➔ `FIXING` ➔ `DONE` / `FAILED`), ensuring full auditability and rollback safety. |
-| 🔁 **Self-Healing Build / Test / Fix Loop** | Detects real build toolchains (`Maven`, `Gradle`, `pytest`, `unittest`, `npm`, `cargo`, `go test`), executes tests, parses JUnit XML & terminal failure traces, and autonomously repairs code (bounded to a strict 3-round safety ceiling). |
-| 🧠 **Dual-Model Routing & Local Semantic Search** | Routes cheap gathering turns to lightweight models while reserving strong models for planning/repair. Includes offline local vector embeddings via preloaded FastEmbed BGE-small. |
-| 🛑 **Instant Task Cancellation** | True real-time task cancellation across Web and Desktop GUI: terminates running process trees cleanly (`kill_tree`) via `taskkill /F /T` on Windows or `kill -9` on Unix, interrupts streaming LLM inference, and safely resets agent readiness. |
-| 🔒 **Zero-Trust Security & Enterprise-Grade Guardrails** | Strict filesystem sandbox prevents path-traversal attacks (`..`), symlink escapes, and system device access (`CON`, `NUL`). Automated live regex redactor strips secrets, API keys, PEM private keys, JWTs, and database credentials before model exposure. |
-| 🌿 **Non-Destructive Git Checkpoints & Targeted Restore** | Every applied diff commits to a local checkpoint commit (`--no-verify`, skips hooks). If subsequent changes block rollback, Targeted Single-File Git Restore safely restores modified files to the exact pre-task commit without rewriting git history. |
-| 🌐 **Native Bilingual Engine & Arabic RTL** | Full first-class Arabic and English dual support. Dynamic Right-to-Left (RTL) interface in the WebApp, automatic language detection (`is_arabic`), and fully localized diagnostic reports and `--arabic` CLI flags. |
-| ⚡ **100% Offline & Multi-Provider Cloud** | Full privacy-first execution with local **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Seamlessly switch to cloud models via **Google Gemini** (`gemini-3.8-flash`), **OpenRouter**, **OpenAI**, **Groq**, or custom OpenAI-compatible endpoints. |
+| ☕ **13-Layer Spring Boot & Polyglot Scanner** | Deeply inspects enterprise codebases across 13 distinct architectural layers (Controllers, Services, Repositories, Entities, DTOs, Mappers, Security, Configs, Exceptions, Events, Clients, Utils, Tests) with 200+ recognized annotations and inter-class dependency graph extraction. |
+| 🕸️ **Directed Code Graph & Blast Radius Analysis** | Builds an in-memory directed graph of classes, methods, endpoints, and tests (`code_graph.py`). Calculates exact impact and blast radius before any file change is synthesized. |
+| ⚙️ **Deterministic FSM & Typed Tool Contracts** | Governed by a bounded Finite State Machine (`PENDING` ➔ `PLANNING` ➔ `REVIEWING` ➔ `EXECUTING` ➔ `VERIFYING` ➔ `FIXING` ➔ `DONE` / `FAILED`). Every tool call adheres to typed contracts with strict input/output schemas and execution bounds (`contracts.py`). |
+| 🛡️ **Zero-Trust Security Gate & MCP Integration** | Every tool invocation passes through a single admission gate (`gate.py`, `policy_engine.py`) with fail-closed policies and single-use TTL approval tokens. Integrates external Model Context Protocol servers (`.agent-mcp.json`) under identical strict guardrails. |
+| 🛑 **Prompt Injection & Data Exfiltration Defense** | Enforces an uncompromised instruction trust hierarchy (`SYSTEM` > `USER` > `REPO`). Neutralizes prompt injection patterns and wraps untrusted repository text in structured envelopes (`trust.py`). |
+| 🔁 **Self-Healing Build / Test / Fix Loop** | Detects project toolchains (`Maven`, `Gradle`, `pytest`, `unittest`, `npm`, `cargo`, `go test`), parses test output and JUnit XML, and autonomously diagnoses failures across a bounded 3-round repair loop with built-in stagnation detection (`repair_loop.py`). |
+| 🧠 **Dual-Tier Persistent Memory & Compass** | Maintains durable project-level (`.agent/memory/project.md`) and session-level (`.agent/memory/chats/`) memory. Automatically injects a bounded 1,500-token Compass into system prompts to preserve project goals, binding constraints, and key decisions across sessions. |
+| 🧭 **Plan Mode (`--plan`) & Mid-Run Steering** | Inspect goals, affected files, risk ratings, and test strategies prior to code generation. Dynamically inject guidance mid-run (`steer <instruction>`) to adjust agent direction without aborting execution. |
+| 📋 **12 Unified Interactive Commands** | A uniform command vocabulary (`status`, `plan`, `changes`, `diff`, `tests`, `risks`, `stop`, `steer`, `report`, `undo`, `memory`, `help`) shared identically across the Rich CLI and the Web UI. |
+| 🌿 **Non-Destructive Git Worktree Safety** | Segregates agent modifications from pre-existing human edits. Targeted single-file restore reverts agent actions to pre-task commit state without touching uncommitted developer work or rewriting history. Hardcoded denial of destructive force pushes. |
+| 🌐 **Native Bilingual Engine & Arabic RTL** | First-class English and Arabic dual support with automatic language detection (`is_arabic`), dynamic Right-to-Left (RTL) interface styling, and fully localized diagnostic reports and CLI banners. |
+| ⚡ **100% Offline-First & Multi-Provider Gateway** | Complete privacy-first offline execution with local **Ollama** (`qwen2.5-coder`, `deepseek-coder`, `llama3`). Seamless multi-cloud gateway for **Google Gemini** (`gemini-3.8-flash`), **OVH**, **LLM7**, **OpenRouter**, **OpenAI**, **Groq**, and **DeepSeek** with automatic fallback. |
 
 ---
 
@@ -71,42 +74,43 @@ cd AI-Agent
 # Verify environment readiness, toolchains, and provider reachability
 python agent.py setup
 
-# Run self-diagnostics: Python version, Ollama reachability, Docker, env variables
+# Run self-diagnostics: Python version, Ollama reachability, Docker, environment variables
 python agent.py doctor
 
 # Run deterministic offline demo — no model, no network, zero repository modifications
 python agent.py demo
 ```
 
-### 3. Run the Test Suite (1,740+ Tests)
+### 3. Run the Automated Test Suite (3,100+ Tests)
 ```bash
 # Run the complete test suite with the standard library test runner:
 python -m unittest discover -s tests
 
-# On Windows (pinned against Python 3.11):
+# On Windows:
 run-tests.cmd
 ```
 
 ### 4. Launch the Application
-- **Windows:** Double-click `Run-Agent.bat` (or run `python desktop.pyw`)
-- **Linux / macOS:** Run `./run-agent.sh` (or `python3 desktop.pyw`)
+- **Desktop WebApp:** Double-click `Run-Agent.bat` (or run `python desktop.pyw`)
+- **Linux / macOS WebApp:** Run `./run-agent.sh` (or `python3 desktop.pyw`)
 - **Interactive Terminal Menu:** Run `python launcher.py`
 - **Headless Web UI Only:** `python -m ai_code_engineer.webapp --port 8765`
+- **Direct CLI Task Execution:** `python agent.py "Fix bug in auth service" --repo /path/to/project`
 
 ---
 
 # 🏛️ Core Architectural Pillars
 
-### 1. ☕ Enterprise Repository Understanding (`repo_scanner.py`)
-Enterprise projects (e.g. Spring Boot microservices, polyglot monorepos) are too large for raw token dump context windows. AI Code Engineer provides an intelligent architectural scanner:
+### 1. ☕ Enterprise Repository Understanding & Directed Code Graph (`repo_scanner.py`, `code_graph.py`)
+Enterprise codebases cannot be dumped raw into model context windows. AI Code Engineer incorporates an intelligent multi-layer analyzer:
 - **13 Specialized Layers:** Automatically identifies and categorizes files into `controllers`, `services`, `repositories`, `entities`, `dtos`, `mappers`, `configs`, `security`, `exceptions`, `events`, `clients`, `utils`, and `tests`.
 - **200+ Annotations Recognized:** Detects Spring Boot, Spring Security, Spring Data, Jakarta EE, Lombok, Kafka, RabbitMQ, and Feign annotations (`@RestController`, `@Service`, `@Repository`, `@Entity`, `@Configuration`, `@Transactional`, `@PreAuthorize`, `@KafkaListener`, etc.).
-- **Dependency Graph:** Extracts inter-class wiring (`LoginController` ➔ `LoginService` ➔ `CustomerRepository`).
-- **`project-index.json`:** Generates and caches structured architecture summaries.
-- **Architectural Boosting (`index_boost`):** Directly integrated into `engine.py` to prioritize relevant architectural layers during file candidate selection.
+- **Directed Code Graph:** Constructs caller/callee trees, interface implementation maps, and dependency graphs (`code_graph.py`).
+- **Blast Radius & Impact Analysis:** Computes the ripple effect of modified symbols across the repository before applying diffs.
+- **Architectural Boosting (`index_boost`):** Integrates directly into retrieval to prioritize relevant architectural layers during file candidate selection.
 
-### 2. ⚙️ Deterministic Typed State Machine (`core.py`)
-Unlike unpredictable infinite-loop agents, AI Code Engineer is orchestrated by a rigorous, bounded Finite State Machine:
+### 2. ⚙️ Deterministic Typed State Machine & Strict Tool Contracts (`core.py`, `contracts.py`)
+Replaces unconstrained infinite agent loops with a formally bounded, typed Finite State Machine:
 ```
            [START]
               │
@@ -117,14 +121,14 @@ Unlike unpredictable infinite-loop agents, AI Code Engineer is orchestrated by a
                │  core.transition_to(PLANNING)
                ▼
           ┌──────────┐
-          │ PLANNING │
+          │ PLANNING │ ◄── [Mid-Run Steering: steer <instruction>]
           └────┬─────┘
                │  core.transition_to(REVIEWING)
                ▼
           ┌───────────┐
-          │ REVIEWING │
+          │ REVIEWING │ ◄── [User Approves: [y] approve / [n] reject / [d] details]
           └────┬──────┘
-               │  core.transition_to(EXECUTING) [User Approves Diff]
+               │  core.transition_to(EXECUTING)
                ▼
           ┌───────────┐
           │ EXECUTING │
@@ -136,132 +140,149 @@ Unlike unpredictable infinite-loop agents, AI Code Engineer is orchestrated by a
           └─────┬─────┘
                 │
         ┌───────┴───────┐
- (Run Passed)     (Run Failed)
+ (Checks Passed)  (Checks Failed)
         │               │
         ▼               ▼
    ┌─────────┐    ┌─────────┐
-   │  DONE   │    │ FIXING  │◄──┐  (Fix round <= 3)
+   │  DONE   │    │ FIXING  │◄──┐  (Fix round <= 3 & Stagnation Check Passed)
    └─────────┘    └────┬────┘   │
                        │        │
                        └────────┘
-                       │ (Fix rounds exhausted)
+                       │ (Fix rounds exhausted or stagnation detected)
                        ▼
                   ┌─────────┐
                   │ FAILED  │
                   └─────────┘
 ```
-- Fully typed data structures: `Task`, `Plan`, `Action`, `Tool`, `Result`, `VerificationResult`, `AgentState`.
-- Every transition is validated against `ALLOWED_TRANSITIONS` and logged in state history.
+- **Strict Tool Contracts:** Every tool call (`contracts.py`) validates typed parameters against declared schemas, enforces monotonic timeout budgets, and filters out extraneous scratchpad thoughts.
+- Every state transition is validated against `ALLOWED_TRANSITIONS` and recorded in immutable history.
 
-### 3. 🔁 Self-Healing Build / Test / Fix Loop (`repair.py`)
-Closing the loop between code generation and execution feedback:
-- **Multi-Toolchain Detection:** Automatically invokes project test suites using `mvn test`, `gradle test`, `pytest`, `unittest`, `npm test`, `cargo test`, or `go test`.
-- **Typed Verification:** Parses execution status, exit codes, failure counts, and output tails into a `VerificationResult`.
-- **Autonomous Repair Iterations:** When tests fail, the agent analyzes compiler diagnostics and assertion errors, proposes targeted diffs, and re-tests up to `MAX_FIX_ROUNDS = 3`.
-- **Review-First Invariant:** Autonomous repair diffs are presented for review (or auto-applied only if explicitly enabled per folder).
+### 3. 🛡️ Zero-Trust Security Gate, Policy Engine & External MCP (`gate.py`, `policy_engine.py`, `mcp.py`)
+Security is not an afterthought; it is enforced before any action executes:
+- **Unified Admission Gate (`gate.py`):** One centralized checkpoint evaluating tool signature, policy classification, running posture, and origin provenance.
+- **Action Risk Classification:** Actions categorized into `SAFE_READ`, `READ`, `WRITE`, `EXECUTE_RECIPE`, `EXECUTE_CUSTOM`, `NETWORK`, and `DESTRUCTIVE`.
+- **Single-Use TTL Approval Tokens:** Sensitive operations issue cryptographically random approval tokens with short expiration times to prevent replay attacks.
+- **External Tools via MCP (`mcp.py`):** Connect external tools via Model Context Protocol servers in `.agent-mcp.json`. MCP tools run namespaced (`mcp_<server>_<tool>`), bounded by operator-defined maximum side-effect ceilings (`read`, `write`, `execute`).
+- **Prompt Injection Defense (`trust.py`):** Treats repository data, git logs, and tool stdout as untrusted *DATA*. Strips hidden prompt injection triggers before sending payloads to LLMs.
+- **Filesystem Sandbox (`workspace.py`):** Rejects path traversal (`..`), symlink escapes, and Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
+- **Zero-Trust Secret Redactor (`redaction.py`):** Strips API keys, PEM private keys, JWTs, AWS credentials, and database passwords from all payloads, terminal logs, and session records.
 
-### 4. 🛑 Instant Task Cancellation
-- Real-time cancellation mechanism driven by `threading.Event`.
-- Subprocesses are spawned within dedicated process groups. Upon cancellation, `runner.kill_tree()` recursively terminates the entire process tree on both Windows (`taskkill /F /T /PID`) and Unix (`kill -9`).
-- Active streaming LLM responses are immediately aborted, freeing GPU and memory resources.
+### 4. 🔁 Self-Healing Build / Test / Fix Loop (`repair_loop.py`, `repair.py`)
 
-### 5. 🔒 Zero-Trust Security & Enterprise-Grade Guardrails
-- **Path Traversal Guards:** Prevents accessing or writing to files outside the workspace root (`..` rejection, symlink escape detection).
-- **Windows Device Protection:** Blocks reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
-- **Secret Redaction:** `redaction.py` strips PEM keys, AWS tokens, GitHub tokens, Slack keys, Google API keys, JWTs, and database passwords from terminal output before sending to the LLM.
-- **Protected Policy Files:** Prevents modification of agent policy files (`.cursorrules`, `.github`, `.mvn`, `mcp.json`).
+<br/>
 
-### Folder policy overrides
+<img src="assets/demo-complex.gif" alt="Autonomous Multi-File Refactor & Self-Healing Repair Loop" width="100%"/>
 
-Show the decisions and safeguards for a project folder:
+<br/>
 
-```bash
-agent policy --repo PATH
-```
+Closes the loop between code generation and compiler/runtime feedback:
+- **Multi-Toolchain Detection:** Discovers and runs test suites using `mvn test`, `gradle test`, `pytest`, `unittest`, `npm test`, `cargo test`, or `go test`.
+- **Diagnostic Analysis:** Parses compiler errors, stack traces, and JUnit XML test reports to pinpoint root causes (Compilation vs Assertion vs Environment).
+- **Stagnation Detection:** Halts immediately if consecutive repair iterations produce identical failure signatures, preventing endless token waste.
+- **Bounded Safety Ceiling:** Strict maximum limit of 3 autonomous fix rounds (`MAX_FIX_ROUNDS = 3`).
 
-Set a decision for a configurable action class (`write_that_runs`, `execute_custom`, or `network`):
+### 5. 🧠 Dual-Tier Persistent Memory & Model Compass (`memory_store.py`, `compass.py`)
+Enables cross-session continuity without context pollution:
+- **Two-Tier Storage:**
+  - **Project Memory (`.agent/memory/project.md`):** High-level project architecture, established design patterns, permanent constraints, and user preferences.
+  - **Chat Memory (`.agent/memory/chats/<chat_id>.md`):** Session-scoped task decisions, files inspected, and work completed.
+- **The Compass (`compass.py`):** Synthesizes a compact, structured account (capped at 1,500 tokens) injected into system prompts. Guides the model on project identity while treating memory strictly as an informative record, preventing memory-based prompt manipulation.
+- **Project Goal Protection:** Project goals cannot be overwritten by agent inference without explicit human confirmation.
 
-```bash
-agent policy --repo PATH --action network --verdict deny
-```
+### 6. 🛑 Instant Task Cancellation & Process Tree Termination
+- Real-time cancellation powered by `threading.Event` and thread-safe cancellation tokens (`governance.py`).
+- Subprocesses run inside dedicated process groups. Cancellation triggers `runner.kill_tree()`, terminating processes recursively on Windows (`taskkill /F /T /PID`) and Unix (`kill -9`).
+- Streaming LLM inference cancels immediately, conserving GPU memory and network resources.
 
-Verdicts are `allow`, `ask`, and `deny`. Overrides are stored outside the project in
-`.agent-permissions.json` beside the application's own data, so a project change cannot rewrite its
-own rules. A missing or unreadable store contributes no overrides; the program uses the built-in
-defaults (for example, custom commands and network requests ask). Removing the file therefore removes
-the saved overrides and restores those defaults.
-
-Hostnames such as `db.internal` are not resolved during the destination check. Since they could point
-to a private service, requests to hostnames require an explicit `network = allow` rule for that folder.
-Private and link-local numeric addresses have the same requirement. Do not use that rule for folders
-whose code or configuration you do not trust.
-
-### External tools (MCP)
-
-A run can offer tools supplied by an external Model Context Protocol server, in addition to the eight
-built-in ones. Servers are declared by the operator, never by the project, in `.agent-mcp.json` beside
-`.agent-permissions.json`:
-
-```json
-{
-  "servers": [
-    {
-      "id": "files",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem"],
-      "env": ["MCP_FILES_ROOT"],
-      "tools": ["read_file"],
-      "enabled": true,
-      "max_side_effect": "read"
-    }
-  ]
-}
-```
-
-`enabled` defaults to `false`, so a row a model or a cloned repository added offers nothing. `env`
-holds variable **names**, never values, and the server process is started with `runner`'s allowlist
-plus exactly those names, without a shell and with an argv taken only from the row. `tools` is an
-allowlist of the server's own tool names; `max_side_effect` is this operator's ceiling on what an
-outside tool may even be offered for (`none`, `read`, `write`, `execute`, `network`).
-
-An outside tool is judged by the same gate as a built-in, with one extra rule: whatever class the
-server declares for itself, the runtime also asks the class that its side-effect level implies, and
-the stricter answer wins. A server describing a network call as a read is therefore refused under both
-names, and an unannotated tool lands at the top of the ladder — which the policy table answers `ask`,
-so a task run declines it until the folder grants it. Tools arrive namespaced as
-`mcp_<server>_<tool>`, and a server's own description of a tool is shown to the model capped and
-labelled as untrusted data, never as an instruction. A server that will not start, or a tool whose
-schema this runtime cannot check, costs a line of output and a note in the session — not the run.
+### 7. 🔍 Smart Code Review & Safety Audit (`smart_review.py`)
+Built-in automated engineering review pipeline:
+- **Intelligent Test Selection:** Matches modified files to relevant test suites via AST symbol and token overlap.
+- **Assertion Tampering Detector:** Flags any attempt to "pass" tests by deleting assertions or disabling test annotations (`@Disabled`, `@Ignore`).
+- **AST Security Scanner:** Scans diffs for SQL injection, unsanitized command execution, hardcoded tokens, and insecure deserialization.
+- **Senior PR Review Package:** Generates production-grade pull request reviews evaluating correctness, test coverage, and backward compatibility.
 
 ---
 
-# 🧠 Offline Extras, Google Gemini & Structured Planning
+# 📋 12 Unified Commands & Terminal Power
 
-The latest updates introduce several architectural improvements for speed, reasoning, planning quality, and cloud flexibility:
+Every interface (Rich CLI, Web UI, Scripted API) speaks the exact same 12 interactive commands:
 
-**Structured Planning & Requirement Grounding (`planning.py`).**
-The planning engine now validates proposed tasks against real repository facts. When providing a structured plan via `--plan-file` or the WebApp composer, the agent checks symbol references, test surfaces, and requirement coverage before proposing diffs. This eliminates hallucinations of nonexistent classes or endpoints.
+| Command | Syntax / Usage | What It Does |
+| :--- | :--- | :--- |
+| **`status`** | `status` | Where this session stands: current state machine phase, active task, and waiting steps. |
+| **`plan`** | `plan` | Read-only view of the plan: Goal, Affected Files, Steps, Risks, and Test Strategy. |
+| **`changes`** | `changes` | Clean per-file summary of touched files with addition/deletion line counts. |
+| **`diff`** | `diff [PATH] [--context N]` | Syntax-highlighted hunks with context lines (default 3 context lines). |
+| **`tests`** | `tests` | Complete record of executed commands, exit codes, and test pass/fail tallies. |
+| **`risks`** | `risks` | Policy risk assessment: identifies sensitive paths (auth, crypto, payments) and side effects. |
+| **`stop`** | `stop` | Instantly aborts the active turn, kills subprocess trees, and safely resets readiness. |
+| **`steer`** | `steer <instruction>` | Injects immediate guidance into the ongoing run to adjust direction without restarting. |
+| **`report`** | `report` | Generates the final audit summary with verification badges (`VERIFIED`, `INFERRED`, `NOT CHECKED`). |
+| **`undo`** | `undo` | Safely restores modified files to the exact pre-task commit using SHA-256 verification. |
+| **`memory`** | `memory [edit\|reset]` | Displays the active project and session compass, allows manual editing or reset. |
+| **`help`** | `help` | Lists available commands, hotkeys, and command usage hints. |
 
-**Google Gemini Provider Integration (`profiles/gemini.toml`).**
-Native Google Gemini support is integrated directly via Google AI Studio's OpenAI-compatible endpoint. Features include:
-- Automatic prefix stripping (`models/gemini-...` ➔ `gemini-...`).
-- Preset profile configured at `profiles/gemini.toml`.
-- Preflight cURL generation and diagnostic testing (`agent.py curl --provider gemini --model gemini-3.8-flash --run`).
-- Key auto-resolution from `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+### CLI Scripting Examples
+```powershell
+# Preview plan before executing (Plan Mode):
+python agent.py "Refactor JWT parsing in AuthService" --repo ./backend --plan
 
-**Preloaded Local FastEmbed Semantic Search.**
-Local embedding models (`fastembed_bge_small`) are pre-bundled in the `models/` folder for 100% offline semantic retrieval. `symbols.rank` pairs lexical search with vector embeddings cached in `.agent-semantic.json`, ensuring high-precision symbol discovery without network roundtrips.
+# Review diffs with custom context lines:
+python agent.py diff "<session_id>" --file src/auth/jwt.py --context 5
 
-**Structured Task State & Anti-Loop Streaming Guards.**
-The orchestration engine maintains continuity across turns using typed task state (`taskstate.py`). Binding operator constraints are preserved across long-context trimming, while streaming safeguards monitor repetitive token output to prevent generation loops.
+# Inspect policy rules and overrides:
+python agent.py policy --repo ./backend
 
-**Dual-Model Fast / Strong Routing.**
-Profiles can specify distinct `fast_model` and `strong_model` definitions (e.g. lightweight models for mechanical `read_file` or `search_code` operations, reserving stronger reasoning models for diff synthesis, architectural decisions, and repair).
+# Set folder-level policy override (stored safely in .agent-permissions.json):
+python agent.py policy --repo ./backend --action network --verdict deny
 
-**Optional Local Evals.**
-Deterministic eval test suites (`tests/test_improvement_evals.py`) and promptfoo configurations (`tools/eval/promptfooconfig.yaml`) ensure regressions are detected before changes reach production.
+# Single-key approval in interactive CLI:
+# [y] approve proposal   [n] reject proposal   [d] show detailed diff
 
-[FastEmbed]: https://github.com/qdrant/fastembed
+# Export complete session audit transcript:
+python agent.py export-session "<session_id>" --format markdown --out audit-report.md
+```
+
+### Terminal Ergonomics
+- **Live Status Line (`Rich.Live`):** Persistent, non-flickering status indicator with phase spinners and checklist markers (`✓` done, `●` running, `○` pending, `!` attention).
+- **Prompt Toolkit Hotkeys:** `Esc` to stop, `Tab` to switch input focus, `?` for quick help.
+- **CI & Script Friendly:** Automatically detects non-TTY environments and respects the `NO_COLOR` standard.
+
+---
+
+# 🖥️ Web App & Visual Experience
+
+The Desktop WebApp provides a streamlined, responsive developer experience:
+
+- **3-Column Architecture:**
+  - **Left Rail (Plan & Tasks):** Step-by-step checklist with live progress, dependency status, and verification criteria.
+  - **Center Workspace (Timeline & Chat):** Real-time streaming output, engineering events (`[ANALYSIS]`, `[CHANGE]`, `[TEST]`), cleanly formatted user bubbles, and syntax blocks.
+  - **Right Rail (Changeset & Controls):** Per-file diffs, quick actions, custom commands, memory viewer, and project configuration.
+- **Top Control Bar:** Always-visible task badge, elapsed time counter, live steering input (`steer`), and emergency stop button.
+- **Real-Time Event Stream (SSE):** Event hub pushes 8 structured event types directly to the browser with automatic reconnect.
+- **Native Right-to-Left (RTL):** Dynamic Arabic RTL support with typography tuned for clarity.
+
+---
+
+# 🧠 Offline Extras, Model Gateway & Planning
+
+### 1. Multi-Provider Model Gateway (`model_gateway.py`)
+AI Code Engineer abstracts compute through a resilient provider gateway:
+- **Local Ollama:** 100% offline privacy with `qwen2.5-coder`, `deepseek-coder`, `llama3`.
+- **Google Gemini:** Native support via Google AI Studio (`profiles/gemini.toml`). Automatically strips prefixes (`models/gemini-...` ➔ `gemini-...`), handles payload conversions, and auto-detects `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+- **OVH Cloud & LLM7:** Dedicated profiles for privacy-conscious cloud hosting.
+- **OpenRouter, Groq, DeepSeek & Custom Endpoints:** Compatible with standard OpenAI API specs.
+- **Dual-Model Routing:** Route cheap gathering turns (file listing, symbol lookup) to lightweight models while reserving reasoning models for diff synthesis and repair.
+- **Transparent Fallback:** Automatically switches to backup local models if a remote gateway times out.
+
+### 2. Structured Planning & Requirement Grounding (`planning.py`, `decomposition.py`)
+- **Plan File Detection:** Automatically detects `PLAN.md` or `--plan-file` in repository roots.
+- **Subtask Decomposition DAG (`decomposition.py`):** Breaks complex objectives into dependency-linked subtasks. If a prerequisite fails, downstream tasks are safely paused for replanning.
+- **Symbol Validation:** Proactively checks that referenced classes, methods, and endpoints exist in the repository before writing code, eliminating hallucination.
+
+### 3. Preloaded Local FastEmbed Semantic Search (`semantic.py`, `retriever.py`)
+- Bundled local `fastembed_bge_small` embedding models for vector-assisted semantic code retrieval.
+- Hybrid search: Combines lexical BM25 token matching with Reciprocal Rank Fusion ($k=60$) and cached embeddings in `.agent-semantic.json`.
 
 ---
 
@@ -276,7 +297,7 @@ Deterministic eval test suites (`tests/test_improvement_evals.py`) and promptfoo
 <details>
 <summary><strong>🐧 Linux & 🍎 macOS First-Time Setup</strong></summary>
 
-Make the shell launchers executable:
+Make shell launchers executable:
 ```bash
 chmod +x run-agent.sh run-agent-cli.sh
 ```
@@ -292,56 +313,6 @@ Launch the interactive CLI:
 ```
 </details>
 
-<details>
-<summary><strong>⚙️ Scriptable CLI Commands</strong></summary>
-
-```powershell
-# Index repository symbols and architectural layers
-python agent.py map --repo examples/demo_repo
-
-# Scan Spring Boot or polyglot architecture to project-index.json
-python -c "from ai_code_engineer.repo_scanner import RepoScanner; RepoScanner('path/to/project').scan(write=True)"
-
-# Seal a folder as Read-only across all windows and terminals
-python agent.py read-only --repo examples/demo_repo
-python agent.py read-only --repo examples/demo_repo --off
-
-# Plan and propose code changes using local Ollama
-python agent.py plan "Fix add in calculator.py so it adds two numbers" --repo examples/demo_repo --config profiles/local.toml
-
-# Plan with a structured Markdown plan file
-python agent.py plan "Implement auth service features" --repo path/to/project --plan-file plan.md --config profiles/gemini.toml --allow-cloud
-
-# Test provider reachability via cURL tool (Google Gemini or Ollama)
-python agent.py curl --provider gemini --model gemini-3.8-flash --prompt "Ping" --run
-
-# Review proposed diff
-python agent.py review "<session_id>"
-
-# Colored diff view: per-file summary plus hunks with three context lines
-python agent.py diff "<session_id>"
-python agent.py diff "<session_id>" --file app/calc.py --context 1
-
-# Apply approved proposal (cryptographically verified by SHA-256)
-python agent.py apply "<session_id>" --approve "<sha256_hash>"
-
-# Execute automated test suite
-python agent.py verify "<session_id>"
-
-# Check status of any session
-python agent.py status "<session_id>"
-
-# Export session audit transcript to Markdown or JSON
-python agent.py export-session "<session_id>" --format markdown --out session-report.md
-
-# Reopen a declined proposal for review
-python agent.py reopen "<session_file>" --approve "<sha256_hash>"
-
-# Rollback changes to pre-task state
-python agent.py rollback "<session_id>" --approve "<sha256_hash>"
-```
-</details>
-
 ---
 
 # 🧭 Three modes, and the limits that go with them
@@ -350,7 +321,7 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 - **Chat:** Answers questions in natural prose; reads workspace files as context; writes zero files.
 - **Read-only:** Formally seals the workspace folder: reads, searches, and maps symbols, but promises never to propose or write diffs.
 - **Change:** Produces cryptographic `SHA-256` diff proposals that you explicitly inspect and approve before anything is written to disk.
-- **Auto-Apply:** An optional per-folder switch. Automatically writes proposals without individual clicks, runs tests immediately afterwards, and retains rollback capability.
+- **Auto-Apply:** An optional per-folder switch. Automatically writes proposals without individual clicks, runs tests immediately afterwards, and retains full rollback capability.
 
 | Safety Guarantee | Implementation Details |
 | :--- | :--- |
@@ -361,59 +332,44 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 
 ---
 
-# 🎯 Try These First
-
-- **Spring Boot Architecture Mapping:**  
-  *"Scan this microservice repository, generate `project-index.json`, and list all Controllers with their injected Services and Repositories."*
-
-- **Fix a Failing Test with Autonomous Repair:**  
-  *"Inspect the failing test in `src/test/java/.../AuthServiceTest.java`. Fix the JWT signature validation, and run `mvn test` until all tests pass."*
-
-- **Bounded Multi-Step Plan:**  
-  Attach a `plan.md` file using the **+ Plan** button in the WebApp:  
-  *"Implement Step 1 from the attached plan only. Create the missing DTO classes and verify syntax."*
-
-- **Autonomous Self-Healing Loop:**  
-  Click **Run & Fix** on the Checks card to let the agent run the test suite, read compiler diagnostics, and iterate on code until all checks turn green.
-
----
-
 # 🏗️ Project Architecture
 
 ```
-                                  +-----------------------------------------------+
-                                  |    Desktop WebApp / Tkinter GUI / CLI Menu    |
-                                  +-----------------------------------------------+
-                                                          │
-                                                          ▼
-+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
-│                                            Agent Orchestration Engine                                             │
-│  - AgentCore State Machine (FSM)               - RepoScanner (13 Architectural Layers & Annotation Index)         │
-│  - Task Planner & Queue Manager                - Architecture-Aware File Selection (index_boost)                  │
-│  - Instant Cancellation (Process Tree Kill)    - Step-by-Step Planbook Ledger & Progress Tracker                  │
-+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
-                 │                                                                │
-                 ▼                                                                ▼
-+─────────────────────────────────+                             +───────────────────────────────────+
-│         Model Providers         │                             │       Workspace & Security        │
-│  - Ollama (Local CPU/GPU)       │                             │  - Path Traversal Guard (..)      │
-│  - OpenRouter / DeepSeek        │                             │  - Zero-Trust Secret Redactor     │
-+─────────────────────────────────+                             +───────────────────────────────────+
-│         Model Providers         │                             │       Workspace & Security        │
-│  - Ollama (Local CPU/GPU)       │                             │  - Path Traversal Guard (..)      │
-│  - Google Gemini (AI Studio)    │                             │  - Zero-Trust Secret Redactor     │
-│  - OpenRouter / DeepSeek        │                             │  - SHA-256 Hash-Locked Diffs      │
-│  - OpenAI / Groq / Custom HTTP  │                             │  - Task State Continuity Guards   │
-+─────────────────────────────────+                             +───────────────────────────────────+
-                                                                                  │
-                                                                                  ▼
-                                                                +───────────────────────────────────+
-                                                                │       Verification & Checks       │
-                                                                │  - Toolchain Detectors (Maven,…)  │
-                                                                │  - JUnit XML Evidence Parser      │
-                                                                │  - 3-Round Autonomous Repair Loop │
-                                                                │  - Optional Docker Sandbox        │
-                                                                +───────────────────────────────────+
+                                  +-------------------------------------------------------------+
+                                  |         Desktop WebApp  /  Rich CLI  /  Tkinter GUI         |
+                                  +-------------------------------------------------------------+
+                                                                 │
+                                    Structured Event Stream & 12 Unified Commands
+                                      (events.py · cli_view.py · commands.py)
+                                                                 │
+                                                                 ▼
++─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
+│                                                  Agent Orchestration Engine                                                 │
+│  - AgentCore State Machine (core.py)                     - Task Decomposition DAG (decomposition.py)                        │
+│  - Engine Execution Loop (engine.py)                     - Mid-Run Steering & Plan Mode (engine.py)                         │
+│  - Step-by-Step Planbook Ledger (planbook.py)            - Concurrency & Resource Governance (governance.py)                │
++─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────+
+                 │                                               │                                            │
+                 ▼                                               ▼                                            ▼
++─────────────────────────────────+             +─────────────────────────────────+          +────────────────────────────────+
+│       Model & Tool Gateway      │             │      Zero-Trust & Security      │          │     Code Intelligence & RAG    │
+│  - Model Gateway (model_gateway)│             │  - Unified Gate (gate.py)       │          │  - 13-Layer Scanner (scanner)  │
+│  - Ollama (Local CPU/GPU)       │             │  - Policy Engine & Single-Use   │          │  - Code Graph & Blast Radius   │
+│  - Google Gemini (AI Studio)    │             │    Approval Tokens (policy)     │          │  - AST Chunker (chunker.py)    │
+│  - OVH / LLM7 / OpenRouter      │             │  - Tool Contracts (contracts)   │          │  - BM25 + RRF Retriever        │
+│  - Tool Provider Registry       │             │  - Prompt Injection Neutralizer │          │  - Local FastEmbed Search      │
+│  - MCP Stdio Adapter (mcp.py)   │             │    & Secret Redactor (trust)    │          │  - Context Builder (budgeting) │
++─────────────────────────────────+             +─────────────────────────────────+          +────────────────────────────────+
+                                                                 │                                            │
+                                                                 ▼                                            ▼
+                                                +─────────────────────────────────+          +────────────────────────────────+
+                                                │      Workspace & Git Safety     │          │     Verification & Quality     │
+                                                │  - Path Traversal Guard (..)    │          │  - Toolchain Detectors (Maven) │
+                                                │  - Windows Device Protection    │          │  - Self-Healing Repair Loop    │
+                                                │  - Git Worktree Manager &       │          │    with Stagnation Guard       │
+                                                │    Selective Rollback (git_mgr) │          │  - Smart Review & Security AST │
+                                                │  - Dual Memory & Compass        │          │  - Eval Harness (eval_harness) │
+                                                +─────────────────────────────────+          +────────────────────────────────+
 ```
 
 ---
@@ -423,25 +379,47 @@ The three operating modes are **Chat**, **Read-only**, and **Change**:
 | Path | Purpose |
 | :--- | :--- |
 | `src/ai_code_engineer/core.py` | **AgentCore State Machine:** Typed dataclasses (`Task`, `Plan`, `Action`, `AgentState`, `VerificationResult`) and deterministic transition engine. |
-| `src/ai_code_engineer/planning.py` | **Structured Planning & Requirement Grounding:** Validates task proposals against real symbols, tests, and build facts. |
-| `src/ai_code_engineer/taskstate.py` | **Task State Continuity:** Bounded session continuity ledger, user binding constraints, and streaming anti-loop guards. |
-| `src/ai_code_engineer/semantic.py` | **Local Offline Semantic Search:** FastEmbed vector retrieval and `.agent-semantic.json` embedding cache. |
-| `src/ai_code_engineer/repo_scanner.py` | **Architectural Repository Scanner:** 13-layer parser, 200+ annotation detectors, dependency graph extractor, `project-index.json`, and `index_boost`. |
-| `src/ai_code_engineer/repair.py` | **Autonomous Repair Loop:** `execute_verification`, `verification_from_run`, `handle_fix_evaluation`, and bounded 3-round repair logic. |
-| `src/ai_code_engineer/engine.py` | **Core Orchestration Loop:** Planning, diff creation, architecture-boosted context selection, and session persistence. |
-| `src/ai_code_engineer/gate.py` | **Unified Security Gate:** One admission decision per call — shape, contract judgeability, folder policy, run posture, and the tool's provenance. |
-| `src/ai_code_engineer/tool_provider.py` | **Tool Providers:** The native registry, external sources, and the composite router that judges each call under its own provider's gate. |
-| `src/ai_code_engineer/mcp.py` | **Optional MCP Provider:** Line-framed JSON-RPC stdio client, schema-to-contract translation, and the operator's `.agent-mcp.json`. |
-| `src/ai_code_engineer/runner.py` | **Command Execution & Sandbox:** Safe process spawning, real-time log streaming, instant cancellation (`kill_tree`), and Docker container isolation. |
-| `src/ai_code_engineer/workspace.py` | **Filesystem Sandbox:** Path traversal prevention, symlink protection, Windows device name defense, and rollback managers. |
-| `src/ai_code_engineer/redaction.py` | **Zero-Trust Secret Redaction:** Real-time scrubbing of API keys, PEM private keys, JWT tokens, and connection strings. |
-| `src/ai_code_engineer/webapp/` | **Desktop WebApp:** Loopback server (`server.py`), state controller (`controller.py`), project manager (`projects.py`), and modern CSS/JS client. |
-| `src/ai_code_engineer/gui.py` | **Native Desktop Tk GUI:** Lightweight Python Tkinter desktop client sharing the same engine and sentences. |
-| `models/` | **Preloaded Offline Embedding Models:** Local FastEmbed BGE-small ONNX models and tokenizer configs. |
-| `tests/` | **1,740+ Automated Tests:** Extensive unit and integration test coverage across all features, state machine transitions, scanner layers, and repair loops. |
+| `src/ai_code_engineer/engine.py` | **Core Orchestration Loop:** Planning, diff creation, mid-run steering, plan mode, architecture-boosted context selection, and session persistence. |
+| `src/ai_code_engineer/contracts.py` | **Strict Tool Contracts:** Typed input/output schemas, timeout limits, scratchpad key filtering, and parameter validation. |
+| `src/ai_code_engineer/capabilities.py` | **Central Capability Registry:** Dynamic tool registry, provenance verification, and permission mapping. |
+| `src/ai_code_engineer/gate.py` | **Unified Security Gate:** Single admission checkpoint per call — schema shape, contract validity, folder policy, run posture, and provenance. |
+| `src/ai_code_engineer/tool_provider.py` | **Composite Tool Provider:** Native tool routing and external capability management under unified gates. |
+| `src/ai_code_engineer/mcp.py` | **MCP Stdio Client:** JSON-RPC adapter for Model Context Protocol servers defined in `.agent-mcp.json`. |
+| `src/ai_code_engineer/policy_engine.py` | **Granular Policy Engine:** Action risk categorization (`SAFE_READ` to `DESTRUCTIVE`), single-use approval tokens with TTL. |
+| `src/ai_code_engineer/trust.py` | **Trust Hierarchy & Prompt Injection Defense:** Strict instruction prioritization (`SYSTEM` > `USER` > `REPO`), exfiltration neutralizing. |
+| `src/ai_code_engineer/git_manager.py` | **Git Worktree Manager:** Change ownership tracking, selective single-file rollback preserving human edits, and force-push denial. |
+| `src/ai_code_engineer/repo_scanner.py` | **Architectural Repository Scanner:** 13-layer parser, 200+ annotation detectors, dependency graph extractor, and `project-index.json`. |
+| `src/ai_code_engineer/code_graph.py` | **Directed Code Graph:** Class, method, endpoint, and test dependency mapping, caller/callee resolution, and blast radius calculation. |
+| `src/ai_code_engineer/chunker.py` | **Code-Aware AST Chunker:** Syntactic chunking preserving class, method, and function boundaries. |
+| `src/ai_code_engineer/retriever.py` | **Hybrid Code Retriever:** Identifier-aware Okapi BM25 scoring with Reciprocal Rank Fusion ($k=60$). |
+| `src/ai_code_engineer/context_builder.py` | **Deterministic Context Builder:** Enforces strict character and token budgets, prioritizing binding user constraints. |
+| `src/ai_code_engineer/agent_state.py` | **Persistent Agent State:** Atomic temp-file checkpoints with SHA-256 integrity and crash recovery without duplicate side effects. |
+| `src/ai_code_engineer/memory_store.py` | **Dual-Tier Memory Store:** Durable project memory (`project.md`) and session chat memory (`chats/<chat_id>.md`). |
+| `src/ai_code_engineer/memory_summarizer.py` | **Memory Summarizer & Goal Protection:** Bounded summarization ceiling (1,500 tokens) and protection against unauthorized goal changes. |
+| `src/ai_code_engineer/compass.py` | **Model Compass:** Structured context block injected into prompts, guiding models with project intent without exposing instruction injection vectors. |
+| `src/ai_code_engineer/repair_loop.py` | **Autonomous Repair Loop:** Diagnostic failure categorization (compilation vs test vs env) with stagnation detection. |
+| `src/ai_code_engineer/smart_review.py` | **Smart Review & Security Audit:** Test suite selector, assertion tampering detector, AST security analyzer, Senior PR reviewer, and IDE protocol. |
+| `src/ai_code_engineer/model_gateway.py` | **Replaceable Model Gateway:** Tier-based task dispatch (triage, coding, planning) with transparent offline fallback. |
+| `src/ai_code_engineer/skills.py` | **Engineering SOPs / Skills:** Signal-matched execution recipes for Bug Fixing, Refactoring, API Compatibility, and Security. |
+| `src/ai_code_engineer/decomposition.py` | **Task Decomposition DAG:** Subtask dependency graphs, prerequisite unlocking, failure propagation, and replanning. |
+| `src/ai_code_engineer/events.py` | **Structured Event Stream:** 8 typed event dataclasses (`StageChanged`, `FileChanged`, `TestResult`, etc.) with 3 verbosity levels. |
+| `src/ai_code_engineer/commands.py` | **12 Unified Commands:** Canonical implementations of `status`, `plan`, `changes`, `diff`, `tests`, `risks`, `stop`, `steer`, `report`, `undo`, `memory`, `help`. |
+| `src/ai_code_engineer/cli_view.py` | **Rich Terminal Views:** Live status lines (`Rich.Live`), status spinners, checklist markers, and styled startup banners. |
+| `src/ai_code_engineer/report_view.py` | **Final Report Table:** Verification badges (`VERIFIED`, `INFERRED`, `NOT CHECKED`), residual risks, and decision logs. |
+| `src/ai_code_engineer/diff_view.py` | **Colored Diff Viewer:** Syntax-highlighted hunks with configurable context lines and per-file diff stats. |
+| `src/ai_code_engineer/error_fmt.py` | **Friendly Error Formatter:** Problem / Root cause / Agent action tri-part error layout with collapsible tracebacks. |
+| `src/ai_code_engineer/terminal.py` | **Terminal Capabilities:** Automatic detection of CI / non-TTY pipes, terminal width adaptors, and `NO_COLOR` compliance. |
+| `src/ai_code_engineer/observability.py` | **Distributed Observability:** Correlated trace IDs, multi-pattern secret scrubbing, failure analytics, and Markdown execution summaries. |
+| `src/ai_code_engineer/governance.py` | **Performance Governance:** Content-addressed mtime/size caching (`IncrementalCache`) and thread-safe cancellation tokens. |
+| `src/ai_code_engineer/concurrency.py` | **Safe Concurrency:** Parallel read operations via ThreadPool with strict write serialization locks. |
+| `src/ai_code_engineer/runner.py` | **Execution Engine & Sandbox:** Safe subprocess spawning, real-time log streaming, process-tree termination (`kill_tree`), and Docker sandbox. |
+| `src/ai_code_engineer/workspace.py` | **Filesystem Sandbox:** Path traversal prevention, symlink protection, Windows device name defense, and rollback manager. |
+| `src/ai_code_engineer/redaction.py` | **Zero-Trust Secret Redactor:** Live regex scrubbing of API keys, PEM private keys, JWTs, and database credentials. |
+| `src/ai_code_engineer/webapp/` | **Desktop WebApp:** Loopback server (`server.py`), state controller (`controller.py`), project manager (`projects.py`), and 3-column client. |
+| `src/ai_code_engineer/gui.py` | **Native Desktop Tk GUI:** Lightweight Python Tkinter desktop client sharing engine and localization. |
+| `tests/` | **3,100+ Automated Tests:** Comprehensive unit and integration test coverage across all features, state machines, gates, and UX pipelines. |
 | `agent.py` · `desktop.pyw` · `launcher.py` | **System Launchers:** CLI entry point, desktop window entry, and interactive terminal menu. |
-| `profiles/` | **Model Profiles:** TOML configuration presets for local Ollama, Google Gemini (`gemini.toml`), and cloud providers. |
-| `assets/` | **Brand Assets:** Vector banner with official logo (`banner.svg`), logo assets (`logo.png`), and UI demo animations. |
+| `profiles/` | **Model Profiles:** TOML presets for local Ollama, Google Gemini (`gemini.toml`), OVH, LLM7, and cloud providers. |
 
 ---
 

@@ -36,7 +36,7 @@ PROTECTED_DIRS = {
     ".agent-permissions.json",
     # The servers an outside tool may arrive from, for the same reason and with the same belt.
     ".agent-mcp.json",
-    ".venv", "venv", ".gradle", ".m2",
+    ".venv", "venv", ".pkgcheck", ".gradle", ".m2",
     ".idea",
 }
 # Matches files that *are* credentials, not source that merely names one — `token.json` yes,

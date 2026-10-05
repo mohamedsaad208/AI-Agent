@@ -49,6 +49,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pkgcheck/
 build/
 dist/
 *.egg-info/

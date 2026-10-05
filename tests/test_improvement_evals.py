@@ -158,6 +158,30 @@ class EngineContinuityThroughTrim(unittest.TestCase):
         self.assertIn("user_constraints", joined)
         self.assertIn(phrase, joined)
 
+    def test_a_scratchpad_written_flat_is_kept_and_the_turn_still_runs(self):
+        """The other dialect: the same notes beside the action instead of inside `state`.
+
+        A small local model that has been carrying its working state all turn writes
+        `{"action": "read_file", ..., "constraints": [...]}`, and the exact-field check used to
+        refuse the call for it — `read_file does not accept: acceptance, constraints` — burning an
+        invalid-action turn on a spelling. The note is kept on the run either way.
+        """
+        phrase = "do not rename the public API surface"
+        propose = {"action": "propose", "summary": "nudge ping", "checks": ["run unittest"],
+                   "changes": [{"path": "api.py", "content": "def ping():\n    return 3\n"}]}
+        provider = ScriptedProvider([
+            {"action": "read_file", "path": "app.py", "constraints": [phrase],
+             "acceptance": ["open: ping returns 3"], "status": "gathering"},
+            propose,       # refused: api.py reached the prompt as a snapshot, not as a read
+            dict(propose, next_step="write the proposal"),   # the flat note leaves the gate clean
+        ])
+        settings = Settings(context_chars=12000)
+        path = plan(self.ws(), "Read app.py then update api.py", provider,
+                    settings, self.base / "runs", progress=lambda _: None)
+        state = load_session(path)["task_state"]
+        self.assertIn(phrase, state["constraints"])
+        self.assertIn("open: ping returns 3", state["acceptance"])
+
     def ws(self):
         return Workspace(self.root)
 

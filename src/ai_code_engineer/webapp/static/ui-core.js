@@ -232,7 +232,6 @@ function render(data) {
   if (state.openStep) state.lockScroll = true;
   renderThemePick(); renderNav(); renderHeader(); renderThread(); renderComposer();
   renderQueue(); renderSetup(); renderQuote();
-  renderPlanColumn();
   renderRail(); renderLog(); takePreviewOffer();
   paintRunBar();
   syncSettings();
